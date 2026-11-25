@@ -28,7 +28,6 @@ in each patch's `From:` line. Their patches remain theirs.
 | 0113 | Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)) | [#1411](https://github.com/ashhart/TensorFold/pull/1411) | GLM conversation states on disk, every rank's part (`--learn-conversations`), backported to this stack by its author |
 | 0114 | Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)) | [#1431](https://github.com/ashhart/TensorFold/issues/1431) | KV sharding at TP=2: each stream's latent rows on its owner rank, with 0113's disk states under it |
 | 0120-0121 | Peter Jurik ([@wagzee](https://github.com/wagzee)) | | `TF_EXTRA_EOS`: named tokens end a reply like the checkpoint's EOS (0120); `TF_THINK_OFF_SPLIT`: a thinking-off reply's text before its close token is reasoning (0121) |
-| 0124 | Devin (Cognition's coding agent) | | `glm_moe_dsa`'s backbone graph, rope table and NVIDIA NVFP4/FP8 load |
 | 0235 | [@devopsfortunato](https://github.com/devopsfortunato) | [#2276](https://github.com/ashhart/TensorFold/pull/2276) | A resumed turn that has not started is ranked by its uncached tail, not as a whole cold prompt (fixes [#2256](https://github.com/ashhart/TensorFold/issues/2256)); backported to `f350cd3e` by [@laidick](https://github.com/laidick) in [GLM-5.3-Flash-DGX-Sparks-1104#20](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/pull/20) |
 | 0236 | Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)) | [#1411](https://github.com/ashhart/TensorFold/pull/1411) | `--learn-conversations` stages the longest state whole instead of skipping states past the 1 GiB default permit (`StagingFull`); authored by him for [GLM-5.3-Flash-DGX-Sparks-1104#49](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/pull/49) |
 | 0237 | Ash Hart ([@ashhart](https://github.com/ashhart)) | [#2442](https://github.com/ashhart/TensorFold/pull/2442), commit [12d61cb6](https://github.com/ashhart/TensorFold/commit/12d61cb6b96c968aab76b8c53444380e66a76f53) | A refused disk read of a learned state tries one shorter disk state before a cold prefill; backported to `f350cd3e` by [@wangtianwen07](https://github.com/wangtianwen07) in [GLM-5.3-Flash-DGX-Sparks-1104#41](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/pull/41) |
@@ -152,7 +151,6 @@ License 2.0), carried upstream in TensorFold as `zig/src/cuda/roce.zig`.
   [1407ad28](https://github.com/ashhart/TensorFold/commit/1407ad28bec9742e5e4d69e016b1c7ca7bf9af30) with the TensorFold
   contributors, after the proposal in issue [#1197](https://github.com/ashhart/TensorFold/issues/1197) by RS91Dev
   ([@RS91Dev](https://github.com/RS91Dev)).
-- The TP6 plan was reviewed by Codex and by Claude Mythos 5.2.
 
 ## Ideas and formats
 
@@ -216,8 +214,3 @@ License 2.0), carried upstream in TensorFold as `zig/src/cuda/roce.zig`.
 [NVIDIA CUDA](https://developer.nvidia.com/cuda-toolkit) and its container images, [Zig](https://ziglang.org),
 [xgrammar](https://github.com/mlc-ai/xgrammar), [libjpeg-turbo](https://libjpeg-turbo.org) and
 [libwebp](https://developers.google.com/speed/webp), under their own licences.
-
-## How it was made
-
-Most of Mia's AI Lab's patches were written by AI coding agents under the lab's direction, with reviews by Codex, DeepSeek
-and GLM-5.3-Flash.

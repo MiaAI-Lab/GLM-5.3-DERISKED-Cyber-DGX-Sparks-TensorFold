@@ -330,7 +330,6 @@ recipes; every patch not listed under other authors below):
 | 0109-0110 | Cameron Basham | DFlash2 drafter MLP split across every rank; a port of [#1823](https://github.com/ashhart/TensorFold/pull/1823)'s adaptive prompt chunk (`TF_GLM_CHUNK_SOLO`) |
 | 0113-0114, 0236 | Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)) | [#1411](https://github.com/ashhart/TensorFold/pull/1411), [#1431](https://github.com/ashhart/TensorFold/issues/1431) |
 | 0120-0121 | Peter Jurik ([@wagzee](https://github.com/wagzee)) | `TF_EXTRA_EOS` (extra end-of-reply tokens) and `TF_THINK_OFF_SPLIT` |
-| 0124 | Devin (Cognition's coding agent) | `glm_moe_dsa`'s backbone graph, rope table and NVIDIA NVFP4/FP8 load |
 | 0235 | [@devopsfortunato](https://github.com/devopsfortunato), backported by [@laidick](https://github.com/laidick) | [#2276](https://github.com/ashhart/TensorFold/pull/2276), [Flash recipe #20](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/pull/20) |
 | 0237 | Ash Hart ([@ashhart](https://github.com/ashhart)), backported by [@wangtianwen07](https://github.com/wangtianwen07) | [#2442](https://github.com/ashhart/TensorFold/pull/2442), [Flash recipe #41](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/pull/41) |
 
