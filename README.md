@@ -327,7 +327,7 @@ recipes; every patch not listed under other authors below):
 | 0026-0027 | [@ajensenwaud](https://github.com/ajensenwaud) | [#1505](https://github.com/ashhart/TensorFold/pull/1505) |
 | 0049-0056 | [@Bizuayeu](https://github.com/Bizuayeu) | [#1423](https://github.com/ashhart/TensorFold/pull/1423) |
 | 0092-0093 | [@SvangenStudios](https://github.com/SvangenStudios) | [DeepSeek recipe #31, #28](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/31) |
-| 0109-0110 | Cameron Basham | DFlash2 drafter MLP split across every rank; a port of [#1823](https://github.com/ashhart/TensorFold/pull/1823)'s adaptive prompt chunk (`TF_GLM_CHUNK_SOLO`) |
+| 0109-0110 | Cameron Basham ([@shanedertrain](https://github.com/shanedertrain)) | DFlash2 drafter MLP split across every rank; a port of [#1823](https://github.com/ashhart/TensorFold/pull/1823)'s adaptive prompt chunk (`TF_GLM_CHUNK_SOLO`) |
 | 0113-0114, 0236 | Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)) | [#1411](https://github.com/ashhart/TensorFold/pull/1411), [#1431](https://github.com/ashhart/TensorFold/issues/1431) |
 | 0120-0121 | Peter Jurik ([@wagzee](https://github.com/wagzee)) | `TF_EXTRA_EOS` (extra end-of-reply tokens) and `TF_THINK_OFF_SPLIT` |
 | 0235 | [@devopsfortunato](https://github.com/devopsfortunato), backported by [@laidick](https://github.com/laidick) | [#2276](https://github.com/ashhart/TensorFold/pull/2276), [Flash recipe #20](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/pull/20) |
