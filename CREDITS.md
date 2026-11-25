@@ -133,10 +133,6 @@ License 2.0), carried upstream in TensorFold as `zig/src/cuda/roce.zig`.
   and quantized in device memory at load; no converted copy is written or shipped.
 - **Patches 0186-0194** (2026-11-16, the TP4 release) are written for this recipe on TensorFold's glm_moe_dsa and
   DFlash2 code by Ash Hart ([@ashhart](https://github.com/ashhart)) and the TensorFold contributors:
-  - **Codex's analysis report** (written by Codex, OpenAI's coding
-    agent, for this recipe) found the int8 prompt-cache bug that patch 0186 fixes (its section 6.3), and proposed the
-    decode indexer's RoPE hoist and multi-CTA top-2048 of patch 0192 (section 4.4), the per-request experiment policy
-    of patch 0191 ("one immutable request policy") and the prompt owner rows of patches 0193-0194 (section 5.1).
   - **Patch 0192**'s multi-CTA top-2048 adapts the scan/merge scheme of patch 0067 (`tf_glm_dsel_scan` /
     `tf_glm_dsel_merge`), which Mia's AI Lab ([MiaAI-Lab](https://github.com/MiaAI-Lab)) wrote for this stack, as
     0192's commit message says.
