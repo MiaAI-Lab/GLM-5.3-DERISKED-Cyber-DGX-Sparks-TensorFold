@@ -361,7 +361,6 @@ recipes; every patch not listed under other authors below):
 - b12x's RoCE exchange ([local-inference-lab/b12x](https://github.com/local-inference-lab/b12x)), carried upstream in TensorFold.
 - [@tfolkman](https://github.com/tfolkman)'s lock fix ([DeepSeek recipe #22](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/22)).
 - [ExLlamaV3](https://github.com/turboderp-org/exllamav3) by turboderp: the EXL3 format.
-- Codex (OpenAI's coding agent): the analysis report behind patches 0186 and 0191-0194.
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) PR #22522: the evidence for programmatic dependent launches.
 - Mia's AI Lab's own recipes it builds on: [GLM-5.3-Flash-DGX-Sparks-1104](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104),
   [GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold),
