@@ -1,0 +1,1551 @@
+From 168e0e2cdcc2bcaa68997e487f37f15bca37155c Mon Sep 17 00:00:00 2001
+From: Devin <devin@cognition.ai>
+Date: Fri, 13 Nov 2026 01:03:45 +0200
+Subject: [PATCH 3/3] 0303: glm_moe_dsa's backbone graph, rope table and NVIDIA
+ NVFP4/FP8 load
+
+---
+ zig/kernels/cuda/glm_glue_attn.cuh          | 242 +++++++++++++++-----
+ zig/kernels/cuda/glm_glue_index.cuh         |  62 ++++-
+ zig/kernels/cuda/glm_glue_latent.cuh        |  76 ++++++
+ zig/src/families/glm/config.zig             |   5 +
+ zig/src/families/glm/cuda_dsa_block.zig     |  79 +++++--
+ zig/src/families/glm/cuda_formats.zig       |   6 +-
+ zig/src/families/glm/cuda_forward.zig       |  53 ++++-
+ zig/src/families/glm/cuda_glue.zig          |  17 ++
+ zig/src/families/glm/cuda_kv_shard_attn.zig |   2 +
+ zig/src/families/glm/cuda_latent.zig        |  38 +--
+ zig/src/families/glm/cuda_shared.zig        |   1 +
+ zig/src/families/glm/cuda_sparse.zig        |  41 ++++
+ zig/src/families/glm/cuda_state.zig         |  16 +-
+ zig/src/families/glm/cuda_weights.zig       | 128 ++++++++---
+ zig/src/native/cuda.zig                     |   2 +-
+ 15 files changed, 631 insertions(+), 137 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index b016c3f..7641c65 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -7,10 +7,14 @@
+ namespace glm_attn {
+ 
+ constexpr int LW = 512, KT = 32, CH = 512, KPAD = LW + 8;
++// glm_moe_dsa's latent rows are 512 latent dims plus a 64-dim rope key (LWV 576): the queries ride [absorbed | rope],
++// the cache rows [latent | rope], and the score dot runs the whole 576 while the output stays the 512 latent dims.
++constexpr int DSA_LW = 576;
+ // chunks_wide's block: its 8 warps' (key group, head block) split and the FP8 tiles' units a thread both assume it;
+ // cuda_latent.chunk_threads launches it, and a launch of any other width traps instead of leaving keys unloaded.
+ constexpr int CHUNK_THREADS = 256;
+ static_assert(KT * (LW / 8) % CHUNK_THREADS == 0, "an FP8 tile's 8-code units split evenly over the block");
++static_assert(KT * (DSA_LW / 8) % CHUNK_THREADS == 0, "the dsa row's tiles split evenly over the block too");
+ 
+ // p fp32 summed as Triton's tile does: a thread's two columns, the quad (xor 2, 1), then warps (w0 + w2) + (w1 + w3).
+ __device__ __forceinline__ float quad_sum(float v) {
+@@ -44,20 +48,22 @@ __device__ __forceinline__ void ldm4(uint32_t* r, const void* p) {
+                  : "r"(a));
+ }
+ 
+-// A 512-wide bf16 row's 16-byte unit u in shared memory, swizzled by the row so ldmatrix's eight rows hit eight banks.
+-__device__ __forceinline__ int wide(int row, int u) { return row * LW + ((u ^ (row & 7)) << 3); }
++// A W-wide bf16 row's 16-byte unit u in shared memory, swizzled by the row so ldmatrix's eight rows hit eight banks.
++// The chunk kernels take their row width as a template argument (LW 512, glm_moe_dsa's DSA_LW 576), so the swizzle is
++// each kernel's local `wof` over it; this file-scope form remains for 512-wide callers outside them.
++__device__ __forceinline__ int wof(int row, int u) { return row * LW + ((u ^ (row & 7)) << 3); }
+ // p's [32][32] rows (64 bytes): unit u of row r.
+ __device__ __forceinline__ int narrow(int row, int u) { return row * KT + ((u ^ ((row >> 1) & 3)) << 3); }
+ 
+ // latent._dense_chunks/_sparse_chunks (sparse 0/1), block (row, HB heads, chunk), 8 warps: online softmax by 32 keys.
+-template <int HB>
++template <int HB, int LWV = LW>
+ constexpr int wide_smem() {
+-  return (HB * LW + 2 * KT * LW + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
++  return (HB * LWV + 2 * KT * LWV + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
+ }
+ 
+ // PAGED8: an E4M3 cache on KV pages (pt, pstep bytes apart): a dense chunk is one page, a sparse key's logical token goes
+ // through the table to its page; codes and scales then load as on a window, so the arithmetic is the window's.
+-template <int HB, bool FP8 = false, bool PAGED8 = false>
++template <int HB, bool FP8 = false, bool PAGED8 = false, int LWV = LW>
+ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
+@@ -65,8 +71,9 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   constexpr int MT = HB / 16;
+   extern __shared__ __align__(16) unsigned char smem[];
+   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
+-  __nv_bfloat16* kvs = qs + HB * LW;
+-  __nv_bfloat16* ps = kvs + 2 * KT * LW;
++  __nv_bfloat16* kvs = qs + HB * LWV;
++  __nv_bfloat16* ps = kvs + 2 * KT * LWV;
++  auto wof = [](int row, int u) { return row * LWV + ((u ^ (row & 7)) << 3); };
+   float* red = reinterpret_cast<float*>(ps + HB * KT);
+   float* stat = red + HB * 4;
+   if (blockDim.x != CHUNK_THREADS) __trap();  // the launch contract above, not a tuning knob
+@@ -77,10 +84,10 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r, start = c * CH;
+   const bool live = sparse ? start < n : start <= limit;
+   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
+-  const __nv_bfloat16* keys_at = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * LW) : lc;
++  const __nv_bfloat16* keys_at = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * LWV) : lc;
+   // E4M3 tiles: each thread's 8-code units in one 8-byte load apiece, all issued before any is converted (fetch8),
+   // then converted value for value as before (store8); the loop fetches tile + 2 before its math and stores it after.
+-  constexpr int UPT = KT * (LW / 8) / CHUNK_THREADS;  // units a thread moves a tile
++  constexpr int UPT = KT * (LWV / 8) / CHUNK_THREADS;  // units a thread moves a tile
+   uint2 raw[FP8 ? UPT : 1];
+   float rsc[FP8 ? UPT : 1];
+   // on pages, a dense chunk is one page: its codes and scales are the window's at bases moved once (as keys_at above),
+@@ -90,7 +97,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   if constexpr (PAGED8) {
+     if (!sparse && live) {
+       const int64_t page = (int64_t)pt[c] * pstep;
+-      codes8 += page - start * LW;
++      codes8 += page - start * LWV;
+       scales8 = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) - start;
+     }
+   }
+@@ -101,13 +108,13 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+         const unsigned char* scale_bytes = reinterpret_cast<const unsigned char*>(scales);
+ #pragma unroll
+         for (int i = 0; i < UPT; ++i) {
+-          const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
++          const int idx = t + i * CHUNK_THREADS, key = idx / (LWV / 8), u = idx % (LWV / 8);
+           const int64_t ki = first + key;
+           const bool ok = ki < n;
+           const int s = ok ? tok[r * w + ki] : 0;  // a visible position: 0 <= s < 2^31
+           const int64_t page = ok ? (int64_t)pt[s >> 9] * pstep : 0;  // CH = 512 rows a page
+           const int row = s & (CH - 1);
+-          raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + page + (row * LW + u * 8))) : make_uint2(0u, 0u);
++          raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + page + (row * LWV + u * 8))) : make_uint2(0u, 0u);
+           rsc[i] = ok ? __ldg(reinterpret_cast<const float*>(scale_bytes + page + row * 4)) : 1.0f;
+         }
+         return;
+@@ -115,26 +122,26 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+     }
+ #pragma unroll
+     for (int i = 0; i < UPT; ++i) {
+-      const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
++      const int idx = t + i * CHUNK_THREADS, key = idx / (LWV / 8), u = idx % (LWV / 8);
+       const int64_t ki = first + key;
+       const bool ok = sparse ? ki < n : ki <= limit;
+       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+-      raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + src * LW + u * 8)) : make_uint2(0u, 0u);
++      raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + src * LWV + u * 8)) : make_uint2(0u, 0u);
+       rsc[i] = ok ? __ldg(scales8 + src) : 1.0f;
+     }
+   };
+   auto store8 = [&](int tile) {
+-    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
++    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LWV;
+ #pragma unroll
+     for (int i = 0; i < UPT; ++i) {
+-      const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
++      const int idx = t + i * CHUNK_THREADS, key = idx / (LWV / 8), u = idx % (LWV / 8);
+       const uint32_t wv[2] = {raw[i].x, raw[i].y};
+ #pragma unroll
+       for (int j = 0; j < 8; j += 2) {
+         const uint16_t bits = (uint16_t)((wv[j / 4] >> (8 * (j % 4))) & 0xffffu);  // codes j, j + 1 (little-endian)
+         const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
+-        dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, rsc[i]));
+-        dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, rsc[i]));
++        dst[wof(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, rsc[i]));
++        dst[wof(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, rsc[i]));
+       }
+     }
+   };
+@@ -144,14 +151,14 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+       store8(tile);
+       return;
+     }
+-    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
++    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LWV;
+     const int64_t first = start + tile * KT;
+-    for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
+-      const int key = idx / (LW / 8), u = idx % (LW / 8);
++    for (int idx = t; idx < KT * (LWV / 8); idx += blockDim.x) {
++      const int key = idx / (LWV / 8), u = idx % (LWV / 8);
+       const int64_t ki = first + key;
+       const bool ok = sparse ? ki < n : ki <= limit;
+       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+-      cp16(dst + wide(key, u), keys_at + src * LW + u * 8, ok);
++      cp16(dst + wof(key, u), keys_at + src * LWV + u * 8, ok);
+     }
+   };
+   float m[MT][2], l[MT][2], o[MT][8][4];
+@@ -162,10 +169,10 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+       for (int e = 0; e < 4; ++e) o[i][j][e] = 0.0f;
+   constexpr int tiles = CH / KT;
+   if (live) {
+-    for (int idx = t; idx < HB * (LW / 8); idx += blockDim.x) {
+-      const int hd = idx / (LW / 8), u = idx % (LW / 8);
++    for (int idx = t; idx < HB * (LWV / 8); idx += blockDim.x) {
++      const int hd = idx / (LWV / 8), u = idx % (LWV / 8);
+       const bool ok = h0 + hd < heads;
+-      cp16(qs + wide(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * LW + u * 8, ok);
++      cp16(qs + wof(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * LWV + u * 8, ok);
+     }
+     load_kv(0);
+     commit();
+@@ -185,17 +192,17 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+     if constexpr (FP8) {
+       if (tile + 2 < tiles) fetch8(tile + 2);  // in flight during this tile's math
+     }
+-    const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LW;
++    const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LWV;
+     const int64_t first = start + tile * KT;
+     float sc[4];
+     if (hh < MT) {
+       float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+ #pragma unroll 4
+-      for (int kk = 0; kk < LW; kk += 32) {
++      for (int kk = 0; kk < LWV; kk += 32) {
+         uint32_t a0[4], a1[4], b[4];
+-        ldm4<false>(a0, qs + wide(hh * 16 + (lane & 15), (kk >> 3) + (lane >> 4)));
+-        ldm4<false>(a1, qs + wide(hh * 16 + (lane & 15), ((kk + 16) >> 3) + (lane >> 4)));
+-        ldm4<false>(b, kv + wide(kg * 8 + (lane & 7), (kk >> 3) + (lane >> 3)));
++        ldm4<false>(a0, qs + wof(hh * 16 + (lane & 15), (kk >> 3) + (lane >> 4)));
++        ldm4<false>(a1, qs + wof(hh * 16 + (lane & 15), ((kk + 16) >> 3) + (lane >> 4)));
++        ldm4<false>(b, kv + wof(kg * 8 + (lane & 7), (kk >> 3) + (lane >> 3)));
+         glm_router::mma16816(acc, a0, b);
+         glm_router::mma16816(acc, a1, b + 2);
+       }
+@@ -256,7 +263,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+ #pragma unroll
+       for (int j = 0; j < 8; j += 2) {
+         uint32_t b[4];
+-        ldm4<true>(b, kv + wide(k16 + (lane & 15), ((warp * 64 + j * 8) >> 3) + (lane >> 4)));
++        ldm4<true>(b, kv + wof(k16 + (lane & 15), ((warp * 64 + j * 8) >> 3) + (lane >> 4)));
+         for (int i = 0; i < MT; ++i) {
+           glm_router::mma16816(o[i][j], a[i], b);
+           glm_router::mma16816(o[i][j + 1], a[i], b + 2);
+@@ -290,7 +297,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+ // in turn, each computed as chunks_wide's own block computes it (fresh m, l, o; the same code, copied, so chunks_wide's
+ // kernels keep their bytes), then merged into the row's running result by tf_glm_merge's sequence, chunk by chunk;
+ // out bf16 [rows][heads][LW] as tf_glm_merge writes it, and count-0 rows left alone. No partials.
+-template <int HB, bool FP8 = false, bool PAGED8 = false>
++template <int HB, bool FP8 = false, bool PAGED8 = false, int LWV = LW>
+ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
+@@ -298,8 +305,9 @@ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, c
+   constexpr int MT = HB / 16;
+   extern __shared__ __align__(16) unsigned char smem[];
+   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
+-  __nv_bfloat16* kvs = qs + HB * LW;
+-  __nv_bfloat16* ps = kvs + 2 * KT * LW;
++  __nv_bfloat16* kvs = qs + HB * LWV;
++  __nv_bfloat16* ps = kvs + 2 * KT * LWV;
++  auto wof = [](int row, int u) { return row * LWV + ((u ^ (row & 7)) << 3); };
+   float* red = reinterpret_cast<float*>(ps + HB * KT);
+   float* stat = red + HB * 4;
+   if (blockDim.x != CHUNK_THREADS) __trap();  // the launch contract above, not a tuning knob
+@@ -313,10 +321,10 @@ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, c
+   const int64_t start = c * CH;
+   const bool live = sparse ? start < n : start <= limit;
+   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
+-  const __nv_bfloat16* keys_at = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * LW) : lc;
++  const __nv_bfloat16* keys_at = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * LWV) : lc;
+   // E4M3 tiles: each thread's 8-code units in one 8-byte load apiece, all issued before any is converted (fetch8),
+   // then converted value for value as before (store8); the loop fetches tile + 2 before its math and stores it after.
+-  constexpr int UPT = KT * (LW / 8) / CHUNK_THREADS;  // units a thread moves a tile
++  constexpr int UPT = KT * (LWV / 8) / CHUNK_THREADS;  // units a thread moves a tile
+   uint2 raw[FP8 ? UPT : 1];
+   float rsc[FP8 ? UPT : 1];
+   // on pages, a dense chunk is one page: its codes and scales are the window's at bases moved once (as keys_at above),
+@@ -326,7 +334,7 @@ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, c
+   if constexpr (PAGED8) {
+     if (!sparse && live) {
+       const int64_t page = (int64_t)pt[c] * pstep;
+-      codes8 += page - start * LW;
++      codes8 += page - start * LWV;
+       scales8 = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) - start;
+     }
+   }
+@@ -337,13 +345,13 @@ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, c
+         const unsigned char* scale_bytes = reinterpret_cast<const unsigned char*>(scales);
+ #pragma unroll
+         for (int i = 0; i < UPT; ++i) {
+-          const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
++          const int idx = t + i * CHUNK_THREADS, key = idx / (LWV / 8), u = idx % (LWV / 8);
+           const int64_t ki = first + key;
+           const bool ok = ki < n;
+           const int s = ok ? tok[r * w + ki] : 0;  // a visible position: 0 <= s < 2^31
+           const int64_t page = ok ? (int64_t)pt[s >> 9] * pstep : 0;  // CH = 512 rows a page
+           const int row = s & (CH - 1);
+-          raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + page + (row * LW + u * 8))) : make_uint2(0u, 0u);
++          raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + page + (row * LWV + u * 8))) : make_uint2(0u, 0u);
+           rsc[i] = ok ? __ldg(reinterpret_cast<const float*>(scale_bytes + page + row * 4)) : 1.0f;
+         }
+         return;
+@@ -351,26 +359,26 @@ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, c
+     }
+ #pragma unroll
+     for (int i = 0; i < UPT; ++i) {
+-      const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
++      const int idx = t + i * CHUNK_THREADS, key = idx / (LWV / 8), u = idx % (LWV / 8);
+       const int64_t ki = first + key;
+       const bool ok = sparse ? ki < n : ki <= limit;
+       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+-      raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + src * LW + u * 8)) : make_uint2(0u, 0u);
++      raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + src * LWV + u * 8)) : make_uint2(0u, 0u);
+       rsc[i] = ok ? __ldg(scales8 + src) : 1.0f;
+     }
+   };
+   auto store8 = [&](int tile) {
+-    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
++    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LWV;
+ #pragma unroll
+     for (int i = 0; i < UPT; ++i) {
+-      const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
++      const int idx = t + i * CHUNK_THREADS, key = idx / (LWV / 8), u = idx % (LWV / 8);
+       const uint32_t wv[2] = {raw[i].x, raw[i].y};
+ #pragma unroll
+       for (int j = 0; j < 8; j += 2) {
+         const uint16_t bits = (uint16_t)((wv[j / 4] >> (8 * (j % 4))) & 0xffffu);  // codes j, j + 1 (little-endian)
+         const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
+-        dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, rsc[i]));
+-        dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, rsc[i]));
++        dst[wof(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, rsc[i]));
++        dst[wof(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, rsc[i]));
+       }
+     }
+   };
+@@ -380,14 +388,14 @@ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, c
+       store8(tile);
+       return;
+     }
+-    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
++    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LWV;
+     const int64_t first = start + tile * KT;
+-    for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
+-      const int key = idx / (LW / 8), u = idx % (LW / 8);
++    for (int idx = t; idx < KT * (LWV / 8); idx += blockDim.x) {
++      const int key = idx / (LWV / 8), u = idx % (LWV / 8);
+       const int64_t ki = first + key;
+       const bool ok = sparse ? ki < n : ki <= limit;
+       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+-      cp16(dst + wide(key, u), keys_at + src * LW + u * 8, ok);
++      cp16(dst + wof(key, u), keys_at + src * LWV + u * 8, ok);
+     }
+   };
+   float m[MT][2], l[MT][2], o[MT][8][4];
+@@ -399,10 +407,10 @@ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, c
+   constexpr int tiles = CH / KT;
+   if (live) {
+     if (c == 0)  // the row's heads once (the later chunks keep them)
+-      for (int idx = t; idx < HB * (LW / 8); idx += blockDim.x) {
+-        const int hd = idx / (LW / 8), u = idx % (LW / 8);
++      for (int idx = t; idx < HB * (LWV / 8); idx += blockDim.x) {
++        const int hd = idx / (LWV / 8), u = idx % (LWV / 8);
+         const bool ok = h0 + hd < heads;
+-        cp16(qs + wide(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * LW + u * 8, ok);
++        cp16(qs + wof(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * LWV + u * 8, ok);
+       }
+     load_kv(0);
+     commit();
+@@ -422,17 +430,17 @@ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, c
+     if constexpr (FP8) {
+       if (tile + 2 < tiles) fetch8(tile + 2);  // in flight during this tile's math
+     }
+-    const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LW;
++    const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LWV;
+     const int64_t first = start + tile * KT;
+     float sc[4];
+     if (hh < MT) {
+       float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+ #pragma unroll 4
+-      for (int kk = 0; kk < LW; kk += 32) {
++      for (int kk = 0; kk < LWV; kk += 32) {
+         uint32_t a0[4], a1[4], b[4];
+-        ldm4<false>(a0, qs + wide(hh * 16 + (lane & 15), (kk >> 3) + (lane >> 4)));
+-        ldm4<false>(a1, qs + wide(hh * 16 + (lane & 15), ((kk + 16) >> 3) + (lane >> 4)));
+-        ldm4<false>(b, kv + wide(kg * 8 + (lane & 7), (kk >> 3) + (lane >> 3)));
++        ldm4<false>(a0, qs + wof(hh * 16 + (lane & 15), (kk >> 3) + (lane >> 4)));
++        ldm4<false>(a1, qs + wof(hh * 16 + (lane & 15), ((kk + 16) >> 3) + (lane >> 4)));
++        ldm4<false>(b, kv + wof(kg * 8 + (lane & 7), (kk >> 3) + (lane >> 3)));
+         glm_router::mma16816(acc, a0, b);
+         glm_router::mma16816(acc, a1, b + 2);
+       }
+@@ -493,7 +501,7 @@ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, c
+ #pragma unroll
+       for (int j = 0; j < 8; j += 2) {
+         uint32_t b[4];
+-        ldm4<true>(b, kv + wide(k16 + (lane & 15), ((warp * 64 + j * 8) >> 3) + (lane >> 4)));
++        ldm4<true>(b, kv + wof(k16 + (lane & 15), ((warp * 64 + j * 8) >> 3) + (lane >> 4)));
+         for (int i = 0; i < MT; ++i) {
+           glm_router::mma16816(o[i][j], a[i], b);
+           glm_router::mma16816(o[i][j + 1], a[i], b + 2);
+@@ -639,6 +647,25 @@ extern "C" __global__ void __launch_bounds__(256)
+                                               out, nch);
+ }
+ 
++// glm_moe_dsa's 576-wide rows (512 latent dims + the 64-dim rope key) in bf16: the same kernels over DSA_LW rows,
++// their output partials and bf16 out still the 512 latent dims. Only the 16-head forms exist: the 32-head block's
++// 113 KB of shared memory passes no device this recipe builds for (GB10's opt-in is 101,376 B), and the dsa's rank
++// never asks for it (cuda_dsa_block forces the 16-head block on its rows).
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_16_w576(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
++                          const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
++                          float scale, int sparse, const int* pt, int64_t pstep) {
++  glm_attn::chunks_wide<16, false, false, glm_attn::DSA_LW>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale,
++                                                            sparse, pt, pstep);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_16_fused_w576(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* tok, const int* cnt,
++                                __nv_bfloat16* out, int64_t rows, int64_t heads, int64_t w, float scale, int nch,
++                                const int* pt, int64_t pstep) {
++  glm_attn::chunks_fused<16, false, false, glm_attn::DSA_LW>(qa, lc, nullptr, tok, cnt, nullptr, nullptr, nullptr,
++                                                             rows, heads, w, scale, 1, pt, pstep, nullptr, out, nch);
++}
++
+ // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
+@@ -830,3 +857,102 @@ extern "C" __global__ void __launch_bounds__(128)
+       }
+   }
+ }
++
++// glm_moe_dsa's scores (tf_glm_scores over its own per-token keys, not pools): the queries roped in place once a row
++// (pairs (2 i, 2 i + 1) -> (i, 32 + i), the row's position), the keys the index cache's roped rows at position p,
++// visible while p <= pos + r, -inf past it. The head weights and the relu'd scaled dots are tf_glm_scores'.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_glm_dsa_scores(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const __nv_bfloat16* ik,
++                      float* out, const int* pos, int64_t np, int64_t nb, float scale, float wscale, int64_t heads,
++                      int loop, const float* inv) {
++  constexpr int D = 128, HP = 32, BP = 64, ROPE = 64;
++  __shared__ __align__(16) __nv_bfloat16 sm[4 * 2 * 16 * D];  // q's 32 rows, then each warp's two 16-key buffers
++  auto at = [](int row, int u) { return row * D + ((u ^ (row & 7)) << 3); };
++  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
++  const int64_t r = blockIdx.x, n = (int64_t)pos[0] + r + 1;
++  for (int idx = threadIdx.x; idx < HP * (D / 8); idx += 128) {
++    const int hh = idx / (D / 8), u = idx % (D / 8);
++    const bool ok = hh < heads;
++    glm_attn::cp16(sm + at(hh, u), qi + (r * heads + (ok ? hh : 0)) * D + u * 8, ok);
++  }
++  glm_attn::commit();
++  float wv[4];
++  for (int i = 0; i < 4; ++i) {
++    const int64_t hh = g + 8 * i;
++    wv[i] = hh < heads ? glm_triton::fmul(__bfloat162float(wts[r * w_stride + hh]), wscale) : 0.0f;
++  }
++  // A block's keys for this warp: rows p0 .. p0 + 15 of the index cache, 16 chunks of 16 bytes, 8 a lane.
++  auto stage = [&](int buf, int64_t p0) {
++    const __nv_bfloat16* src = ik + (p0 < n ? p0 : 0) * D;
++#pragma unroll
++    for (int t = 0; t < 8; ++t) {
++      const int idx = lane + t * 32, row = idx / (D / 8), u = idx % (D / 8);
++      const int64_t p = p0 + row;
++      const bool ok = p < n;
++      glm_attn::cp16(sm + (warp * 2 + buf) * 16 * D + at(row, u), src + (ok ? row : 0) * D + u * 8, ok);
++    }
++  };
++  const int64_t first = (int64_t)blockIdx.y * loop;
++  // Blocks that score: those under nb with visible keys (pb * BP < n); the rest only write -inf.
++  auto live = [&](int j) { const int64_t pb = first + j; return j < loop && pb < nb && pb * BP < n; };
++  glm_attn::wait<0>();
++  __syncthreads();
++  // The queries' rope, in place while q's rows are the only thing in shared: then the fragments read roped queries.
++  const int p0q = pos[0] + (int)r;
++  for (int idx = threadIdx.x; idx < HP * (ROPE / 2); idx += 128) {
++    const int hh = idx / (ROPE / 2), i = idx % (ROPE / 2);
++    if (hh >= heads) continue;
++    const int u0 = (2 * i) / 8, l0 = (2 * i) % 8;
++    const float x0 = __bfloat162float(sm[at(hh, u0) + l0]), x1 = __bfloat162float(sm[at(hh, u0) + l0 + 1]);
++    const float2 o = glm_dsa_rope(x0, x1, p0q, inv, i);
++    sm[at(hh, i / 8) + i % 8] = __float2bfloat16_rn(o.x);
++    sm[at(hh, D / 4 + i / 8) + i % 8] = __float2bfloat16_rn(o.y);
++  }
++  __syncthreads();
++  uint32_t aq[D / 16][2][4];
++#pragma unroll
++  for (int kq = 0; kq < D / 16; ++kq)
++#pragma unroll
++    for (int i = 0; i < 2; ++i) glm_attn::ldm4<false>(aq[kq][i], sm + at(i * 16 + (lane & 15), kq * 2 + (lane >> 4)));
++  __syncthreads();  // q's fragments are in registers: the key buffers take its place
++  if (live(0)) stage(0, first * BP + warp * 16);
++  glm_attn::commit();
++  for (int j = 0; j < loop; ++j) {
++    const int64_t pb = first + j;
++    if (pb >= nb) break;
++    const int64_t p0 = pb * BP + warp * 16;
++    if (!live(j)) {
++      for (int e = lane; e < 16; e += 32)
++        if (p0 + e < np) out[r * np + p0 + e] = -INFINITY;
++      continue;
++    }
++    if (live(j + 1)) stage((j + 1) & 1, p0 + BP);
++    glm_attn::commit();
++    glm_attn::wait<1>();
++    __syncwarp();
++    float acc[2][2][4] = {};
++    const __nv_bfloat16* keys = sm + (warp * 2 + (j & 1)) * 16 * D;
++#pragma unroll
++    for (int kq = 0; kq < D / 16; ++kq) {
++      uint32_t b[4];
++      glm_attn::ldm4<false>(b, keys + at((lane >> 4) * 8 + (lane & 7), kq * 2 + ((lane >> 3) & 1)));
++      for (int nt = 0; nt < 2; ++nt)
++        for (int i = 0; i < 2; ++i) glm_router::mma16816(acc[i][nt], aq[kq][i], b + 2 * nt);
++    }
++    __syncwarp();
++    for (int nt = 0; nt < 2; ++nt)
++      for (int e = 0; e < 2; ++e) {
++        const float v0 = fmaxf(__fmul_rn(acc[0][nt][e], scale), 0.0f),
++                    v1 = fmaxf(__fmul_rn(acc[0][nt][e + 2], scale), 0.0f);
++        const float v2 = fmaxf(__fmul_rn(acc[1][nt][e], scale), 0.0f),
++                    v3 = fmaxf(__fmul_rn(acc[1][nt][e + 2], scale), 0.0f);
++        float s = glm_triton::fmul(wv[1], v1);
++        s = __fmaf_rn(wv[0], v0, s);
++        s = __fmaf_rn(wv[2], v2, s);
++        s = __fmaf_rn(wv[3], v3, s);
++        for (int o = 16; o >= 4; o >>= 1) s = s + __shfl_xor_sync(0xffffffffu, s, o);
++        const int64_t p = p0 + nt * 8 + q * 2 + e;
++        if (g == 0 && p < np) out[r * np + p] = p < n ? s : -INFINITY;
++      }
++  }
++}
+diff --git a/zig/kernels/cuda/glm_glue_index.cuh b/zig/kernels/cuda/glm_glue_index.cuh
+index fc90360..dda0cf9 100644
+--- a/zig/kernels/cuda/glm_glue_index.cuh
++++ b/zig/kernels/cuda/glm_glue_index.cuh
+@@ -218,8 +218,10 @@ __device__ __forceinline__ int block_scan(int v, int (*wsum)[W], int slot, int*
+ }
+ 
+ // sparse._select_rows (VISIBLE), a row per T-thread block: K best visible pools by 8-bit radix select, ties to lower.
+-template <int T>
+-__device__ __forceinline__ void select_row(const float* scores, int64_t* out, int64_t np, const int* pos, int k) {
++// POOLED divides the row's visible count by Flash's 4-token pool; glm_moe_dsa scores per-token keys (POOLED false).
++// O sets the list's width (Flash's pools int64; glm_moe_dsa's token lists int32).
++template <int T, bool POOLED = true, typename O = int64_t>
++__device__ __forceinline__ void select_row(const float* scores, O* out, int64_t np, const int* pos, int k) {
+   __shared__ int hist[256];
+   __shared__ uint32_t sh_prefix;
+   __shared__ int sh_need, wsum[2][T / 32];
+@@ -227,7 +229,7 @@ __device__ __forceinline__ void select_row(const float* scores, int64_t* out, in
+   const float* row = scores + r * np;
+   const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+   const unsigned below = (1u << lane) - 1;
+-  const int64_t vis = ((int64_t)pos[0] + r + 1) / 4;
++  const int64_t vis = POOLED ? ((int64_t)pos[0] + r + 1) / 4 : (int64_t)pos[0] + r + 1;
+   const int64_t limit = np < (vis > k ? vis : k) ? np : (vis > k ? vis : k);
+   const bool vec = (reinterpret_cast<uintptr_t>(row) & 15) == 0;
+   // The order keys of pools c + 8 t .. + 7 (0 past limit; callers test the index).
+@@ -311,7 +313,7 @@ __device__ __forceinline__ void select_row(const float* scores, int64_t* out, in
+     }
+     int at = run_take + block_scan<T / 32>(takes, wsum, 1, &all_take);
+     for (int j = 0; j < 8; ++j)
+-      if (take[j]) out[r * k + at++] = c + 8 * t + j;
++      if (take[j]) out[r * k + at++] = static_cast<O>(c + 8 * t + j);
+     run_eq += all_eq;
+     run_take += all_take;
+   }
+@@ -330,3 +332,55 @@ extern "C" __global__ void __launch_bounds__(1024)
+     tf_glm_select_rows_wide(const float* scores, int64_t* out, int64_t np, const int* pos, int k) {
+   glm_index::select_row<1024>(scores, out, np, pos, k);
+ }
++
++// glm_moe_dsa's top-k: each row's best 2048 of its own per-token keys' scores (no pools), i32 lists by position,
++// then the count: 2048 past the all-visible prefix, 0 within it (those rows keep the dense pass's whole-context result).
++extern "C" __global__ void __launch_bounds__(1024)
++    tf_glm_dsa_topk(const float* scores, int* out, int64_t np, const int* pos, int k, int* counts) {
++  glm_index::select_row<1024, false, int>(scores, out, np, pos, k);
++  if (threadIdx.x == 0) {
++    const int64_t n = (int64_t)pos[0] + blockIdx.x + 1;
++    counts[blockIdx.x] = n > k ? k : 0;
++  }
++}
++
++// glm_moe_dsa's index key write, a warp a row: LayerNorm of the fused kw output's key half (its first 128 dims,
++// tf_glm_index_write's LN), then the interleaved 64-wide rope on the first 64 dims, into the index cache at the row's
++// position. glm_moe_dsa caches roped keys (its scores dot roped queries) and has no gate row.
++extern "C" __global__ void __launch_bounds__(32)
++    tf_glm_index_write_dsa(const __nv_bfloat16* kr, int64_t k_stride, const __nv_bfloat16* lnw, const __nv_bfloat16* lnb,
++                           __nv_bfloat16* ik, const int* pos, const float* inv, float eps) {
++  constexpr int D = 128, ROPE = 64;
++  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
++  const int d0 = threadIdx.x * 4;
++  float x[4];
++  for (int j = 0; j < 4; ++j) x[j] = bf(kr[r * k_stride + d0 + j]);
++  float s = x[0] + x[1];
++  s = x[2] + s;
++  s = x[3] + s;
++  for (int o = 16; o > 0; o >>= 1) s = s + __shfl_xor_sync(0xffffffffu, s, o);
++  const float mean = div_full(s, (float)D);
++  float xc[4];
++  for (int j = 0; j < 4; ++j) xc[j] = __fsub_rn(x[j], mean);  // sub.rn in Triton: never contracted
++  float v = fmul(xc[1], xc[1]);
++  v = __fmaf_rn(xc[0], xc[0], v);
++  v = __fmaf_rn(xc[2], xc[2], v);
++  v = __fmaf_rn(xc[3], xc[3], v);
++  for (int o = 16; o > 0; o >>= 1) v = v + __shfl_xor_sync(0xffffffffu, v, o);
++  const float sd = sqrt_approx(fadd(eps, div_full(v, (float)D)));
++  const int p = pos[0] + (int)r;
++  for (int j = 0; j < 4; ++j) {
++    const int d = d0 + j;
++    const float y = __fmaf_rn(div_full(xc[j], sd), bf(lnw[d]), bf(lnb[d]));
++    if (d >= ROPE) {
++      ik[at * D + d] = __float2bfloat16_rn(y);
++      continue;
++    }
++    if (d & 1) continue;  // its pair (d - 1, d) was roped and written by the even dim
++    // a thread's dims 4 t .. 4 t + 3 hold the pairs (4 t, 4 t + 1), (4 t + 2, 4 t + 3): i = d / 2, out at i and 32 + i
++    const float y1 = __fmaf_rn(div_full(xc[j + 1], sd), bf(lnw[d + 1]), bf(lnb[d + 1]));
++    const float2 o = glm_dsa_rope(y, y1, p, inv, d / 2);
++    ik[at * D + d / 2] = __float2bfloat16_rn(o.x);
++    ik[at * D + ROPE / 2 + d / 2] = __float2bfloat16_rn(o.y);
++  }
++}
+diff --git a/zig/kernels/cuda/glm_glue_latent.cuh b/zig/kernels/cuda/glm_glue_latent.cuh
+index 12be317..ab2ad0c 100644
+--- a/zig/kernels/cuda/glm_glue_latent.cuh
++++ b/zig/kernels/cuda/glm_glue_latent.cuh
+@@ -66,6 +66,82 @@ extern "C" __global__ void __launch_bounds__(128)
+   }
+ }
+ 
++// glm_moe_dsa's absorb: q_nope is 192 of each head's 256 dims (the last 64 are its rope share, qa_rope moves them),
++// wk [heads * 192][512], and each head's output row is 576 wide (the absorbed 512, then room for the roped query).
++// The rest is tf_glm_absorb_q's structure with those widths, fp32 sums, bf16 out.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_glm_absorb_q_dsa(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa, int64_t rows,
++                        int64_t heads, int64_t rb) {
++  constexpr int D = 192, QS = 256, LW = 512, OS = 576;
++  __shared__ float smem[128];
++  const int t = threadIdx.x, k0 = t >> 2, nq = t & 3, warp = t >> 5;
++  const int64_t h = blockIdx.x, n0 = (int64_t)blockIdx.y * 32 + nq * 8, r0 = blockIdx.z * rb;
++  float w[6][8];
++  for (int rep = 0; rep < 6; ++rep)
++    for (int j = 0; j < 8; ++j) w[rep][j] = bf(wk[(h * D + k0 + 32 * rep) * LW + n0 + j]);
++  for (int64_t r = r0; r < r0 + rb && r < rows; ++r) {
++    float qv[6];
++    for (int rep = 0; rep < 6; ++rep) qv[rep] = bf(q[(r * heads + h) * QS + k0 + 32 * rep]);
++    for (int j = 0; j < 8; ++j) {
++      float a = fmul(w[1][j], qv[1]);
++      a = __fmaf_rn(w[0][j], qv[0], a);
++      for (int rep = 2; rep < 6; ++rep) a = __fmaf_rn(w[rep][j], qv[rep], a);
++      for (int o = 16; o >= 4; o >>= 1) a = a + __shfl_xor_sync(0xffffffffu, a, o);
++      if ((t & 28) == 0) smem[(nq * 8 + j) * 4 + warp] = a;
++    }
++    __syncthreads();
++    float v = smem[t];
++    v = v + __shfl_xor_sync(0xffffffffu, v, 2);
++    v = v + __shfl_xor_sync(0xffffffffu, v, 1);
++    if ((t & 3) == 0) qa[(r * heads + h) * OS + (int64_t)blockIdx.y * 32 + t / 4] = __float2bfloat16_rn(v);
++    __syncthreads();
++  }
++}
++
++// glm_moe_dsa's interleaved 64-wide rope at position pos: pair i of (x[2i], x[2i+1]) -> (out[i], out[32 + i]),
++// inv[i] = theta^(-i / 32) (the host's table), fp32 sincos as the Metal family's precise::cos / sin.
++__device__ __forceinline__ float2 glm_dsa_rope(float x0, float x1, int pos, const float* inv, int i) {
++  const float a = __fmul_rn((float)pos, inv[i]);
++  float c, s;
++  sincosf(a, &s, &c);
++  return make_float2(__fmaf_rn(x0, c, -__fmul_rn(x1, s)), __fmaf_rn(x1, c, __fmul_rn(x0, s)));
++}
++
++// tf_glm_qa_rope, block a row of 256: each head's roped query tail (q's dims 192..256) into its qa row's top,
++// qa[(r * heads + h) * 576 + 512 + i] and + 32 + i. After tf_glm_absorb_q_dsa, whose out rows leave those 64 free.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_qa_rope(const __nv_bfloat16* q, __nv_bfloat16* qa, const int* pos, const float* inv, int64_t rows,
++                   int64_t heads) {
++  constexpr int QS = 256, NOPE = 192, OS = 576, ROPE = 64;
++  const int64_t r = blockIdx.x;
++  const int p = pos[0] + (int)r;
++  for (int idx = threadIdx.x; idx < heads * (ROPE / 2); idx += blockDim.x) {
++    const int64_t h = idx / (ROPE / 2);
++    const int i = idx % (ROPE / 2);
++    const float x0 = bf(q[(r * heads + h) * QS + NOPE + 2 * i]), x1 = bf(q[(r * heads + h) * QS + NOPE + 2 * i + 1]);
++    const float2 o = glm_dsa_rope(x0, x1, p, inv, i);
++    qa[(r * heads + h) * OS + 512 + i] = __float2bfloat16_rn(o.x);
++    qa[(r * heads + h) * OS + 512 + ROPE / 2 + i] = __float2bfloat16_rn(o.y);
++  }
++}
++
++// tf_glm_kv_rope, a warp a row: the kv_a slice's rope tail (its dims 512..576, raw) roped into the latent row's top,
++// lat[r * 576 + 512 + i] and + 32 + i. The kv_a proj emits [latent 512 | rope 64]; only the latent half is normalized.
++extern "C" __global__ void __launch_bounds__(32)
++    tf_glm_kv_rope(const __nv_bfloat16* dp, int64_t dp_stride, __nv_bfloat16* lat, int64_t lat_stride, const int* pos,
++                   const float* inv, int64_t rows, int64_t q_lora) {
++  constexpr int LAT = 512, ROPE = 64;
++  const int64_t r = blockIdx.x;
++  const int p = pos[0] + (int)r;
++  const int i = threadIdx.x;
++  if (i >= ROPE / 2) return;
++  const float x0 = bf(dp[r * dp_stride + q_lora + LAT + 2 * i]);
++  const float x1 = bf(dp[r * dp_stride + q_lora + LAT + 2 * i + 1]);
++  const float2 o = glm_dsa_rope(x0, x1, p, inv, i);
++  lat[r * lat_stride + LAT + i] = __float2bfloat16_rn(o.x);
++  lat[r * lat_stride + LAT + ROPE / 2 + i] = __float2bfloat16_rn(o.y);
++}
++
+ namespace glm_pages {
+ 
+ // Row r's first element in a cache of `width`-element rows: in order (pt null), or row r % P of page pt[r / P].
+diff --git a/zig/src/families/glm/config.zig b/zig/src/families/glm/config.zig
+index 4e6e2fb..9beeb28 100644
+--- a/zig/src/families/glm/config.zig
++++ b/zig/src/families/glm/config.zig
+@@ -49,6 +49,7 @@ pub const Config = struct {
+     mtp: u32 = 1,
+     dsa: bool = false, // glm_moe_dsa (full GLM-5.3): no KDA, no mHC, a rope plane, per-token indexer keys
+     rope: u32 = 0, // rotary dims of q and k: 64 on glm_moe_dsa; Flash's attention has none
++    rope_theta: f64 = 10000, // its base: glm_moe_dsa's 8e6 (the engine hangs the frequencies at init)
+     tp: u32 = 1, // tensor parallel: the Macs splitting the attention heads
+     tp_rank: u32 = 0,
+     eos: [3]u32 = .{ 154820, 154827, 154829 },
+@@ -238,6 +239,10 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
+     if (dsa) {
+         c.dsa = true;
+         c.rope = @intCast(try int(t, "qk_rope_head_dim"));
++        // the checkpoint nests its rope base in rope_parameters (some exports put it top level)
++        if (t.get("rope_parameters")) |rp| {
++            if (rp == .object) c.rope_theta = try float(rp.object, "rope_theta") else c.rope_theta = try float(t, "rope_theta");
++        } else c.rope_theta = try float(t, "rope_theta");
+         c.kpool = 1; // per-token indexer keys: no pooling (the config has no index_kpool)
+         c.hc = 0; // no mHC residuals (the config has no hc_mult)
+         c.mla = std.StaticBitSet(max_layers).empty;
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index 2f9b87b..2366c1e 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -15,6 +15,9 @@ pub const prompt_att_rows = 512;
+ pub const Index = struct { kw: projection.Proj, gate: u64, ln_w: u64, ln_b: u64, ape: u64, qb: projection.Proj, heads: usize, d: usize };
+ 
+ /// One DSA layer on a rank of `heads` heads: proj, norms, q_b, kv_b per head as wk/wv, o, indexer; shapes from config.
++/// glm_moe_dsa's layers carry `rope` 64 (Flash's attention has none): the cache and query rows are `lw + rope` wide,
++/// the last 64 dims the roped share, and `inv` the device table of rope frequencies (theta^(-i / 32), 32 floats).
++/// `ifull` false on its shared layers: they carry no indexer and reuse the last full layer's token list.
+ pub const Layer = struct {
+     proj: projection.Proj, // [q_a | kv_a], q_b and o as the checkpoint stores them: bf16, block FP8 or the MTP's MXFP8
+     q_norm: u64,
+@@ -32,6 +35,14 @@ pub const Layer = struct {
+     dims: usize,
+     eps: f32,
+     dense_limit: usize, // the largest context whose top-k selection keeps every visible key (Config.keyWidth)
++    rope: usize = 0, // the rotary dims: 64 on glm_moe_dsa (its rows lw + rope wide), 0 on Flash
++    inv: u64 = 0, // the rope frequencies on the device (glm_moe_dsa); 0 without a rope plane
++    ifull: bool = true, // glm_moe_dsa's indexer_types; Flash's every layer is full
++
++    /// The cache and query rows' width: the latent plus the rope plane.
++    pub fn rowW(l: Layer) usize {
++        return l.lw + l.rope;
++    }
+ };
+ 
+ /// The caches: latent bf16 [capacity][lw], index keys/gates bf16 [capacity][128], pooled keys bf16 [pk_rows][128].
+@@ -118,11 +129,12 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
+ 
+ pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool, profile: ?*prof.Prof) !void {
+     var stamp = prof.span(profile, stream, .replicated_qakva);
+-    const width = l.q_lora + l.lw;
++    const width = l.q_lora + l.rowW();
+     const ix = l.index;
+     const kw_n = ix.d + ix.heads;
++    const has_ix = l.ifull; // a shared layer carries no indexer tensors at all: its kw/qb/gate reads would fault
+     // a decode window's [q_a | kv_a] and the indexer's kw read the same rows: one launch, each its own K slices
+-    const two_kw = try projection.matmulTwo(set, stream, .{ l.proj, ix.kw }, .{ x, x }, .{ x_stride, x_stride }, .{ s.dp, s.ikr }, .{ width, kw_n }, .{ l.dims, l.dims }, s.mm_part, s.mm_part_bytes, rows);
++    const two_kw = if (has_ix) try projection.matmulTwo(set, stream, .{ l.proj, ix.kw }, .{ x, x }, .{ x_stride, x_stride }, .{ s.dp, s.ikr }, .{ width, kw_n }, .{ l.dims, l.dims }, s.mm_part, s.mm_part_bytes, rows) else false;
+     if (!two_kw) try projection.matmul(set, stream, l.proj, x, x_stride, s.dp, s.mm_part, rows, width, l.dims, false);
+     try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
+     try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
+@@ -130,12 +142,34 @@ pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch,
+     stamp = prof.span(profile, stream, .projections);
+     defer stamp.end();
+     // and q_b with the indexer's qb (sparse rows only) on the q rows, likewise
+-    const two_qb = if (qi) try projection.matmulTwo(set, stream, .{ l.q_b, ix.qb }, .{ s.qr, s.qr }, .{ l.q_lora, l.q_lora }, .{ s.q, s.qi }, .{ l.heads * l.qk, ix.heads * ix.d }, .{ l.q_lora, l.q_lora }, s.mm_part, s.mm_part_bytes, rows) else false;
++    const two_qb = if (qi and has_ix) try projection.matmulTwo(set, stream, .{ l.q_b, ix.qb }, .{ s.qr, s.qr }, .{ l.q_lora, l.q_lora }, .{ s.q, s.qi }, .{ l.heads * l.qk, ix.heads * ix.d }, .{ l.q_lora, l.q_lora }, s.mm_part, s.mm_part_bytes, rows) else false;
+     if (!two_qb) try projection.matmul(set, stream, l.q_b, s.qr, l.q_lora, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
+-    if (!two_kw) try projection.matmul(set, stream, ix.kw, x, x_stride, s.ikr, s.mm_part, rows, kw_n, l.dims, false);
+-    try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
+-    try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
+-    if (qi and !two_qb) try projection.matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
++    if (!two_kw and has_ix) try projection.matmul(set, stream, ix.kw, x, x_stride, s.ikr, s.mm_part, rows, kw_n, l.dims, false);
++    if (ix.gate != 0) try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
++    try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk - l.rope, l.qk, l.lw, l.rowW());
++    if (qi and !two_qb and has_ix) try projection.matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
++}
++
++/// The rows' roped query tails into their absorbed rows' top (glm_glue_latent.cuh's tf_glm_qa_rope), after the
++/// absorb whose 576-wide out rows leave the top 64 free. `pos` the call's device position (its rows pos .. pos + rows).
++pub fn qaRope(set: glue.Set, stream: cuda.Stream, l: Layer, q: u64, qa: u64, pos: u64, rows: usize) !void {
++    var a: cuda.Args = .{};
++    inline for (.{ q, qa, pos, l.inv, @as(i64, @intCast(rows)), @as(i64, @intCast(l.heads)) }) |v| a.add(v);
++    try cuda.launch.launch(set.glue.qa_rope, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
++}
++
++/// The rows' kv_a rope tails into their latent rows' top (tf_glm_kv_rope), before the cache write takes the whole row.
++pub fn kvRope(set: glue.Set, stream: cuda.Stream, l: Layer, dp: u64, lat: u64, pos: u64, rows: usize) !void {
++    var a: cuda.Args = .{};
++    inline for (.{ dp, @as(i64, @intCast(l.q_lora + l.rowW())), lat, @as(i64, @intCast(l.rowW())), pos, l.inv, @as(i64, @intCast(rows)), @as(i64, @intCast(l.q_lora)) }) |v| a.add(v);
++    try cuda.launch.launch(set.glue.kv_rope, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
++}
++
++/// glm_moe_dsa's index keys: LayerNormed, first-64 roped, into the index cache at pos (tf_glm_index_write_dsa).
++pub fn indexWriteDsa(set: glue.Set, stream: cuda.Stream, l: Layer, ikr: u64, ik: u64, pos: u64, rows: usize) !void {
++    var a: cuda.Args = .{};
++    inline for (.{ ikr, @as(i64, @intCast(l.index.d + l.index.heads)), l.index.ln_w, l.index.ln_b, ik, pos, l.inv, @as(f32, 1e-6) }) |v| a.add(v);
++    try cuda.launch.launch(set.glue.index_write_dsa, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
+ }
+ 
+ /// One sequence's rows r0..r0 + rows at pos: latent and index keys written, dense then sparse attention into s.ol.
+@@ -144,6 +178,7 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
+     const ix = l.index;
+     const kw_rows = ix.d + ix.heads;
+     const v = try attendWrite(k, stream, l, c, s, r0, rows, pos);
++    if (l.rope != 0) try qaRope(set, stream, l, s.q, v.qa, pos, rows);
+     const t = table(l, c);
+     const scale = attnScale(l);
+     if (host_pos < l.dense_limit) {
+@@ -152,10 +187,12 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
+         stamp.end();
+     }
+     if (sparseRows(l, host_pos, rows)) {
+-        try sparse.selectTokensProfile(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
++        if (l.ifull) { // a shared layer reuses the last full layer's token lists still in v.tokens/counts
++            if (l.rope != 0) try sparse.dsaSelect(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, l.inv, c.ik, pos, host_pos, rows, ix.heads, ix.d, v.select, v.tokens, v.counts, k.prof) else try sparse.selectTokensProfile(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
++        }
+         const stamp = prof.span(k.prof, stream, .mla);
+         defer stamp.end();
+-        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, latTable(l, c), v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
++        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, latTable(l, c), v.tokens, v.counts, if (l.rope != 0) sparse.dsa_width else sparse.width, v.partials, v.ol, rows, l.heads, l.rowW(), scale);
+     }
+ }
+ 
+@@ -186,7 +223,7 @@ pub fn attendOnly(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scrat
+     if (sparseRows(l, host_pos, rows)) {
+         const stamp = prof.span(k.prof, stream, .mla);
+         defer stamp.end();
+-        try latent.sparseAttentionFormat(k.set, stream, qa, c.lc, c.ls, latTable(l, c), tokens, counts, sparse.width, v.partials, ol, rows, l.heads, l.lw, scale);
++        try latent.sparseAttentionFormat(k.set, stream, qa, c.lc, c.ls, latTable(l, c), tokens, counts, if (l.rope != 0) sparse.dsa_width else sparse.width, v.partials, ol, rows, l.heads, l.rowW(), scale);
+     }
+ }
+ 
+@@ -210,10 +247,10 @@ pub fn attendScratch(l: Layer, s: Scratch, r0: usize) Scratch {
+     const ix = l.index;
+     const kw_rows = ix.d + ix.heads;
+     var v = s;
+-    v.lat += r0 * l.lw * 2;
++    v.lat += r0 * l.rowW() * 2;
+     v.ikr += r0 * kw_rows * 2;
+     v.igr += r0 * ix.d * 4;
+-    v.qa += r0 * l.heads * l.lw * 2;
++    v.qa += r0 * l.heads * l.rowW() * 2;
+     v.ol += r0 * l.heads * l.lw * 2;
+     v.qi += r0 * ix.heads * ix.d * 2;
+     return v;
+@@ -229,11 +266,14 @@ pub fn attendWrite(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scra
+     if (c.ps % (l.lw * 2) != 0 or c.latPs() % (l.lw * 2) != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
+     const t = table(l, c);
+     var stamp = prof.span(k.prof, stream, .cache_write);
+-    try latent.latentWriteFormat(set, stream, v.lat, l.lw, c.lc, c.ls, latTable(l, c), pos, rows, l.lw);
+-    stamp.end();
+-    stamp = prof.span(k.prof, stream, .index_update);
+-    try sparse.indexUpdate(set, stream, v.ikr, kw_rows, v.igr, ix.ln_w, ix.ln_b, ix.ape, c.ik, c.ig, c.pk, t, pos, rows);
++    if (l.rope != 0) try kvRope(set, stream, l, s.dp, v.lat, pos, rows); // the latent row's roped tail, then the whole 576
++    try latent.latentWriteFormat(set, stream, v.lat, l.rowW(), c.lc, c.ls, latTable(l, c), pos, rows, l.rowW());
+     stamp.end();
++    if (l.ifull) { // a shared layer carries no indexer: it reuses the last full layer's token list whole
++        stamp = prof.span(k.prof, stream, .index_update);
++        if (l.rope != 0) try indexWriteDsa(set, stream, l, v.ikr, c.ik, pos, rows) else try sparse.indexUpdate(set, stream, v.ikr, kw_rows, v.igr, ix.ln_w, ix.ln_b, ix.ape, c.ik, c.ig, c.pk, t, pos, rows);
++        stamp.end();
++    }
+     return v;
+ }
+ 
+@@ -335,7 +375,7 @@ pub fn attendSegs(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, t: *con
+ 
+ /// forward.dense_attention: latent.attention in `part_rows`-row blocks, each at its first row's position.
+ fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, pos: u64, rows: usize, nch: usize, part_rows: usize, scale: f32) !void {
+-    const hb = latent.headBlock(rows);
++    const hb = if (l.rope != 0) latent.heads_tile else latent.headBlock(rows); // the dsa rides 16-head blocks only (smem)
+     var r0: usize = 0;
+     while (r0 < rows) : (r0 += part_rows) {
+         const n = @min(part_rows, rows - r0);
+@@ -348,7 +388,8 @@ fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scrat
+             try cuda.launch.launch(try k.ops.function("tf_glm_add_i32"), .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 } }, stream, &a);
+             at = s.at;
+         }
+-        const off = r0 * l.heads * l.lw * 2;
+-        try latent.attentionFormat(k.set, stream, s.qa + off, c.lc, c.ls, .{ .pt = c.latPt(), .ps = c.latPs() }, at, s.partials, s.ol + off, s.dummy, n, l.heads, l.lw, nch, scale, hb);
++        const off = r0 * l.heads * l.rowW() * 2;
++        const ooff = r0 * l.heads * l.lw * 2;
++        try latent.attentionFormat(k.set, stream, s.qa + off, c.lc, c.ls, .{ .pt = c.latPt(), .ps = c.latPs() }, at, s.partials, s.ol + ooff, s.dummy, n, l.heads, l.rowW(), nch, scale, hb);
+     }
+ }
+diff --git a/zig/src/families/glm/cuda_formats.zig b/zig/src/families/glm/cuda_formats.zig
+index 6a60e9d..f4acfc8 100644
+--- a/zig/src/families/glm/cuda_formats.zig
++++ b/zig/src/families/glm/cuda_formats.zig
+@@ -142,12 +142,12 @@ pub fn metaOf(t: *const core.checkpoint.Tensor) Meta {
+ /// A projection's part as a rank takes it: tensor `rel` (under the layer, for cutProj), its rows or inputs, or all.
+ pub const Part = struct { rel: []const u8, rows: ?[2]usize = null, cols: ?[2]usize = null };
+ 
+-/// Layer `i`'s projection `name` of `parts` stacked, as `cut` reads them.
+-pub fn cutProj(L: anytype, comptime prefix: []const u8, i: u32, parts: []const Part, wants: []const Format, comptime name: []const u8) !projection.Proj {
++/// Layer `i`'s projection `name` of `parts` stacked, as `cut` reads them; `prefix` is the checkpoint's LM prefix.
++pub fn cutProj(L: anytype, prefix: []const u8, i: u32, parts: []const Part, wants: []const Format, comptime name: []const u8) !projection.Proj {
+     var bufs: [3][192]u8 = undefined;
+     var mods: [3][]const u8 = undefined;
+     if (parts.len == 0 or parts.len > bufs.len) return error.UnreadableFormat; // a tensor, [q_a | kv_a], [q | k | v]
+-    for (parts, 0..) |q, j| mods[j] = try std.fmt.bufPrint(&bufs[j], prefix ++ "layers.{d}.{s}", .{ i, q.rel });
++    for (parts, 0..) |q, j| mods[j] = try std.fmt.bufPrint(&bufs[j], "{s}layers.{d}.{s}", .{ prefix, i, q.rel });
+     return cut(L, L.ck, mods[0..parts.len], parts, wants, name, .{i});
+ }
+ 
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 4ba2db4..5e396ce 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -472,14 +472,17 @@ pub const Forward = struct {
+         }
+         const c = &f.ranks[0].w.config;
+         const embed_stamp = prof_mod.span(f.prof, f.stream, .embed);
+-        for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
+-        if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
++        // glm_moe_dsa keeps one residual stream (no mHC): its embedding lands in b.hidden, not the s x d x
++        for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, if (c.dsa) r.b.hidden else r.b.x, R, c.hidden, if (c.dsa) 1 else c.hc);
++        if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, if (c.dsa) r.b.hidden else r.b.x, if (c.dsa) 1 else c.hc);
+         embed_stamp.end();
+         if (f.prof) |p| p.mark(f.stream, .embed);
+         var cut: [max_pieces][2]usize = undefined;
+         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
+         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
+-        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
++        const want_pieces = pieces > 1 or (pieces == 1 and f.splits(R));
++        if (want_pieces and c.dsa) return error.DsaPieces;
++        if (want_pieces) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+         try f.finish(R);
+         if (f.prof) |p| p.mark(f.stream, .head);
+     }
+@@ -487,6 +490,7 @@ pub const Forward = struct {
+     /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
+     fn whole(f: *const Forward, R: usize) !void {
+         const c = &f.ranks[0].w.config;
++        if (c.dsa) return f.wholeDsa(R);
+         const pf = f.prefetch();
+         var li: usize = 0;
+         var di: usize = 0;
+@@ -523,6 +527,49 @@ pub const Forward = struct {
+         if (pf) |p| try p.join(f.stream);
+     }
+ 
++    /// whole()'s glm_moe_dsa form: one bf16 residual stream in b.hidden (no mHC streams, no stream mean).
++    /// The layer bodies, fills and exchanges are the mHC loop's — the same plain-residual graph mtp() runs.
++    fn wholeDsa(f: *const Forward, R: usize) !void {
++        const c = &f.ranks[0].w.config;
++        const D = c.hidden;
++        const pf = f.prefetch();
++        if (f.taps != null) return error.DsaTaps;
++        var di: usize = 0;
++        for (f.ranks[0].w.layers, 0..) |_, j| {
++            prof_mod.context(f.prof, j, null, .mixer);
++            for (f.ranks) |r| {
++                const l = r.w.layers[j];
++                const b = r.b;
++                try glue.rmsnormBy(f.set(), f.stream, b.hidden, D, l.in_norm, b.normed, D, b.xs, c.eps, R, D);
++                if (r.segs.len > 0) try shared.mixer(f, r, l, 0, di, R, slot(r, R)) else try f.mixer(r, l, 0, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
++            }
++            if (f.prof) |p| p.mark(f.stream, .mla);
++            if (pf) |p| try p.fork(f.stream, j, .f);
++            try f.gather(R);
++            prof_mod.context(f.prof, j, null, .ffn);
++            for (f.ranks) |r| {
++                const l = r.w.layers[j];
++                const b = r.b;
++                try glue.residualAdd(f.set(), f.stream, b.hidden, b.hidden, b.gathered, R, D, r.w.share.world);
++                try glue.rmsnormBy(f.set(), f.stream, b.hidden, D, l.post_norm, b.normed, D, b.xs, c.eps, R, D);
++                try f.ffn(r, l, R, slot(r, R));
++            }
++            if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared);
++            if (pf) |p| try p.fork(f.stream, j, .n);
++            try f.gather(R);
++            for (f.ranks) |r| {
++                const b = r.b;
++                try glue.residualAdd(f.set(), f.stream, b.hidden, b.hidden, b.gathered, R, D, r.w.share.world);
++            }
++            if (f.prof) |p| p.mark(f.stream, .gather_b);
++            switch (f.ranks[0].w.layers[j].mixer) {
++                .kda => unreachable, // glm_moe_dsa's layers are all .mla (its config's kind says so)
++                .mla => di += 1,
++            }
++        }
++        if (pf) |p| try p.join(f.stream);
++    }
++
+     /// The final norm and this rank's rows of the head (a prompt buffer's last row only).
+     pub fn finish(f: *const Forward, R: usize) !void {
+         prof_mod.context(f.prof, null, null, .chunk);
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 564e4e4..28b811d 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -96,6 +96,14 @@ pub const Kernels = struct {
+     scores: cuda.Function,
+     latent_mma_kn: cuda.Function, // TF_GLM_ABSORB_MMA (glm_glue_num.cuh): absorb_q's head-batched GEMM, B as [K][N]
+     latent_mma_nk: cuda.Function, // and expand_v's, B as [N][K]
++    absorb_q_dsa: cuda.Function, // glm_moe_dsa's absorb: q_nope 192 of the head's 256 dims, out rows 576 wide
++    qa_rope: cuda.Function, // its roped query tails into the absorbed rows' top (glm_glue_latent.cuh)
++    kv_rope: cuda.Function, // and the kv_a slice's rope tail into the latent rows' top
++    index_write_dsa: cuda.Function, // its LayerNormed, first-64-roped index keys (glm_glue_index.cuh; no gate row)
++    dsa_scores: cuda.Function, // its indexer's scores over its own roped per-token keys (glm_glue_attn.cuh)
++    dsa_topk: cuda.Function, // and each row's best 2048 of them (select_row's unpooled, i32 form)
++    chunks_16_w576: cuda.Function, // the chunk kernels over the dsa's 576-wide rows (512 latent + the 64 rope);
++    chunks_16_fused_w576: cuda.Function, // 16-head blocks only: the 32-head block's 113 KB passes no GB10
+ 
+     pub fn load(m: cuda.Module) !Kernels {
+         var k: Kernels = undefined;
+@@ -115,6 +123,8 @@ pub const Kernels = struct {
+         try k.chunks_32_fp8_fused.allowDynamicShared(chunksSmem(32));
+         try k.chunks_16_fp8_paged_fused.allowDynamicShared(chunksSmem(16));
+         try k.chunks_32_fp8_paged_fused.allowDynamicShared(chunksSmem(32));
++        try k.chunks_16_w576.allowDynamicShared(chunksSmemW(16, dsa_row));
++        try k.chunks_16_fused_w576.allowDynamicShared(chunksSmemW(16, dsa_row));
+         try k.latent_mma_kn.allowDynamicShared(latent_mma_smem[0]);
+         try k.latent_mma_nk.allowDynamicShared(latent_mma_smem[1]);
+         return k;
+@@ -206,6 +216,13 @@ pub fn chunksSmem(comptime hb: u32) u32 {
+     return (hb * 512 + 2 * 32 * 512 + hb * 32) * 2 + (hb * 4 + 2 * hb) * 4;
+ }
+ 
++/// glm_moe_dsa's cache and query rows: 512 latent dims plus the 64-dim rope key (glm_glue_attn.cuh's DSA_LW).
++pub const dsa_row = 576;
++/// wide_smem over a dsa row: the same layout at `w`-wide rows (the outputs stay the 512 latent dims).
++pub fn chunksSmemW(comptime hb: u32, comptime w: u32) u32 {
++    return (hb * w + 2 * 32 * w + hb * 32) * 2 + (hb * 4 + 2 * hb) * 4;
++}
++
+ /// K slices of the router's dot (glue.ROUTER_KS): fixed by the shape, as the sliced and the single pass differ in bits.
+ pub const router_ks = 8;
+ 
+diff --git a/zig/src/families/glm/cuda_kv_shard_attn.zig b/zig/src/families/glm/cuda_kv_shard_attn.zig
+index 72b5397..3d7a080 100644
+--- a/zig/src/families/glm/cuda_kv_shard_attn.zig
++++ b/zig/src/families/glm/cuda_kv_shard_attn.zig
+@@ -181,6 +181,7 @@ pub fn wanted(f: *const fw.Forward, r: fw.Rank) bool {
+ /// Forward.mixer's DSA block on one sequence whose latent rows one rank holds: the projections, the exchange, its
+ /// attention or the peer's, expand_v (o_proj stays the caller's fill).
+ pub fn single(f: *const fw.Forward, r: fw.Rank, a: dsa_block.Layer, di: usize, rows: usize, nch: usize, k: dsa_block.Kernels) !void {
++    if (a.rope != 0) return error.DsaShardUnsupported; // glm_moe_dsa serves unsharded until its graph lands (patch 0303)
+     const kv = f.kv.?;
+     const st = r.st;
+     try dsa_block.prepareProfile(k.set, f.stream, a, r.b.dsa, r.b.normed, r.w.config.hidden, rows, dsa_block.sparseRows(a, st.pos, rows), k.prof);
+@@ -198,6 +199,7 @@ pub fn single(f: *const fw.Forward, r: fw.Rank, a: dsa_block.Layer, di: usize, r
+ /// The shared window's DSA block (cuda_shared.mixer's) with owner-computed segments: every segment on its own
+ /// launches (the batched ones' bits), the exchanges around them, then expand_v for every row.
+ pub fn shared(f: *const fw.Forward, r: fw.Rank, a: dsa_block.Layer, di: usize, rows: usize) !void {
++    if (a.rope != 0) return error.DsaShardUnsupported; // glm_moe_dsa serves unsharded until its graph lands (patch 0303)
+     const kv = f.kv.?;
+     const b = r.b;
+     var sparse_any = false;
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index 84690ef..e5c77e4 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -30,11 +30,15 @@ fn cdiv(a: usize, b: usize) u32 {
+     return @intCast((a + b - 1) / b);
+ }
+ 
+-/// latent.absorb_q (BF16 kv_b): out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums.
+-pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
+-    if (d != 256 or lw != 512) return error.LatentShape;
+-    if (mmaRows(set, rows, .{ q, wk, out })) return headsMma(set.glue.latent_mma_kn, glue.latent_mma_smem[0], stream, q, heads * d, wk, out, heads * lw, rows, heads, lw, d);
+-    try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
++/// latent.absorb_q (BF16 kv_b): out [rows][heads][os] bf16 = q [rows][heads][qs] . wk [heads][d][lw], fp32 sums.
++/// `d` the absorbed dims (Flash's 256, glm_moe_dsa's 192), `qs` the q rows' per-head stride (d, or 256 on the dsa,
++/// whose head's last 64 dims are its rope share), `os` the out rows' per-head stride (lw, or the dsa's 576: the
++/// absorbed 512 then the roped query qa_rope writes). lw stays 512 (the latent) either way.
++pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, qs: usize, lw: usize, os: usize) !void {
++    if (lw != 512 or os != lw and os != lw + 64) return error.LatentShape;
++    const f = if (d == 256 and qs == 256 and os == lw) set.glue.absorb_q else if (d == 192 and qs == 256 and os == lw + 64) set.glue.absorb_q_dsa else return error.LatentShape;
++    if (mmaRows(set, rows, .{ q, wk, out })) return headsMma(set.glue.latent_mma_kn, glue.latent_mma_smem[0], stream, q, heads * qs, wk, out, heads * os, rows, heads, lw, d);
++    try rowBlocks(f, stream, q, wk, out, rows, heads, lw / 32);
+ }
+ 
+ /// TF_GLM_ABSORB_MMA=1 and a prompt's rows (aligned): the tensor-core GEMMs; else the SIMT kernels (always in windows).
+@@ -119,13 +123,15 @@ pub fn attentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64,
+ /// latent._dense_chunks (sparse false: keys through pos + r) and _sparse_chunks (row r's `counts` tokens of `tokens`).
+ /// BF16 takes the table always (pt 0: in order); E4M3 on pages its _paged kernels, the window's arguments then the table.
+ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
+-    if (lw != 512) return error.LatentShape;
++    if (lw != 512 and lw != glue.dsa_row) return error.LatentShape;
+     const kv8 = scales != 0;
++    if (lw == glue.dsa_row and (kv8 or t.pt != 0)) return error.LatentShape; // the dsa's rows are BF16 and unpaged
++    if (lw == glue.dsa_row and hb != heads_tile) return error.DsaHeadBlock; // its 32-head block's 113 KB passes no GB10
+     const paged8 = kv8 and t.pt != 0;
+     // a paged sparse list's units are the kernel's: positions for E4M3 (Table.logical), the BF16 rows otherwise
+     if (sparse and t.pt != 0 and t.logical != paged8) return error.TokenUnits;
+     const f = switch (hb) {
+-        heads_tile => if (!kv8) set.glue.chunks_16 else if (paged8) set.glue.chunks_16_fp8_paged else set.glue.chunks_16_fp8,
++        heads_tile => if (lw == glue.dsa_row) set.glue.chunks_16_w576 else if (!kv8) set.glue.chunks_16 else if (paged8) set.glue.chunks_16_fp8_paged else set.glue.chunks_16_fp8,
+         heads_tile_wide => if (!kv8) set.glue.chunks_32 else if (paged8) set.glue.chunks_32_fp8_paged else set.glue.chunks_32_fp8,
+         else => return error.HeadBlock,
+     };
+@@ -138,7 +144,7 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64,
+         a.add(t.pt);
+         a.add(@as(i64, @intCast(t.ps)));
+     }
+-    const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
++    const shared = if (lw == glue.dsa_row) glue.chunksSmemW(heads_tile, glue.dsa_row) else if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
+     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = chunk_threads }, .shared = shared }, stream, &a);
+ }
+ 
+@@ -149,8 +155,9 @@ pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64,
+ 
+ pub fn sparseAttentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
+     const nch = chunksFor(w);
+-    if (fuses(p, nch, rows)) return fused(set, stream, qa, cache, scales, t, tokens, counts, w, out, rows, heads, lw, nch, scale, headBlock(rows));
+-    try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, headBlock(rows), true);
++    const hb = if (lw == glue.dsa_row) heads_tile else headBlock(rows); // the dsa rides 16-head blocks only (smem)
++    if (fuses(p, nch, rows)) return fused(set, stream, qa, cache, scales, t, tokens, counts, w, out, rows, heads, lw, nch, scale, hb);
++    try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, hb, true);
+     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
+ }
+ 
+@@ -161,12 +168,14 @@ pub fn fuses(p: Partials, nch: usize, rows: usize) bool {
+ 
+ /// The chunks and their merge in one launch, block (row, hb heads) over all nch chunks: the same bytes into out bf16.
+ fn fused(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, out: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
+-    if (lw != 512) return error.LatentShape;
++    if (lw != 512 and lw != glue.dsa_row) return error.LatentShape;
+     const kv8 = scales != 0;
++    if (lw == glue.dsa_row and (kv8 or t.pt != 0)) return error.LatentShape; // the dsa's rows are BF16 and unpaged
++    if (lw == glue.dsa_row and hb != heads_tile) return error.DsaHeadBlock; // its 32-head block's 113 KB passes no GB10
+     const paged8 = kv8 and t.pt != 0;
+     if (t.pt != 0 and t.logical != paged8) return error.TokenUnits;
+     const f = switch (hb) {
+-        heads_tile => if (!kv8) set.glue.chunks_16_fused else if (paged8) set.glue.chunks_16_fp8_paged_fused else set.glue.chunks_16_fp8_fused,
++        heads_tile => if (lw == glue.dsa_row) set.glue.chunks_16_fused_w576 else if (!kv8) set.glue.chunks_16_fused else if (paged8) set.glue.chunks_16_fp8_paged_fused else set.glue.chunks_16_fp8_fused,
+         heads_tile_wide => if (!kv8) set.glue.chunks_32_fused else if (paged8) set.glue.chunks_32_fp8_paged_fused else set.glue.chunks_32_fp8_fused,
+         else => return error.HeadBlock,
+     };
+@@ -179,7 +188,7 @@ fn fused(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t
+         a.add(t.pt);
+         a.add(@as(i64, @intCast(t.ps)));
+     }
+-    const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
++    const shared = if (lw == glue.dsa_row) glue.chunksSmemW(heads_tile, glue.dsa_row) else if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
+     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb) }, .block = .{ .x = chunk_threads }, .shared = shared }, stream, &a);
+ }
+ 
+@@ -225,7 +234,8 @@ test "a shared window's attention segments fit glm_glue_attn.cuh's table and one
+ }
+ 
+ fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64, rows: usize, heads: usize, lw: usize, nch: usize, sparse: bool) !void {
+-    if (lw != 512) return error.LatentShape;
++    // the merge's partials and out rows are the 512 latent dims on every shape (the dsa's rope plane never reaches them)
++    if (lw != 512 and lw != glue.dsa_row) return error.LatentShape;
+     var a: cuda.Args = .{};
+     inline for (.{ p.po, p.pm, p.pl, out, counts, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(c_int, @intCast(nch)), @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
+     try cuda.launch.launch(set.glue.merge, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = 128 } }, stream, &a);
+diff --git a/zig/src/families/glm/cuda_shared.zig b/zig/src/families/glm/cuda_shared.zig
+index 0b5ae8a..874cdc5 100644
+--- a/zig/src/families/glm/cuda_shared.zig
++++ b/zig/src/families/glm/cuda_shared.zig
+@@ -124,6 +124,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di:
+             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
+         },
+         .mla => |a| {
++            if (a.rope != 0) return error.DsaSharedWindow; // glm_moe_dsa serves one stream until its graph lands (patch 0303)
+             if (@import("cuda_kv_shard_attn.zig").wanted(f, r)) { // TF_GLM_KV_SHARD: a segment one rank holds alone
+                 try @import("cuda_kv_shard_attn.zig").shared(f, r, a, di, rows);
+                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index 8efa62b..d0fa598 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -15,6 +15,8 @@ pub const score_loop = 32;
+ pub const select_rows = 512;
+ /// A row's token list: the 512 pools' tokens, then the incomplete pool's up to 3.
+ pub const width = topk_pools * pool + pool - 1;
++/// glm_moe_dsa's list: its own top-k of per-token keys, 2048 of them (index_topk), no pools to unfold.
++pub const dsa_width = 2048;
+ 
+ fn cdiv(a: usize, b: usize) usize {
+     return (a + b - 1) / b;
+@@ -82,6 +84,45 @@ pub fn decodeSelect(set: glue.Set, stream: cuda.Stream, scores: u64, pools: u64,
+     try cuda.launch.launch(set.glue.dsel_merge, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = dsel_merge_threads } }, stream, &ma);
+ }
+ 
++/// glm_moe_dsa's select: its indexer's scores over its own roped per-token keys (tf_glm_dsa_scores), then each row's
++/// best 2048 of them into its token list (tf_glm_dsa_topk; positions ascending, counts 0 within the all-visible
++/// prefix so those rows keep the dense pass's result). `wts` the fused kw output's weights half, `ik` the roped key
++/// cache, `inv` the rope frequencies. The scores scratch is [b][np] fp32 per block, np the call's most visible keys.
++pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64, wts: u64, inv: u64, ik: u64, pos: u64, host_pos: usize, rows: usize, heads: usize, d: usize, s: Scratch, tokens: u64, counts: u64, profile: ?*@import("cuda_prof.zig").Prof) !void {
++    const prof_mod = @import("cuda_prof.zig");
++    if (d != 128 or heads != 32) return error.IndexShape;
++    const stride = d + heads; // the fused kw output's row
++    const np = host_pos + rows;
++    const b = @min(rows, select_rows);
++    const loop: usize = if (rows >= score_loop_from) score_loop else 1;
++    const add = try ops.function("tf_glm_add_i32");
++    var a: usize = 0;
++    while (a < rows) : (a += b) {
++        const n = @min(b, rows - a);
++        var at = pos;
++        if (a > 0) {
++            var args: cuda.Args = .{};
++            args.add(pos);
++            args.add(@as(c_int, @intCast(a)));
++            args.add(s.at);
++            try cuda.launch.launch(add, .{ .grid = .{}, .block = .{ .x = 32 } }, stream, &args);
++            at = s.at;
++        }
++        const nb = cdiv(np, 64); // tf_glm_dsa_scores' key blocks of 64
++        const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(d), -0.5));
++        var stamp = prof_mod.span(profile, stream, .index_score);
++        var sa: cuda.Args = .{};
++        inline for (.{ qi + a * heads * d * 2, wts + a * stride * 2, @as(i64, @intCast(stride)), ik, s.scores + a * np * 4, at, @as(i64, @intCast(np)), @as(i64, @intCast(nb)), scale, headScale(heads), @as(i64, @intCast(heads)), @as(c_int, @intCast(loop)), inv }) |v| sa.add(v);
++        try cuda.launch.launch(set.glue.dsa_scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
++        stamp.end();
++        stamp = prof_mod.span(profile, stream, .index_select);
++        var ta: cuda.Args = .{};
++        inline for (.{ s.scores + a * np * 4, tokens + a * dsa_width * 4, @as(i64, @intCast(np)), at, @as(c_int, dsa_width), counts + a * 4 }) |v| ta.add(v);
++        try cuda.launch.launch(set.glue.dsa_topk, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 } }, stream, &ta);
++        stamp.end();
++    }
++}
++
+ /// sparse.index_update: the window's LayerNormed index keys and gates into ik and ig at pos, completed pools into pk.
+ pub fn indexUpdate(set: glue.Set, stream: cuda.Stream, k_raw: u64, k_stride: usize, gate: u64, ln_w: u64, ln_b: u64, ape: u64, ik: u64, ig: u64, pk: u64, t: latent.Table, pos: u64, rows: usize) !void {
+     var a: cuda.Args = .{};
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 10d16cb..be2b057 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -140,7 +140,8 @@ fn b16Shapes(w: *const weights.Weights) [12][2]usize {
+     const kw = 3 * n + 2 * c.kda_dim + s.kda.len();
+     return .{
+         .{ kw, c.hidden },                   .{ n, c.kda_dim },                    .{ c.hidden, n },
+-        .{ c.q_lora + c.kv_lora, c.hidden }, .{ s.mla.len() * c.nope, c.q_lora },  .{ c.i_dim + c.i_heads, c.hidden },
++        // glm_moe_dsa's [q_a | kv_a] ends in a rope plane (its rows are kv_lora + rope wide), and its q_b's heads nope + rope
++        .{ c.q_lora + c.kv_lora + c.rope, c.hidden }, .{ s.mla.len() * (c.nope + c.rope), c.q_lora }, .{ c.i_dim + c.i_heads, c.hidden },
+         .{ c.i_heads * c.i_dim, c.q_lora },  .{ c.hidden, s.mla.len() * c.v_dim }, .{ 2 * s.shared.len(), c.hidden },
+         .{ c.hidden, 2 * c.hidden }, // the MTP head's eh_proj
+         if (c.exl3) .{ 2 * s.dense.len(), c.hidden } else .{ c.hidden, 2 * c.hidden }, // bf16 dense layers: [gate | up]
+@@ -153,8 +154,8 @@ fn twoShapes(w: *const weights.Weights) [2][4]usize {
+     const c = &w.config;
+     const s = &w.share;
+     return .{
+-        .{ c.q_lora + c.kv_lora, c.hidden, c.i_dim + c.i_heads, c.hidden },
+-        .{ s.mla.len() * c.nope, c.q_lora, c.i_heads * c.i_dim, c.q_lora },
++        .{ c.q_lora + c.kv_lora + c.rope, c.hidden, c.i_dim + c.i_heads, c.hidden },
++        .{ s.mla.len() * (c.nope + c.rope), c.q_lora, c.i_heads * c.i_dim, c.q_lora },
+     };
+ }
+ 
+@@ -279,7 +280,8 @@ pub const Buffers = struct {
+         const shared_decode = !prefill and shared;
+         const part_chunks = @max(nch, latent.chunksFor(sparse.width));
+         const partial_rows = if (prefill) nch * part_rows else if (shared_decode) part_chunks * rows else @max(nch * part_rows, latent.chunksFor(sparse.width) * seg);
+-        const np_max = capacity / sparse.pool;
++        // a Flash select's scores are one fp32 a pool; glm_moe_dsa's dsa_scores writes one a visible key
++        const np_max = if (c.dsa) capacity else capacity / sparse.pool;
+         var mm: usize = 4;
+         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
+         for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
+@@ -299,10 +301,10 @@ pub const Buffers = struct {
+             if (prefill or shared) rows * kw * 2 else 4, rows * n * 2, rows * n * 2, // kproj, ka, kg (a lone window's: the state's)
+             rows * n * 2, rows * n * 4, rows * n * 2, rows * n * 4, // saves out, k, v, g
+             rows * LL * 4,                    rows * n * 4,               rows * n * 2, // saves b, wide q, y
+-            rows * (c.q_lora + lw) * 2,       rows * c.q_lora * 2,        rows * (c.q_lora / 64) * 4,
+-            rows * lw * 2,                    rows * (lw / 64) * 4,       rows * HL * c.nope * 2,
++            rows * (c.q_lora + lw + c.rope) * 2, rows * c.q_lora * 2,        rows * (c.q_lora / 64) * 4, // glm_moe_dsa's [q_a | kv_a] is rope wider
++            rows * (lw + c.rope) * 2,         rows * (lw / 64) * 4,       rows * HL * (c.nope + c.rope) * 2, // lat and q end in the rope plane
+             rows * (c.i_dim + c.i_heads) * 2, rows * c.i_dim * 4,         glue.router_ks * rows * @max(count, c.i_dim) * 4,
+-            rows * HL * lw * 2,               rows * HL * lw * 2,         rows * HL * c.v_dim * 2,
++            rows * HL * (lw + c.rope) * 2,    rows * HL * lw * 2,         rows * HL * c.v_dim * 2, // qa (rowW) and ol (lw)
+             rows * c.i_heads * c.i_dim * 2,   partial_rows * HL * lw * 4, partial_rows * HL * 4,
+             partial_rows * HL * 4,
+             4, // dummy
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 4accd83..ee48803 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -18,7 +18,8 @@ pub const formats = @import("cuda_formats.zig");
+ const projection = @import("cuda_proj.zig");
+ const glue = @import("cuda_glue.zig");
+ const Tensor = core.checkpoint.Tensor;
+-const prefix = "model.language_model.";
++/// The LM tower's tensor prefixes a GLM checkpoint may use: FP4-Local's `model.language_model.`, nvidia's `model.`.
++const prefixes = [_][]const u8{ "model.language_model.", "model." };
+ /// A hyper-connection site: fn bf16 [s (s + 2)][s d], base and scale widened to fp32.
+ pub const Hc = struct { fn_w: u64, base: u64, scale: u64 };
+ 
+@@ -91,9 +92,11 @@ const Loader = struct {
+     name_buf: [192]u8 = undefined,
+     last: []const u8 = "", // the tensor `get` read last, named when its values are refused
+     recipes: ?*const core.modelopt.Recipes = null, // MIXED_PRECISION's table; null: the tensors decide (NVFP4)
++    pfx: []const u8 = prefixes[0], // this checkpoint's LM tensor prefix (load probes the embedding for it)
++    inv: u64 = 0, // glm_moe_dsa's rope inv_freq table, one upload for every DSA layer and the MTP one's
+ 
+     pub fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !Tensor {
+-        L.last = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args);
++        L.last = try std.fmt.bufPrint(&L.name_buf, "{s}" ++ fmt, .{L.pfx} ++ args);
+         return L.ck.get(L.last);
+     }
+ 
+@@ -110,7 +113,7 @@ const Loader = struct {
+     /// The projection `fmt` (a module under the prefix) is stored as `want`, or it is refused by name (formats.of).
+     fn format(L: *Loader, comptime fmt: []const u8, args: anytype, want: formats.Format) !void {
+         var buf: [192]u8 = undefined;
+-        return L.formatIn(L.ck, try std.fmt.bufPrint(&buf, prefix ++ fmt, args), want);
++        return L.formatIn(L.ck, try std.fmt.bufPrint(&buf, "{s}" ++ fmt, .{L.pfx} ++ args), want);
+     }
+ 
+     pub fn formatIn(L: *Loader, ck: *core.Checkpoint, module: []const u8, want: formats.Format) !void {
+@@ -217,7 +220,7 @@ const Loader = struct {
+         var qkv: ?cuda.qmmf.Weight = null; // [q | k | v] as one lane weight, then the stack's bf16 rest
+         if (mx) {
+             const parts = [_]formats.Part{ .{ .rel = "self_attn.q_proj", .rows = hr }, .{ .rel = "self_attn.k_proj", .rows = hr }, .{ .rel = "self_attn.v_proj", .rows = hr } };
+-            qkv = (try formats.cutProj(L, prefix, i, &parts, &.{.mxfp8}, "layers.{d}.kda.qkv")).mxfp8;
++            qkv = (try formats.cutProj(L, L.pfx, i, &parts, &.{.mxfp8}, "layers.{d}.kda.qkv")).mxfp8;
+         } else inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), hr[0], hr[1], all, .bf16);
+         inline for (.{ "f_a", "g_a" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), .bf16);
+         try L.rows(try L.get("layers.{d}.self_attn.b_proj.weight", .{i}), h.lo, h.hi, c.kda_heads, .bf16);
+@@ -234,7 +237,7 @@ const Loader = struct {
+         const dt = try L.put("layers.{d}.kda.dt_bias", .{i});
+         try L.whole(try L.get("layers.{d}.self_attn.o_norm.weight", .{i}), .bf16);
+         const o_norm = try L.put("layers.{d}.kda.norm", .{i});
+-        const o = try formats.cutProj(L, prefix, i, &.{.{ .rel = "self_attn.o_proj", .cols = hr }}, &.{ .bf16, .mxfp8 }, "layers.{d}.kda.o");
++        const o = try formats.cutProj(L, L.pfx, i, &.{.{ .rel = "self_attn.o_proj", .cols = hr }}, &.{ .bf16, .mxfp8 }, "layers.{d}.kda.o");
+         return .{ .proj = proj, .fb = fb, .gb = gb, .o = o, .conv_w = conv, .a_log = a_log, .dt_bias = dt, .norm_w = o_norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
+     }
+ 
+@@ -242,29 +245,29 @@ const Loader = struct {
+     pub fn dsa(L: *Loader, i: u32) !dsa_block.Layer {
+         const c = &L.w.config;
+         const h = L.w.share.mla;
+-        const qk = c.nope;
++        const qk = c.nope + c.rope; // a head's q rows: its nope dims, then its rope share (q_b's and the scale's 256)
+         // the MTP layer's may be MXFP8 (FP4-Local's): on the lane as stored, kv_b widened exactly for its halves
+         const mtp = i == c.layers;
+         const wants: []const formats.Format = if (mtp) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb };
+         var kb: [96]u8 = undefined;
+-        const kv_name = try std.fmt.bufPrint(&kb, prefix ++ "layers.{d}.self_attn.kv_b_proj", .{i});
++        const kv_name = try std.fmt.bufPrint(&kb, "{s}layers.{d}.self_attn.kv_b_proj", .{ L.pfx, i });
+         const kv_mx = mtp and (try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i})).dtype == .f8_e4m3;
+         try L.format("layers.{d}.self_attn.kv_b_proj", .{i}, if (kv_mx) .mxfp8 else .bf16);
+         const kv_wide: ?formats.mxfp8.Mxfp8 = if (kv_mx) try formats.mxfp8.Mxfp8.read(L.ck, kv_name) else null;
+-        const proj = try formats.cutProj(L, prefix, i, &.{ .{ .rel = "self_attn.q_a_proj" }, .{ .rel = "self_attn.kv_a_proj_with_mqa" } }, wants, "layers.{d}.dsa.proj");
++        const proj = try formats.cutProj(L, L.pfx, i, &.{ .{ .rel = "self_attn.q_a_proj" }, .{ .rel = "self_attn.kv_a_proj_with_mqa" } }, wants, "layers.{d}.dsa.proj");
+         try L.whole(try L.get("layers.{d}.self_attn.q_a_layernorm.weight", .{i}), .bf16);
+         const q_norm = try L.put("layers.{d}.dsa.q_norm", .{i});
+         try L.whole(try L.get("layers.{d}.self_attn.kv_a_layernorm.weight", .{i}), .bf16);
+         const kv_norm = try L.put("layers.{d}.dsa.kv_norm", .{i});
+-        const q_b = try formats.cutProj(L, prefix, i, &.{.{ .rel = "self_attn.q_b_proj", .rows = .{ h.lo * qk, h.hi * qk } }}, wants, "layers.{d}.dsa.q_b");
++        const q_b = try formats.cutProj(L, L.pfx, i, &.{.{ .rel = "self_attn.q_b_proj", .rows = .{ h.lo * qk, h.hi * qk } }}, wants, "layers.{d}.dsa.q_b");
+         const kv_b = try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i});
+-        const per = qk + c.v_dim; // a head's kv_b rows: its keys, then its values
++        const per = c.nope + c.v_dim; // a head's kv_b rows: its keys (nope), then its values
+         const total = c.mla_heads * per;
+-        for (h.lo..h.hi) |head| try absorbRows(L, kv_wide, kv_b, kv_name, head * per, head * per + qk, total);
++        for (h.lo..h.hi) |head| try absorbRows(L, kv_wide, kv_b, kv_name, head * per, head * per + c.nope, total);
+         const wk = try L.put("layers.{d}.dsa.absorb.wk", .{i});
+-        for (h.lo..h.hi) |head| try absorbRows(L, kv_wide, kv_b, kv_name, head * per + qk, (head + 1) * per, total);
++        for (h.lo..h.hi) |head| try absorbRows(L, kv_wide, kv_b, kv_name, head * per + c.nope, (head + 1) * per, total);
+         const wv = try L.put("layers.{d}.dsa.absorb.wv", .{i});
+-        const o = try formats.cutProj(L, prefix, i, &.{.{ .rel = "self_attn.o_proj", .cols = .{ h.lo * c.v_dim, h.hi * c.v_dim } }}, wants, "layers.{d}.dsa.o");
++        const o = try formats.cutProj(L, L.pfx, i, &.{.{ .rel = "self_attn.o_proj", .cols = .{ h.lo * c.v_dim, h.hi * c.v_dim } }}, wants, "layers.{d}.dsa.o");
+         const iw: []const formats.Format = if (mtp) &.{ .bf16, .mxfp8 } else &.{.bf16};
+         // glm_moe_dsa computes its top-k on its full layers only (indexer_types): a shared layer carries no
+         // indexer tensors at all and reuses the last full layer's token list, so its index weights stay unset (0).
+@@ -274,8 +277,8 @@ const Loader = struct {
+         var ln_w: u64 = 0;
+         var ln_b: u64 = 0;
+         if (full) {
+-            kw = try formats.cutProj(L, prefix, i, &.{ .{ .rel = "self_attn.indexer.wk" }, .{ .rel = "self_attn.indexer.weights_proj" } }, iw, "layers.{d}.dsa.index.kw");
+-            qb = try formats.cutProj(L, prefix, i, &.{.{ .rel = "self_attn.indexer.wq_b" }}, iw, "layers.{d}.dsa.index.qb");
++            kw = try formats.cutProj(L, L.pfx, i, &.{ .{ .rel = "self_attn.indexer.wk" }, .{ .rel = "self_attn.indexer.weights_proj" } }, iw, "layers.{d}.dsa.index.kw");
++            qb = try formats.cutProj(L, L.pfx, i, &.{.{ .rel = "self_attn.indexer.wq_b" }}, iw, "layers.{d}.dsa.index.qb");
+             try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.weight", .{i}), .bf16);
+             ln_w = try L.put("layers.{d}.dsa.index.ln_w", .{i});
+             try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.bias", .{i}), .bf16);
+@@ -308,7 +311,10 @@ const Loader = struct {
+             .q_lora = c.q_lora,
+             .dims = c.hidden,
+             .eps = c.eps,
+-            .dense_limit = c.keyWidth(),
++            .dense_limit = if (c.dsa) c.i_topk else c.keyWidth(), // glm_moe_dsa: its top-k keeps every key through 2047
++            .rope = c.rope,
++            .inv = L.inv, // weights.load's rope frequency table (theta^-2i/rope): one upload, every layer's
++            .ifull = full, // the loader's: the MTP layer and glm_moe_dsa's indexer_types' "full" layers
+         };
+     }
+ 
+@@ -320,7 +326,7 @@ const Loader = struct {
+ 
+     /// An NVFP4 linear's rows [lo, hi), inputs [klo, khi) as Fp4Linear.from_checkpoint (tf_pack_dense, packScales).
+     fn fp4(L: *Loader, comptime fmt: []const u8, i: u32, lo: usize, hi: usize, klo: usize, khi: usize) !cuda.qmmf.Weight {
+-        const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, .{i});
++        const name = try std.fmt.bufPrint(&L.name_buf, "{s}" ++ fmt, .{ L.pfx, i });
+         const l = try core.nvfp4.Linear.read(L.ck, name);
+         const n = hi - lo;
+         const k = khi - klo;
+@@ -355,6 +361,13 @@ const Loader = struct {
+         const c = &L.w.config;
+         const s = L.w.share.dense;
+         const d = c.hidden;
++        // ModelOpt MIXED's per-tensor FP8 (nvidia's GLM-5.3-NVFP4 dense layers): e4m3 under one f32
++        // weight_scale, dequantized on the host to the bf16 lane — formats.of admits no .fp8 projection.
++        if (L.recipes) |r| {
++            var nb: [96]u8 = undefined;
++            const mod = try std.fmt.bufPrint(&nb, "{s}layers.{d}.mlp.gate_proj", .{ L.pfx, i });
++            if (r.of(mod) == .fp8) return L.fp8Dense(i);
++        }
+         const mx = !c.exl3 and !c.fp8 and (try L.get("layers.{d}.mlp.gate_proj.weight", .{i})).dtype == .f8_e4m3; // FP4-Local's
+         const want: formats.Format = if (c.exl3) .bf16 else if (c.fp8) .fp8_pb else if (mx) .mxfp8 else .nvfp4;
+         inline for (.{ "gate_proj", "up_proj", "down_proj" }) |x| try L.format("layers.{d}.mlp." ++ x, .{i}, want);
+@@ -365,13 +378,13 @@ const Loader = struct {
+             break :bf16 .{ .bf16 = .{ .gu = gu, .down = try L.put("layers.{d}.mlp.down", .{i}) } };
+         } else if (c.fp8) f8: { // a block FP8 checkpoint's dense layers: [gate | up] and down on the lane, as its shared experts
+             const parts = [_]formats.Part{ .{ .rel = "mlp.gate_proj", .rows = .{ s.lo, s.hi } }, .{ .rel = "mlp.up_proj", .rows = .{ s.lo, s.hi } } };
+-            const gu = try formats.cutProj(L, prefix, i, &parts, &.{.fp8_pb}, "layers.{d}.mlp.gu");
+-            const down = try formats.cutProj(L, prefix, i, &.{.{ .rel = "mlp.down_proj", .cols = .{ s.lo, s.hi } }}, &.{.fp8_pb}, "layers.{d}.mlp.down");
++            const gu = try formats.cutProj(L, L.pfx, i, &parts, &.{.fp8_pb}, "layers.{d}.mlp.gu");
++            const down = try formats.cutProj(L, L.pfx, i, &.{.{ .rel = "mlp.down_proj", .cols = .{ s.lo, s.hi } }}, &.{.fp8_pb}, "layers.{d}.mlp.down");
+             break :f8 .{ .fp8g = .{ .gu = gu.fp8g, .down = down.fp8g } };
+         } else if (mx) mx8: {
+             const parts = [_]formats.Part{ .{ .rel = "mlp.gate_proj", .rows = .{ s.lo, s.hi } }, .{ .rel = "mlp.up_proj", .rows = .{ s.lo, s.hi } } };
+-            const gu = try formats.cutProj(L, prefix, i, &parts, &.{.mxfp8}, "layers.{d}.mlp.gu");
+-            const down = try formats.cutProj(L, prefix, i, &.{.{ .rel = "mlp.down_proj", .cols = .{ s.lo, s.hi } }}, &.{.mxfp8}, "layers.{d}.mlp.down");
++            const gu = try formats.cutProj(L, L.pfx, i, &parts, &.{.mxfp8}, "layers.{d}.mlp.gu");
++            const down = try formats.cutProj(L, L.pfx, i, &.{.{ .rel = "mlp.down_proj", .cols = .{ s.lo, s.hi } }}, &.{.mxfp8}, "layers.{d}.mlp.down");
+             break :mx8 .{ .mxfp8 = .{ .gu = gu.mxfp8, .down = down.mxfp8 } };
+         } else .{ .nvfp4 = .{
+             .gate = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d),
+@@ -386,6 +399,48 @@ const Loader = struct {
+         };
+     }
+ 
++    /// A ModelOpt per-tensor FP8 dense layer as the bf16 lane's [gate | up] and down, the rank's share of each.
++    fn fp8Dense(L: *Loader, i: u32) !mlp.Layer {
++        const c = &L.w.config;
++        const s = L.w.share.dense;
++        const d = c.hidden;
++        inline for (.{ "gate_proj", "up_proj" }) |x| try L.fp8Slice("layers.{d}.mlp." ++ x, i, s.lo, s.hi, 0, d);
++        const gu = try L.put("layers.{d}.mlp.gu", .{i});
++        try L.fp8Slice("layers.{d}.mlp.down_proj", i, 0, d, s.lo, s.hi);
++        return .{
++            .w = .{ .bf16 = .{ .gu = gu, .down = try L.put("layers.{d}.mlp.down", .{i}) } },
++            .width = s.len(),
++            .dims = d,
++            .limit = c.swiglu_limit,
++        };
++    }
++
++    /// An FP8 linear's [rlo, rhi) x [clo, chi) as bf16 on L.host: its e4m3 codes under the f32 weight_scale.
++    /// input_scale is validated but unused — the lane's activations stay bf16 (weight-only quantization).
++    fn fp8Slice(L: *Loader, comptime fmt: []const u8, i: u32, rlo: usize, rhi: usize, clo: usize, chi: usize) !void {
++        const w = try L.get(fmt ++ ".weight", .{i});
++        if (w.dtype != .f8_e4m3 or w.rank != 2) {
++            std.log.err("{s}: a ModelOpt FP8 linear's weight is e4m3 [n][k], not {t} {any}", .{ L.last, w.dtype, w.shape[0..w.rank] });
++            return error.UnexpectedTensor;
++        }
++        const sc = try L.get(fmt ++ ".weight_scale", .{i});
++        const inp = try L.get(fmt ++ ".input_scale", .{i});
++        if (sc.dtype != .f32 or sc.numel() != 1 or inp.dtype != .f32 or inp.numel() != 1) {
++            std.log.err("{s}: a ModelOpt FP8 linear has one f32 weight_scale and one f32 input_scale", .{L.last});
++            return error.UnexpectedTensor;
++        }
++        const n = w.shape[0];
++        const k = w.shape[1];
++        if (rhi > n or chi > k or rlo >= rhi or clo >= chi) return error.UnexpectedTensor;
++        const g = std.mem.bytesToValue(f32, sc.bytes[0..4]);
++        const out = try L.host.addManyAsSlice(L.gpa, (rhi - rlo) * (chi - clo) * 2);
++        var o: usize = 0;
++        for (rlo..rhi) |r| for (clo..chi) |col| {
++            std.mem.writeInt(u16, out[o..][0..2], toBf16(core.exlr8.codec.e4m3Value(w.bytes[r * k + col]) * g), .little);
++            o += 2;
++        };
++    }
++
+     /// One device allocation the loader frees itself (staging for the GPU's quantizers).
+     pub fn scratch(L: *Loader, n: usize) !cuda.DeviceBuffer {
+         return cuda.DeviceBuffer.alloc(L.d, n);
+@@ -473,8 +528,8 @@ const Loader = struct {
+         const sh = L.w.share.shared;
+         const sw: []const formats.Format = if (i == c.layers) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb }; // MTP's MXFP8
+         const gu_parts = [_]formats.Part{ .{ .rel = "mlp.shared_experts.gate_proj", .rows = .{ sh.lo, sh.hi } }, .{ .rel = "mlp.shared_experts.up_proj", .rows = .{ sh.lo, sh.hi } } };
+-        const gu = try formats.cutProj(L, prefix, i, &gu_parts, sw, "layers.{d}.moe.shared.gu");
+-        const sd = try formats.cutProj(L, prefix, i, &.{.{ .rel = "mlp.shared_experts.down_proj", .cols = .{ sh.lo, sh.hi } }}, sw, "layers.{d}.moe.shared.down");
++        const gu = try formats.cutProj(L, L.pfx, i, &gu_parts, sw, "layers.{d}.moe.shared.gu");
++        const sd = try formats.cutProj(L, L.pfx, i, &.{.{ .rel = "mlp.shared_experts.down_proj", .cols = .{ sh.lo, sh.hi } }}, sw, "layers.{d}.moe.shared.down");
+         return .{
+             .router = router,
+             .bias = bias,
+@@ -519,7 +574,7 @@ const Loader = struct {
+         if (bf16) try L.quantizedExperts(i, up, down, up_scale, down_scale) else for (0..count) |e| {
+             var ls: [3]core.nvfp4.Linear = undefined;
+             inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, m| {
+-                const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.mlp.experts.{d}." ++ proj, .{ i, e });
++                const name = try std.fmt.bufPrint(&L.name_buf, "{s}layers.{d}.mlp.experts.{d}." ++ proj, .{ L.pfx, i, e });
+                 ls[m] = try formats.expert(L, name, decoded[m * per ..][0..per]);
+             }
+             // gate and up: the rank's rows; down: every row, the rank's columns
+@@ -580,7 +635,7 @@ const Loader = struct {
+             var made: usize = 0;
+             defer for (ps[0..made]) |p| p.deinit(L.gpa);
+             inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, m| {
+-                const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.mlp.experts.{d}." ++ proj, .{ i, e });
++                const name = try std.fmt.bufPrint(&L.name_buf, "{s}layers.{d}.mlp.experts.{d}." ++ proj, .{ L.pfx, i, e });
+                 try L.formatIn(L.ck, name, .fp8_pb);
+                 ps[m] = try formats.fp8pb.Fp8pb.read(L.gpa, L.ck, name);
+                 made += 1;
+@@ -634,21 +689,38 @@ fn recipeTable(r: *const core.modelopt.Recipes) ?*const core.modelopt.Recipes {
+     return if (r.mixed) r else null;
+ }
+ 
++/// The checkpoint's LM prefix: the one its embed_tokens sits under.
++fn modelPrefix(ck: *core.Checkpoint) ![]const u8 {
++    for (prefixes) |p| {
++        var buf: [96]u8 = undefined;
++        if (ck.has(try std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{p}))) return p;
++    }
++    std.log.err("checkpoint has no embed_tokens.weight under model.language_model. or model.", .{});
++    return error.NoModelPrefix;
++}
++
+ /// weights.load without the MTP head: embedding, layers, final norm, the rank's head rows (bf16, MXFP8); `pack_dense`.
+ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layers: []const u32, heads: Heads) !Weights {
+     var w: Weights = .{ .gpa = gpa, .config = c, .share = share };
+     errdefer w.deinit();
+-    var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, prefix);
++    var ck = try core.Checkpoint.openModelPrefixes(gpa, io, dir, &prefixes);
+     defer ck.close();
+     var head_ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, "lm_head.");
+     defer head_ck.close();
+-    var L: Loader = .{ .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck };
++    var L: Loader = .{ .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck, .pfx = try modelPrefix(&ck) };
+     defer L.host.deinit(gpa);
+     var recipes = try formats.readRecipes(gpa, io, dir);
+     defer if (recipes) |*r| r.deinit();
+     if (recipes) |*r| L.recipes = recipeTable(r);
+     w.layers = try gpa.alloc(Layer, layers.len);
+-    try @import("cuda_load_ahead.zig").layers(&L, prefix, layers, w.layers);
++    if (c.dsa) { // glm_moe_dsa's rope: inv_freq[j] = theta^(-2j/rope), one upload every DSA layer shares
++        const inv = try gpa.alloc(f32, c.rope / 2);
++        defer gpa.free(inv);
++        for (inv, 0..) |*v, j| v.* = @floatCast(std.math.pow(f64, c.rope_theta, -2.0 * @as(f64, @floatFromInt(j)) / @as(f64, @floatFromInt(c.rope))));
++        try L.host.appendSlice(gpa, std.mem.sliceAsBytes(inv));
++        L.inv = try L.put("glm.dsa.inv", .{});
++    }
++    try @import("cuda_load_ahead.zig").layers(&L, L.pfx, layers, w.layers);
+     try L.whole(try L.get("embed_tokens.weight", .{}), .bf16);
+     w.embed = try L.put("embed", .{});
+     w.norm = try L.norm("norm.weight", .{}, "norm");
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 1214ed0..ce0dde5 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -40,7 +40,7 @@ pub const families: []const api.Family = blk: {
+     out[registry.len + 1] = .{ .model_type = "fish_omni", .formats = &.{"fp8-block128"} };
+     out[registry.len + 2] = .{ .model_type = "qwen4", .formats = @import("qwen4").family.native_host.formats };
+     out[registry.len + 3] = .{ .model_type = "qwen4_text", .formats = @import("qwen4").family.native_host.formats };
+-    out[registry.len + 4] = .{ .model_type = "glm_moe_dsa", .formats = &.{"exl3"} }; // full GLM-5.3: the glm family's second shape
++    out[registry.len + 4] = .{ .model_type = "glm_moe_dsa", .formats = &.{ "exl3", "modelopt-mixed", "modelopt-nvfp4" } }; // full GLM-5.3: the glm family's second shape
+     const final = out;
+     break :blk &final;
+ };
+-- 
+2.43.0
+

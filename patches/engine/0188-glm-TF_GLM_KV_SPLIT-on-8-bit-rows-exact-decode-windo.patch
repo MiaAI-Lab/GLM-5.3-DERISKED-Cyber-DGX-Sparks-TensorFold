@@ -1,0 +1,503 @@
+From db9e1ae96e895a6cc0119c2ee113e4e852a41ea2 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 11:30:31 +0200
+Subject: [PATCH 188/194] glm: TF_GLM_KV_SPLIT on 8-bit rows; exact decode
+ windows (the picks' union gathered, the unchanged attention); host tests
+
+Decode windows past the dense prefix gather the union of their picks from the ranks that hold them and run
+dsa_block's sparse attention on those rows with the lists remapped: bit-identical to unsplit. Windows in the
+prefix take the prompt path. TF_GLM_KV_SPLIT_DECODE=lse keeps the query-gather path (BF16, not exact).
+Int8 and E4M3 rows: codes and scales gathered and kept apart. test-glm-kv-split-host runs the module's tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/build/glm_family_host.zig          |   1 +
+ zig/kernels/cuda/glm_kvsplit.cuh       | 117 ++++++++++++++-
+ zig/src/families/glm/cuda.zig          |   1 +
+ zig/src/families/glm/cuda_engine.zig   |   2 +-
+ zig/src/families/glm/cuda_forward.zig  |   2 +-
+ zig/src/families/glm/cuda_kv_split.zig | 194 +++++++++++++++++++++++--
+ 6 files changed, 299 insertions(+), 18 deletions(-)
+
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 481a9a837..88392753c 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -21,6 +21,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     b.step("test-glm-index-emulate", "GLM's prompt indexer kernels as host C++ against a plain top-K and a model of tf_glm_scores").dependOn(&index_emulated.step);
+     const kv8_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "GLM FP8 KV:", "GLM heads:" } }));
+     b.step("test-glm-tools-host", "A request's tool list as drafts: the prompt's <tools> block, the call cursor and its forced tokens, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM tool drafts:"} })).step);
++    b.step("test-glm-kv-split-host", "TF_GLM_KV_SPLIT's ownership, head tables and switch, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"KV split:"} })).step);
+     b.step("test-glm-dspark-host", "DSpark's host chain (candidate merge, Markov alignment, confidence) without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM DSpark:"} })).step);
+     b.step("test-glm-fp8-kv-host", "GLM latent cache layout, mode agreement and recorded CUDA launches without devices").dependOn(&kv8_run.step);
+     step.dependOn(&kv8_run.step);
+diff --git a/zig/kernels/cuda/glm_kvsplit.cuh b/zig/kernels/cuda/glm_kvsplit.cuh
+index 6b85c08c6..f5dab2b7c 100644
+--- a/zig/kernels/cuda/glm_kvsplit.cuh
++++ b/zig/kernels/cuda/glm_kvsplit.cuh
+@@ -29,6 +29,15 @@ __device__ __forceinline__ int owner(const Heads& t, int h, int* local) {
+   *local = 0;
+   return 0;
+ }
++// One row of `n` bytes: 16-byte words when both ends and n allow it, else bytes (the 8-bit rows' scales, 4 or 8 B).
++__device__ __forceinline__ void copy_row(unsigned char* d, const unsigned char* s, int64_t n) {
++  if (n % 16 == 0 && (reinterpret_cast<uintptr_t>(d) | reinterpret_cast<uintptr_t>(s)) % 16 == 0) {
++    for (int64_t i = threadIdx.x; i < n / 16; i += blockDim.x)
++      reinterpret_cast<uint4*>(d)[i] = reinterpret_cast<const uint4*>(s)[i];
++  } else {
++    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) d[i] = s[i];
++  }
++}
+ }  // namespace glm_kvs
+ 
+ // Rows this rank owns, copied whole (row_bytes, a multiple of 16) from src into the split cache at their local rows.
+@@ -39,9 +48,7 @@ extern "C" __global__ void __launch_bounds__(128)
+                         int64_t row_bytes, const int* pos, int world, int rank) {
+   const int64_t r = blockIdx.x, p = (int64_t)pos[0] + r;
+   if (p % world != rank) return;
+-  const uint4* s = reinterpret_cast<const uint4*>(src + (src_by_pos ? p : r) * src_stride);
+-  uint4* d = reinterpret_cast<uint4*>(dst + (p / world) * row_bytes);
+-  for (int64_t i = threadIdx.x; i < row_bytes / 16; i += blockDim.x) d[i] = s[i];
++  glm_kvs::copy_row(dst + (p / world) * row_bytes, src + (src_by_pos ? p : r) * src_stride, row_bytes);
+ }
+ 
+ // A window's local token lists, a block a row (1,024 threads): a row with no global picks (count 0, or `sparse` 0: no
+@@ -209,7 +216,105 @@ extern "C" __global__ void __launch_bounds__(128)
+                            int64_t n, int world, int64_t limit) {
+   const int64_t j = blockIdx.x, s = blockIdx.y, p = (j0 + j) * world + s;
+   if (p >= limit) return;
+-  const uint4* src = reinterpret_cast<const uint4*>(gathered + (s * n + j) * row_bytes);
+-  uint4* dst = reinterpret_cast<uint4*>(scratch + p * row_bytes);
+-  for (int64_t i = threadIdx.x; i < row_bytes / 16; i += blockDim.x) dst[i] = src[i];
++  glm_kvs::copy_row(scratch + p * row_bytes, gathered + (s * n + j) * row_bytes, row_bytes);
++}
++
++// ---- exact decode windows: the window's picked keys gathered, the unchanged attention on them ----
++
++namespace glm_kvs {
++// an exclusive scan of one int a thread over a 1,024-thread block (sh: 1,024 ints); returns this thread's offset
++__device__ __forceinline__ int block_scan(int v, int* sh, int* total) {
++  const int t = threadIdx.x;
++  sh[t] = v;
++  __syncthreads();
++  for (int o = 1; o < 1024; o <<= 1) {
++    const int x = t >= o ? sh[t - o] : 0;
++    __syncthreads();
++    sh[t] += x;
++    __syncthreads();
++  }
++  const int incl = sh[t];
++  if (total) *total = sh[1023];
++  __syncthreads();
++  return incl - v;
++}
++}  // namespace glm_kvs
++
++// The window's picks (rows' lists, counts) as one ascending union of positions below npos (ul), each position's index
++// among its owner's (uidx: its slot in the owner's share), and out[0] = |union|, out[1 + s] = rank s's share. One
++// block of 1,024 threads; bits: (npos + 31) / 32 words of scratch.
++extern "C" __global__ void __launch_bounds__(1024)
++    tf_glm_kvs_union(const int* tok, const int* cnt, int rows, int w, int64_t npos, int world, unsigned* bits, int* ul,
++                     int* uidx, int* out) {
++  __shared__ int sh[1024];
++  __shared__ int tot;
++  const int t = threadIdx.x;
++  const int64_t nw = (npos + 31) / 32;
++  for (int64_t i = t; i < nw; i += 1024) bits[i] = 0u;
++  __syncthreads();
++  for (int r = 0; r < rows; ++r)
++    for (int i = t; i < cnt[r]; i += 1024) {
++      const int p = tok[(int64_t)r * w + i];
++      atomicOr(&bits[p >> 5], 1u << (p & 31));
++    }
++  __syncthreads();
++  const int64_t per = (nw + 1023) / 1024, w0 = t * per, w1 = w0 + per < nw ? w0 + per : nw;
++  int mine = 0, own[glm_kvs::MAX_W] = {};
++  for (int64_t i = w0; i < w1; ++i) {
++    unsigned b = bits[i];
++    mine += __popc(b);
++    while (b) {
++      const int bit = __ffs(b) - 1;
++      b &= b - 1;
++      ++own[(i * 32 + bit) % world];
++    }
++  }
++  int at = glm_kvs::block_scan(mine, sh, &tot);
++  int oo[glm_kvs::MAX_W];
++  for (int s = 0; s < world; ++s) {
++    int all;
++    oo[s] = glm_kvs::block_scan(own[s], sh, &all);
++    if (t == 0) out[1 + s] = all;
++  }
++  if (t == 0) out[0] = tot;
++  for (int64_t i = w0; i < w1; ++i) {
++    unsigned b = bits[i];
++    while (b) {
++      const int bit = __ffs(b) - 1;
++      b &= b - 1;
++      const int p = (int)(i * 32 + bit);
++      ul[at] = p;
++      uidx[at] = oo[p % world]++;
++      ++at;
++    }
++  }
++}
++
++// This rank's share of the union: its rows (local row p div W of this layer's cache, `rb` bytes, and `sb` bytes of
++// scales when an 8-bit cache has them) into the send rows at their share index. Block (union element), 64 threads.
++extern "C" __global__ void __launch_bounds__(64)
++    tf_glm_kvs_pack(const unsigned char* lc, const unsigned char* ls, const int* ul, const int* uidx, int world,
++                    int rank, int64_t rb, int64_t sb, unsigned char* send, unsigned char* send_s) {
++  const int u = blockIdx.x, p = ul[u];
++  if (p % world != rank) return;
++  const int64_t j = p / world, at = uidx[u];
++  glm_kvs::copy_row(send + at * rb, lc + j * rb, rb);
++  if (sb) glm_kvs::copy_row(send_s + at * sb, ls + j * sb, sb);
++}
++
++// A window's lists (positions) as rows of the gathered shares: position p -> (p mod W) c + its share index. Block a
++// row, 1,024 threads; un the union's size.
++extern "C" __global__ void __launch_bounds__(1024)
++    tf_glm_kvs_remap(const int* tok, const int* cnt, int w, const int* ul, const int* uidx, int un, int world, int c,
++                     int* out) {
++  const int64_t r = blockIdx.x;
++  for (int i = threadIdx.x; i < cnt[r]; i += 1024) {
++    const int p = tok[r * w + i];
++    int lo = 0, hi = un;
++    while (lo < hi) {
++      const int mid = (lo + hi) >> 1;
++      if (ul[mid] < p) lo = mid + 1; else hi = mid;
++    }
++    out[r * w + i] = (p % world) * c + uidx[lo];
++  }
+ }
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index 8db287127..f51210c17 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -59,6 +59,7 @@ test {
+     _ = @import("cuda_kv_shard_attn_test.zig");
+     _ = @import("cuda_kv_shard_keep.zig");
+     _ = @import("cuda_kv_shard_keep_test.zig");
++    _ = @import("cuda_kv_split.zig");
+     _ = @import("cuda_disk_shard_test.zig");
+     _ = @import("cuda_ranks_test.zig");
+     _ = @import("cuda_p2p.zig");
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index c694d43f4..0d9754673 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -281,7 +281,7 @@ pub const Engine = struct {
+         if (o.settings.kv_split != 0) {
+             const x = try gpa.create(kv_split.Ctx);
+             errdefer gpa.destroy(x);
+-            x.* = try kv_split.Ctx.init(d, e.m.ops(), e.m.mods[6], &c, lib, comm, rank, world, o.capacity, o.settings.kv_split == 2);
++            x.* = try kv_split.Ctx.init(d, e.m.ops(), e.m.mods[6], &c, lib, comm, rank, world, o.capacity, o.settings.kv_split == 2, o.settings.kv8);
+             e.kvs = x;
+         }
+         errdefer if (e.kvs) |x| {
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 6a9544413..e21b31af4 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -364,7 +364,7 @@ pub const Forward = struct {
+                     };
+                     const nx: ?@import("cuda_kv_split.zig").Next = if (di + 1 < st.caches.len and di + 1 < r.w.layers.len and r.w.layers[di + 1].mixer == .mla) .{ .c = st.caches[di + 1], .ifull = r.w.layers[di + 1].mixer.mla.ifull } else null;
+                     const done = try f.splitProj(r, a, rows);
+-                    if (b.prefill) try x.prompt(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, done, di, nx) else try x.decode(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, done);
++                    if (b.prefill) try x.prompt(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, done, di, nx) else try x.decode(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, done, di);
+                 } else if (kv_attn.wanted(f, r)) try kv_attn.single(f, r, a, di, rows, nch, k) else {
+                     const done = try f.splitProj(r, a, rows);
+                     try dsa_block.bodyPre(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, if (f.prefetch()) |pf| .{ .l2 = pf, .layer = l.index } else null, done);
+diff --git a/zig/src/families/glm/cuda_kv_split.zig b/zig/src/families/glm/cuda_kv_split.zig
+index 579bc4d34..e3f148b1d 100644
+--- a/zig/src/families/glm/cuda_kv_split.zig
++++ b/zig/src/families/glm/cuda_kv_split.zig
+@@ -52,7 +52,6 @@ pub fn refuse(on: bool, f: Facts) !void {
+     if (!on) return;
+     if (f.world < 2) return error.KvSplitNeedsRanks;
+     if (!f.dsa) return error.KvSplitNeedsDsa;
+-    if (f.kv8) return error.KvSplitNeedsBf16;
+     if (f.pages) return error.KvSplitWithPages;
+     if (f.kv_shard) return error.KvSplitWithShard;
+     if (f.mtp_drafts or f.mtp_loaded) return error.KvSplitWithMtp;
+@@ -63,7 +62,6 @@ pub fn why(err: anyerror) ?[]const u8 {
+         error.BadKvSplit => why_bad,
+         error.KvSplitNeedsRanks => "TF_GLM_KV_SPLIT=1 needs two ranks or more",
+         error.KvSplitNeedsDsa => "TF_GLM_KV_SPLIT=1 serves glm_moe_dsa (GLM-5.3) checkpoints only",
+-        error.KvSplitNeedsBf16 => "TF_GLM_KV_SPLIT=1 splits BF16 latent rows (KV=bf16); --kv-cache fp8 is not split yet",
+         error.KvSplitWithPages => "TF_GLM_KV_SPLIT=1 does not run on KV pages (KV_PAGES=off)",
+         error.KvSplitWithShard => "TF_GLM_KV_SPLIT=1 and TF_GLM_KV_SHARD=1 exclude each other",
+         error.KvSplitWithMtp => "TF_GLM_KV_SPLIT=1 does not run with the target MTP head (DRAFTER=dspark, dflash2 or none)",
+@@ -93,6 +91,8 @@ pub const max_rows = 32;
+ pub const nch = 16;
+ /// A prompt chunk's history gather: local rows a rank sends a piece.
+ pub const piece_rows = 8192;
++/// An exact decode window's gathered share: at most this many rows a rank (more: the window gathers the whole history).
++pub const share_cap = 8192;
+ const row_w = glue.dsa_row; // 576
+ const row_bytes = row_w * 2;
+ const ik_bytes = 128 * 2; // an index key row (i_dim bf16)
+@@ -156,9 +156,38 @@ pub const Ctx = struct {
+     mpos: u64 = 0, // i32 [max_rows][world k]
+     fi: struct { scores: cuda.Function, local: cuda.Function, merge: cuda.Function } = undefined,
+     f: struct { own_rows: cuda.Function, lists: cuda.Function, q_pack: cuda.Function, q_unpack: cuda.Function, premerge: cuda.Function, merge: cuda.Function, unpack_rows: cuda.Function, premerge_b16: cuda.Function, merge_b16: cuda.Function },
+-    counts: struct { prompt_bytes: u64 = 0, decode_layers: u64 = 0 } = .{},
++    counts: struct { prompt_bytes: u64 = 0, decode_layers: u64 = 0, union_rows: u64 = 0, full_windows: u64 = 0 } = .{},
++    // the cache rows' format: BF16 (cb 1,152 bytes a row), or 8-bit codes (cb 576) and sb bytes of scales a row
++    kv8: bool = false,
++    cb: usize = row_bytes,
++    sb: usize = 0,
++    fulls: u64 = 0, // the scratch's scales (8-bit rows): [capacity][sb]
++    fulls2: u64 = 0,
++    // TF_GLM_KV_SPLIT_DECODE: exact (default; the window's picked keys gathered, the unchanged attention on them:
++    // every decode window bit-identical to unsplit) or lse (queries gathered, partials merged: fewer bytes, not exact)
++    lse: bool = false,
++    wc: u64 = 0, // a window's rows written before this rank keeps its own: codes [max_rows][cb], scales [max_rows][sb]
++    ws: u64 = 0,
++    bits: u64 = 0, // the union's bitmap, (capacity + 31) / 32 words
++    ul: u64 = 0, // i32 [max_rows k]: the union's positions, ascending
++    uidx: u64 = 0, // i32 [max_rows k]: each one's index in its owner's share
++    uout: u64 = 0, // i32 [1 + world]: |union|, every rank's share
++    rtok: u64 = 0, // i32 [max_rows][k]: the window's lists as gathered rows
++    send: u64 = 0, // this rank's share: [share_cap][cb], scales [share_cap][sb]
++    sends: u64 = 0,
++    recv: u64 = 0, // every rank's: [world][share_cap][cb], scales [world][share_cap][sb]
++    recvs: u64 = 0,
++    u_pos: ?usize = null, // the window (its position) the union below is of
++    u_n: usize = 0,
++    u_c: usize = 0, // the shares' common length (the largest)
++    u_full: bool = false, // a share past share_cap: this window gathers the whole history instead
++    fx: struct { unite: cuda.Function, pack: cuda.Function, remap: cuda.Function } = undefined,
+ 
+-    pub fn init(d: *const cuda.Driver, ops: cuda.Module, glue_mod: cuda.Module, c: anytype, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, capacity: usize, index: bool) !Ctx {
++    pub fn init(d: *const cuda.Driver, ops: cuda.Module, glue_mod: cuda.Module, c: anytype, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, capacity: usize, index: bool, kv8: bool) !Ctx {
++        const cb: usize = if (kv8) row_w else row_bytes;
++        const sb: usize = if (kv8) (if (latent.int8()) 8 else 4) else 0;
++        const lse = if (std.c.getenv("TF_GLM_KV_SPLIT_DECODE")) |v| std.mem.eql(u8, std.mem.span(v), "lse") else false;
++        if (lse and kv8) return error.KvSplitLseBf16;
+         const t = try headsOf(c, world);
+         const H: usize = c.mla_heads;
+         const hp: usize = @intCast(t.hpad);
+@@ -188,9 +217,25 @@ pub const Ctx = struct {
+         };
+         const want_pf = world >= 3 and if (std.c.getenv("TF_GLM_KV_SPLIT_PREFETCH")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+         const sizes2 = [_]usize{ if (want_pf) capacity * row_bytes else 0, if (want_pf and index) capacity * ik_bytes else 0, if (want_pf) world * piece_rows * row_bytes else 0 };
++        const sizes3 = [_]usize{
++            capacity * sb, // fulls
++            if (want_pf) capacity * sb else 0, // fulls2
++            max_rows * cb,
++            max_rows * @max(sb, 16),
++            (capacity + 31) / 32 * 4,
++            max_rows * k_picks * 4,
++            max_rows * k_picks * 4,
++            (1 + world) * 4,
++            max_rows * k_picks * 4,
++            share_cap * cb,
++            share_cap * @max(sb, 16),
++            world * share_cap * cb,
++            world * share_cap * @max(sb, 16),
++        };
+         var total: usize = 0;
+         for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
+         for (sizes2) |n| total += std.mem.alignForward(usize, n, 256);
++        for (sizes3) |n| total += std.mem.alignForward(usize, n, 256);
+         var buf = try cuda.DeviceBuffer.alloc(d, total);
+         errdefer buf.free();
+         try buf.fill8(0, null);
+@@ -203,6 +248,12 @@ pub const Ctx = struct {
+         const full2 = buf.ptr + at;
+         const fik2 = full2 + std.mem.alignForward(usize, sizes2[0], 256);
+         const gat2 = fik2 + std.mem.alignForward(usize, sizes2[1], 256);
++        var p3: [sizes3.len]u64 = undefined;
++        var at3: u64 = gat2 + std.mem.alignForward(usize, sizes2[2], 256);
++        for (sizes3, 0..) |n, i| {
++            p3[i] = at3;
++            at3 += std.mem.alignForward(usize, n, 256);
++        }
+         var side: ?cuda.Stream = null;
+         var mark: ?cuda.Event = null;
+         var ready: [2]?cuda.Event = .{ null, null };
+@@ -237,6 +288,24 @@ pub const Ctx = struct {
+             .rm = p[14],
+             .rl = p[15],
+             .index = index,
++            .kv8 = kv8,
++            .cb = cb,
++            .sb = sb,
++            .lse = lse,
++            .fulls = p3[0],
++            .fulls2 = p3[1],
++            .wc = p3[2],
++            .ws = p3[3],
++            .bits = p3[4],
++            .ul = p3[5],
++            .uidx = p3[6],
++            .uout = p3[7],
++            .rtok = p3[8],
++            .send = p3[9],
++            .sends = p3[10],
++            .recv = p3[11],
++            .recvs = p3[12],
++            .fx = .{ .unite = try ops.function("tf_glm_kvs_union"), .pack = try ops.function("tf_glm_kvs_pack"), .remap = try ops.function("tf_glm_kvs_remap") },
+             .prefetch = want_pf,
+             .full2 = full2,
+             .fik2 = fik2,
+@@ -329,42 +398,147 @@ pub const Ctx = struct {
+     /// gathered (or prefetched while the layer before computed), the block on the whole-row scratch, then this rank's
+     /// rows of the chunk kept. `di` the layer's index among the DSA layers, `next` the next one's caches.
+     pub fn prompt(x: *Ctx, k: dsa_block.Kernels, stream: cuda.Stream, l: dsa_block.Layer, c: dsa_block.Caches, s: dsa_block.Scratch, xin: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, n_ch: usize, part_rows: usize, proj_done: bool, di: usize, next: ?Next) !void {
+-        if (c.ls != 0 or c.pt != 0) return error.KvSplitLayout;
++        if ((c.ls != 0) != x.kv8 or c.pt != 0) return error.KvSplitLayout;
+         if (host_pos + rows > x.full_rows) return error.KvSplitRoom;
+         // TF_GLM_KV_SPLIT_DIAG=window (a diagnosis): the chunk's attention as decode windows run it (the split
+         // attention, 32 rows at a time), so a prompt_logprobs panel measures the decode path's numerics
+-        if (x.diag_window) return x.decode(k, stream, l, c, s, xin, x_stride, rows, pos, host_pos, proj_done);
++        if (x.diag_window and x.lse) return x.decodeLse(k, stream, l, c, s, xin, x_stride, rows, pos, host_pos, proj_done);
+         const pf = x.prefetch and x.side_comm != null;
+         const b: usize = if (pf) di % 2 else 0;
+         const lat = if (b == 0) x.full else x.full2;
++        const lats = if (b == 0) x.fulls else x.fulls2;
+         const fik = if (b == 0) x.fik else x.fik2;
+         const ix = x.index and l.ifull; // the index keys too (TF_GLM_KV_SPLIT=2): a shared layer reads none
+         const have = if (x.filled[b]) |f| f[0] == di and f[1] == host_pos else false;
+         x.filled[b] = null;
+         if (have) try stream.wait(x.ready[b].?) else {
+-            try x.gatherRows(stream, c.lc, host_pos, row_bytes, lat);
++            try x.gatherRows(stream, c.lc, host_pos, x.cb, lat);
++            if (x.kv8) try x.gatherRows(stream, c.ls, host_pos, x.sb, lats);
+             if (ix) try x.gatherRows(stream, c.ik, host_pos, ik_bytes, fik);
+         }
+         if (pf) if (next) |nx| if (host_pos > 0) {
+             const sd = x.side.?;
+             try x.mark.?.record(stream); // the other scratch's last reader and every write of the rows it gathers
+             try sd.wait(x.mark.?);
+-            try x.gatherRowsOn(sd, x.side_comm, x.gat2, nx.c.lc, host_pos, row_bytes, if (b == 0) x.full2 else x.full);
++            try x.gatherRowsOn(sd, x.side_comm, x.gat2, nx.c.lc, host_pos, x.cb, if (b == 0) x.full2 else x.full);
++            if (x.kv8) try x.gatherRowsOn(sd, x.side_comm, x.gat2, nx.c.ls, host_pos, x.sb, if (b == 0) x.fulls2 else x.fulls);
+             if (x.index and nx.ifull) try x.gatherRowsOn(sd, x.side_comm, x.gat2, nx.c.ik, host_pos, ik_bytes, if (b == 0) x.fik2 else x.fik);
+             try x.ready[1 - b].?.record(sd);
+             x.filled[1 - b] = .{ di + 1, host_pos };
+         };
+         var whole = c;
+         whole.lc = lat;
++        if (x.kv8) whole.ls = lats;
+         if (ix) whole.ik = fik;
+         try dsa_block.bodyPre(k, stream, l, whole, s, xin, x_stride, rows, pos, host_pos, n_ch, part_rows, null, proj_done);
+-        try x.ownRows(stream, lat, row_bytes, true, c.lc, pos, rows);
++        try x.ownRowsOf(stream, lat, x.cb, true, c.lc, pos, rows, x.cb);
++        if (x.kv8) try x.ownRowsOf(stream, lats, x.sb, true, c.ls, pos, rows, x.sb);
+         if (ix) try x.ownRowsOf(stream, fik, ik_bytes, true, c.ik, pos, rows, ik_bytes);
+     }
+ 
+     /// A decode window's DSA block through s.vn, as dsa_block.bodyPre: projections (or `proj_done`), the window's
+     /// latent rows this rank owns written, index keys, picks (replicated), then the split attention and expand_v.
+-    pub fn decode(x: *Ctx, k: dsa_block.Kernels, stream: cuda.Stream, l: dsa_block.Layer, c: dsa_block.Caches, s: dsa_block.Scratch, xin: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, proj_done: bool) !void {
++    pub fn decode(x: *Ctx, k: dsa_block.Kernels, stream: cuda.Stream, l: dsa_block.Layer, c: dsa_block.Caches, s: dsa_block.Scratch, xin: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, n_ch: usize, part_rows: usize, proj_done: bool, di: usize) !void {
++        if (x.lse) return x.decodeLse(k, stream, l, c, s, xin, x_stride, rows, pos, host_pos, proj_done);
++        // a window with rows inside the all-visible prefix attends densely: the whole history (under 2,048 rows) as a
++        // prompt chunk gathers it, through the unchanged block
++        if (host_pos < l.dense_limit or rows > max_rows) return x.prompt(k, stream, l, c, s, xin, x_stride, rows, pos, host_pos, n_ch, part_rows, proj_done, di, null);
++        return x.decodeExact(k, stream, l, c, s, xin, x_stride, rows, pos, host_pos, proj_done);
++    }
++
++    /// An exact decode window past the dense prefix (every row sparse): the unchanged projections, rows written
++    /// (this rank's kept), picks (as unsplit), then the union of the window's picks gathered from the ranks that hold
++    /// them — the share lengths read on the host once a window at each indexer layer — and the unchanged sparse
++    /// attention over the gathered rows with the lists remapped to them: the same keys in the same order, the same
++    /// launches, so the same bits as unsplit.
++    fn decodeExact(x: *Ctx, k: dsa_block.Kernels, stream: cuda.Stream, l: dsa_block.Layer, c: dsa_block.Caches, s: dsa_block.Scratch, xin: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, proj_done: bool) !void {
++        if ((c.ls != 0) != x.kv8 or c.pt != 0 or l.rope == 0) return error.KvSplitLayout;
++        const set = k.set;
++        const ix = l.index;
++        try dsa_block.prepareProfile(set, stream, l, s, xin, x_stride, rows, true, k.prof, proj_done);
++        const v = dsa_block.attendScratch(l, s, 0);
++        var stamp = prof.span(k.prof, stream, .cache_write);
++        try dsa_block.kvRope(set, stream, l, s.dp, v.lat, pos, rows);
++        // the window's rows in the cache's format into wc / ws (row r at pos + r of bases moved back), then kept
++        try latent.latentWriteFormat(set, stream, v.lat, l.rowW(), x.wc -% host_pos * x.cb, if (x.kv8) x.ws -% host_pos * x.sb else 0, .{}, pos, rows, l.rowW());
++        try x.ownRowsOf(stream, x.wc, x.cb, false, c.lc, pos, rows, x.cb);
++        if (x.kv8) try x.ownRowsOf(stream, x.ws, x.sb, false, c.ls, pos, rows, x.sb);
++        stamp.end();
++        if (l.ifull) {
++            stamp = prof.span(k.prof, stream, .index_update);
++            if (x.index) {
++                try dsa_block.indexWriteDsa(set, stream, l, v.ikr, x.ikw -% host_pos * ik_bytes, pos, rows);
++                try x.ownRowsOf(stream, x.ikw, ik_bytes, false, c.ik, pos, rows, ik_bytes);
++            } else try dsa_block.indexWriteDsa(set, stream, l, v.ikr, c.ik, pos, rows);
++            stamp.end();
++        }
++        try dsa_block.qaRope(set, stream, l, s.q, v.qa, pos, rows);
++        if (l.ifull) {
++            if (x.index) try x.select(stream, l, c.ik, v, pos, host_pos, rows, k.prof) else try sparse.dsaSelect(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, l.inv, c.ik, pos, host_pos, rows, ix.heads, ix.d, v.select, v.tokens, v.counts, null, k.prof);
++            try x.unite(stream, v.tokens, v.counts, host_pos, rows);
++        } else if (x.u_pos == null or x.u_pos.? != host_pos) return error.KvSplitNoUnion; // a shared layer before its window's full one
++        stamp = prof.span(k.prof, stream, .mla);
++        var lc = x.recv;
++        var ls = x.recvs;
++        var tok = x.rtok;
++        if (x.u_full) { // a share past share_cap: the whole history (and the window) as a prompt chunk gathers it
++            try x.gatherRows(stream, c.lc, host_pos + rows, x.cb, x.full);
++            if (x.kv8) try x.gatherRows(stream, c.ls, host_pos + rows, x.sb, x.fulls);
++            lc = x.full;
++            ls = x.fulls;
++            tok = v.tokens;
++            x.counts.full_windows += 1;
++        } else {
++            var pa: cuda.Args = .{};
++            inline for (.{ c.lc, if (x.kv8) c.ls else @as(u64, 0), x.ul, x.uidx, @as(c_int, @intCast(x.world)), @as(c_int, @intCast(x.rank)), @as(i64, @intCast(x.cb)), @as(i64, @intCast(x.sb)), x.send, x.sends }) |a| pa.add(a);
++            try cuda.launch.launch(x.fx.pack, .{ .grid = .{ .x = @intCast(x.u_n) }, .block = .{ .x = 64 } }, stream, &pa);
++            try x.allGather(stream, x.send, x.recv, x.u_c * x.cb);
++            if (x.kv8) try x.allGather(stream, x.sends, x.recvs, x.u_c * x.sb);
++            x.counts.union_rows += x.u_n;
++        }
++        // dsa_block.attend's sparse branch for a decode window, on the gathered rows
++        const w = sparse.dsa_width;
++        const scale = scaleOf(l);
++        const scales = if (x.kv8) ls else @as(u64, 0);
++        if (!try latent.sparseDsaSplit(set, stream, v.qa, lc, scales, .{}, tok, v.counts, w, v.partials, v.ol, rows, l.heads, l.rowW(), scale)) {
++            var ro: usize = 0;
++            while (ro < rows) : (ro += dsa_block.prompt_att_rows) {
++                const n = @min(dsa_block.prompt_att_rows, rows - ro);
++                try latent.sparseAttentionFormat(set, stream, v.qa + ro * l.heads * l.rowW() * 2, lc, scales, .{ .logical = x.kv8 }, tok + ro * w * 4, v.counts + ro * 4, w, v.partials, v.ol + ro * l.heads * l.lw * 2, n, l.heads, l.rowW(), scale);
++            }
++        }
++        stamp.end();
++        x.counts.decode_layers += 1;
++        stamp = prof.span(k.prof, stream, .projections);
++        defer stamp.end();
++        try latent.expandV(set, stream, s.ol, l.wv, s.vn, rows, l.heads, l.dv, l.lw);
++    }
++
++    /// The union of a window's picks (every rank alike: the picks are), its shares' lengths read on the host, and the
++    /// lists remapped to rows of the gathered shares.
++    fn unite(x: *Ctx, stream: cuda.Stream, tokens: u64, counts: u64, host_pos: usize, rows: usize) !void {
++        var a: cuda.Args = .{};
++        inline for (.{ tokens, counts, @as(c_int, @intCast(rows)), @as(c_int, k_picks), @as(i64, @intCast(host_pos + rows)), @as(c_int, @intCast(x.world)), x.bits, x.ul, x.uidx, x.uout }) |v| a.add(v);
++        try cuda.launch.launch(x.fx.unite, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, stream, &a);
++        var host: [1 + 8]i32 = undefined;
++        const drv = x.buf.d;
++        try stream.synchronize();
++        try drv.check(drv.api.cuMemcpyDtoH_v2(&host, x.uout, (1 + x.world) * 4), "cuMemcpyDtoH");
++        var most: usize = 1;
++        for (host[1 .. 1 + x.world]) |n| most = @max(most, @as(usize, @intCast(n)));
++        x.u_n = @intCast(host[0]);
++        x.u_c = most;
++        x.u_full = most > share_cap;
++        x.u_pos = host_pos;
++        if (x.u_full) return;
++        var r: cuda.Args = .{};
++        inline for (.{ tokens, counts, @as(c_int, k_picks), x.ul, x.uidx, @as(c_int, @intCast(x.u_n)), @as(c_int, @intCast(x.world)), @as(c_int, @intCast(x.u_c)), x.rtok }) |v| r.add(v);
++        try cuda.launch.launch(x.fx.remap, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, stream, &r);
++    }
++
++    /// TF_GLM_KV_SPLIT_DECODE=lse: the query-gather path (BF16 rows only): queries all-gathered, every rank attends its
++    /// own keys for every head, the partials merged by log-sum-exp at each head's owner. Not bit-identical to unsplit.
++    pub fn decodeLse(x: *Ctx, k: dsa_block.Kernels, stream: cuda.Stream, l: dsa_block.Layer, c: dsa_block.Caches, s: dsa_block.Scratch, xin: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, proj_done: bool) !void {
+         if (c.ls != 0 or c.pt != 0 or l.rope == 0) return error.KvSplitLayout;
+         const set = k.set;
+         const ix = l.index;
+-- 
+2.43.0
+

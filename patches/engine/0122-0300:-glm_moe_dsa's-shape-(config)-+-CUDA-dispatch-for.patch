@@ -1,0 +1,336 @@
+From 1f1aa2723d97a3234bbe773d87d2cfb5ec09a126 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:35:37 +0200
+Subject: [PATCH 1/3] 0300: glm_moe_dsa's shape (config) + CUDA dispatch for
+ full GLM-5.3
+
+config.zig: max_layers 96; dsa/rope fields; the ifull bitset (indexer_types);
+the dsa parse branch (no text_config, no index_kpool/hc_mult/linear_attn_config),
+dsaWant() template, dsa early widths check (error.NotGlm53Dsa), whole() dsa counts.
+cuda.zig: glm_moe_dsa routes into glm.native before the registry; pull metadata
+gains the family entry (formats exl3). cuda_refusal.zig: the mtp flag refusals
+cover glm_moe_dsa with GLM-5.3's own wording. Tests: dsa parse + TP4 split.
+---
+ zig/src/families/glm/config.zig | 187 +++++++++++++++++++++++++++++---
+ zig/src/native/cuda.zig         |   4 +-
+ zig/src/native/cuda_refusal.zig |   8 +-
+ 3 files changed, 179 insertions(+), 20 deletions(-)
+
+diff --git a/zig/src/families/glm/config.zig b/zig/src/families/glm/config.zig
+index a18221a..4e6e2fb 100644
+--- a/zig/src/families/glm/config.zig
++++ b/zig/src/families/glm/config.zig
+@@ -1,7 +1,9 @@
+ //! GLM-5.3-Flash's shape from config.json's text_config: the engine's kernels are generated for exactly this shape.
++//! GLM-5.3 itself (model_type glm_moe_dsa, no text_config) parses to the second shape: every layer MLA, no KDA,
++//! no mHC, a 64-dim rope plane, per-token indexer keys.
+ const std = @import("std");
+ 
+-pub const max_layers = 46;
++pub const max_layers = 96;
+ 
+ pub const Kind = enum { kda, mla };
+ 
+@@ -45,12 +47,17 @@ pub const Config = struct {
+     hc_eps: f32 = 1e-6,
+     sinkhorn: u32 = 20,
+     mtp: u32 = 1,
++    dsa: bool = false, // glm_moe_dsa (full GLM-5.3): no KDA, no mHC, a rope plane, per-token indexer keys
++    rope: u32 = 0, // rotary dims of q and k: 64 on glm_moe_dsa; Flash's attention has none
+     tp: u32 = 1, // tensor parallel: the Macs splitting the attention heads
+     tp_rank: u32 = 0,
+     eos: [3]u32 = .{ 154820, 154827, 154829 },
+     eos_n: u32 = 3,
+     /// Layer i is MLA (sparse attention) when set; KDA otherwise.
+     mla: std.StaticBitSet(max_layers) = defaultMla(),
++    /// Layer i computes its own indexer top-k when set; it reuses the last full layer's otherwise
++    /// (glm_moe_dsa's indexer_types, "full" every fourth layer and "shared" in between). Flash: every layer full.
++    ifull: std.StaticBitSet(max_layers) = defaultIfull(),
+ 
+     pub fn kind(c: *const Config, i: u32) Kind {
+         return if (c.mla.isSet(i)) .mla else .kda;
+@@ -122,6 +129,48 @@ fn defaultMla() std.StaticBitSet(max_layers) {
+     return s;
+ }
+ 
++fn defaultIfull() std.StaticBitSet(max_layers) {
++    var s = std.StaticBitSet(max_layers).empty;
++    var l: usize = 0;
++    while (l <= 45) : (l += 1) s.set(l); // Flash: every layer computes its own indexer top-k
++    return s;
++}
++
++/// GLM-5.3's own shape (model_type glm_moe_dsa): the widths the CUDA port is generated for,
++/// from the checkpoint's config.json (no text_config; the Metal glm_dsa family parses the same values).
++pub fn dsaWant() Config {
++    var c = Config{};
++    c.dsa = true;
++    c.hidden = 6144;
++    c.layers = 78;
++    c.vocab = 154880;
++    c.eps = 1e-5;
++    c.dense_layers = 3;
++    c.dense_inter = 12288;
++    c.experts = 256;
++    c.topk = 8;
++    c.moe_inter = 2048;
++    c.shared_inter = 2048;
++    c.routed_scale = 2.5;
++    c.mla_heads = 64;
++    c.nope = 192;
++    c.rope = 64;
++    c.v_dim = 256;
++    c.q_lora = 2048;
++    c.kv_lora = 512;
++    c.i_heads = 32;
++    c.i_dim = 128;
++    c.i_topk = 2048;
++    c.kpool = 1;
++    c.hc = 0;
++    c.mtp = 1;
++    c.mla = std.StaticBitSet(max_layers).empty;
++    var all: usize = 0;
++    while (all < max_layers) : (all += 1) c.mla.set(@intCast(all));
++    c.ifull = std.StaticBitSet(max_layers).empty;
++    return c;
++}
++
+ fn int(o: std.json.ObjectMap, key: []const u8) !i64 {
+     const v = o.get(key) orelse return error.BadConfig;
+     return switch (v) {
+@@ -144,6 +193,8 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
+     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+     defer parsed.deinit();
+     const root = parsed.value.object;
++    const mt = if (root.get("model_type")) |m| (if (m == .string) m.string else "") else "";
++    const dsa = std.mem.eql(u8, mt, "glm_moe_dsa");
+     const t = (root.get("text_config") orelse parsed.value).object;
+     var c = Config{};
+     const want = c;
+@@ -170,7 +221,12 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
+     c.shared_inter = c.moe_inter * @as(u32, @intCast(if (t.get("n_shared_experts")) |v| v.integer else 1));
+     if (t.get("norm_topk_prob")) |v| c.norm_topk = v != .bool or v.bool;
+     c.routed_scale = @floatCast(try float(t, "routed_scaling_factor"));
+-    c.swiglu_limit = @floatCast(try float(t, "swiglu_limit"));
++    // Flash's experts clamp their swiglu at swiglu_limit; glm_moe_dsa's config has no such field
++    if (t.get("swiglu_limit")) |v| switch (v) {
++        .float => |f| c.swiglu_limit = @floatCast(f),
++        .integer => |i| c.swiglu_limit = @floatFromInt(i),
++        else => return error.BadConfig,
++    } else if (!dsa) return error.BadConfig;
+     c.mla_heads = @intCast(try int(t, "num_attention_heads"));
+     c.nope = @intCast(try int(t, "qk_nope_head_dim"));
+     c.v_dim = @intCast(try int(t, "v_head_dim"));
+@@ -179,20 +235,40 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
+     c.i_heads = @intCast(try int(t, "index_n_heads"));
+     c.i_dim = @intCast(try int(t, "index_head_dim"));
+     c.i_topk = @intCast(try int(t, "index_topk"));
+-    c.kpool = @intCast(try int(t, "index_kpool"));
+-    c.hc = @intCast(try int(t, "hc_mult"));
+-    c.hc_eps = @floatCast(try float(t, "hc_eps"));
+-    c.sinkhorn = @intCast(try int(t, "hc_sinkhorn_iters"));
++    if (dsa) {
++        c.dsa = true;
++        c.rope = @intCast(try int(t, "qk_rope_head_dim"));
++        c.kpool = 1; // per-token indexer keys: no pooling (the config has no index_kpool)
++        c.hc = 0; // no mHC residuals (the config has no hc_mult)
++        c.mla = std.StaticBitSet(max_layers).empty;
++        var all: usize = 0;
++        while (all < max_layers) : (all += 1) c.mla.set(@intCast(all)); // every layer attends sparsely; none is KDA
++        c.ifull = std.StaticBitSet(max_layers).empty;
++        const types = (t.get("indexer_types") orelse return error.BadConfig).array;
++        if (types.items.len != c.layers) return error.BadConfig;
++        for (types.items, 0..) |v, i| {
++            if (v != .string) return error.BadConfig;
++            if (std.mem.eql(u8, v.string, "full")) c.ifull.set(@intCast(i)) else if (!std.mem.eql(u8, v.string, "shared")) return error.BadConfig;
++        }
++        if (!c.ifull.isSet(0)) return error.BadConfig; // layer 0 owns the top-k the shared layers reuse
++    } else {
++        c.kpool = @intCast(try int(t, "index_kpool"));
++        c.hc = @intCast(try int(t, "hc_mult"));
++        c.hc_eps = @floatCast(try float(t, "hc_eps"));
++        c.sinkhorn = @intCast(try int(t, "hc_sinkhorn_iters"));
++    }
+     c.mtp = @intCast(try int(t, "num_nextn_predict_layers"));
+-    const la = (t.get("linear_attn_config") orelse return error.BadConfig).object;
+-    c.kda_heads = @intCast(try int(la, "num_heads"));
+-    c.kda_dim = @intCast(try int(la, "head_dim"));
+-    c.conv = @intCast(try int(la, "short_conv_kernel_size"));
+-    c.lower_bound = @floatCast(try float(la, "gate_lower_bound"));
+-    c.mla = std.StaticBitSet(max_layers).empty;
+-    for ((la.get("full_attn_layers") orelse return error.BadConfig).array.items) |v| {
+-        if (v != .integer or v.integer < 0 or v.integer >= max_layers) return error.BadConfig;
+-        c.mla.set(@intCast(v.integer));
++    if (!dsa) {
++        const la = (t.get("linear_attn_config") orelse return error.BadConfig).object;
++        c.kda_heads = @intCast(try int(la, "num_heads"));
++        c.kda_dim = @intCast(try int(la, "head_dim"));
++        c.conv = @intCast(try int(la, "short_conv_kernel_size"));
++        c.lower_bound = @floatCast(try float(la, "gate_lower_bound"));
++        c.mla = std.StaticBitSet(max_layers).empty;
++        for ((la.get("full_attn_layers") orelse return error.BadConfig).array.items) |v| {
++            if (v != .integer or v.integer < 0 or v.integer >= max_layers) return error.BadConfig;
++            c.mla.set(@intCast(v.integer));
++        }
+     }
+     if (c.layers + c.mtp > max_layers) return error.BadConfig;
+     if (c.mtp > 0) c.mla.set(c.layers);
+@@ -202,6 +278,20 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
+     };
+     const rope = t.get("qk_rope_head_dim");
+     const plain = (if (t.get("n_group")) |v| v.integer else 1) == 1 and (if (t.get("topk_group")) |v| v.integer else 1) == 1;
++    var eos_in = true;
++    for (c.eos[0..c.eos_n]) |id| eos_in = eos_in and id < c.vocab;
++    if (dsa) {
++        const w = dsaWant();
++        const dwidths = c.hidden == w.hidden and c.dense_inter == w.dense_inter and c.topk == w.topk and
++            c.moe_inter == w.moe_inter and c.shared_inter == w.shared_inter and c.mla_heads == w.mla_heads and
++            c.nope == w.nope and c.v_dim == w.v_dim and c.q_lora == w.q_lora and c.kv_lora == w.kv_lora and
++            c.i_heads == w.i_heads and c.i_dim == w.i_dim and c.i_topk == w.i_topk and c.kpool == w.kpool and
++            c.hc == w.hc and c.rope == w.rope and plain and c.vocab % 128 == 0;
++        const dcounts = c.layers >= 1 and c.layers <= w.layers and c.dense_layers <= c.layers and
++            c.experts == w.experts and c.vocab == w.vocab and c.mtp == w.mtp and eos_in;
++        if (!dwidths or !dcounts) return error.NotGlm53Dsa;
++        return c;
++    }
+     const widths = c.hidden == want.hidden and c.dense_inter == want.dense_inter and c.topk == want.topk and
+         c.moe_inter == want.moe_inter and c.shared_inter == want.shared_inter and c.mla_heads == want.mla_heads and
+         c.nope == want.nope and c.v_dim == want.v_dim and c.q_lora == want.q_lora and c.kv_lora == want.kv_lora and
+@@ -209,8 +299,6 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
+         c.hc == want.hc and c.sinkhorn == want.sinkhorn and c.kda_heads == want.kda_heads and
+         c.kda_dim == want.kda_dim and c.conv == want.conv and plain and
+         (rope == null or (rope.? == .integer and rope.?.integer == 0));
+-    var eos_in = true;
+-    for (c.eos[0..c.eos_n]) |id| eos_in = eos_in and id < c.vocab;
+     const counts = c.layers >= 1 and c.layers <= want.layers and c.dense_layers <= c.layers and
+         c.experts >= c.topk and c.experts <= want.experts and c.vocab <= want.vocab and c.vocab % 128 == 0 and eos_in;
+     if (!widths or !counts) return error.NotGlm53Flash;
+@@ -219,6 +307,10 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
+ 
+ /// GLM-5.3-Flash's own counts, the shapes the Metal kernels are built for (parse also passes smaller synthetic ones).
+ pub fn whole(c: Config) bool {
++    if (c.dsa) {
++        const w = dsaWant();
++        return c.layers == w.layers and c.vocab == w.vocab and c.dense_layers == w.dense_layers and c.experts == w.experts;
++    }
+     const want = Config{};
+     return c.layers == want.layers and c.vocab == want.vocab and c.dense_layers == want.dense_layers and
+         c.experts == want.experts and c.mla.eql(want.mla);
+@@ -310,6 +402,67 @@ test "the real counts parse to the defaults; smaller counts parse, other widths
+     try std.testing.expectError(error.NotGlm53Flash, parse(gpa, few));
+ }
+ 
++/// GLM-5.3's root-level config.json with the counts given (the widths as the checkpoint has them), for the tests.
++pub fn dsaText(gpa: std.mem.Allocator, layers: u32, fulls: []const u32) ![]u8 {
++    var types: std.ArrayList(u8) = .empty;
++    defer types.deinit(gpa);
++    var next_full: usize = 0;
++    var l: u32 = 0;
++    while (l < layers) : (l += 1) {
++        if (next_full < fulls.len and fulls[next_full] == l) {
++            next_full += 1;
++            try types.appendSlice(gpa, if (l > 0) ", \"full\"" else "\"full\"");
++        } else try types.appendSlice(gpa, if (l > 0) ", \"shared\"" else "\"shared\"");
++    }
++    return std.fmt.allocPrint(gpa,
++        \\{{"model_type": "glm_moe_dsa", "hidden_size": 6144, "num_hidden_layers": {d}, "vocab_size": 154880,
++        \\"rms_norm_eps": 1e-05, "first_k_dense_replace": 3, "intermediate_size": 12288, "n_routed_experts": 256,
++        \\"num_experts_per_tok": 8, "moe_intermediate_size": 2048, "n_shared_experts": 1, "norm_topk_prob": true,
++        \\"routed_scaling_factor": 2.5, "num_attention_heads": 64, "qk_nope_head_dim": 192, "qk_rope_head_dim": 64,
++        \\"v_head_dim": 256, "q_lora_rank": 2048, "kv_lora_rank": 512, "index_n_heads": 32, "index_head_dim": 128,
++        \\"index_topk": 2048, "num_nextn_predict_layers": 1, "scoring_func": "sigmoid", "eos_token_id": [154820],
++        \\"rope_parameters": {{"rope_type": "default", "rope_theta": 8000000.0}}, "indexer_types": [{s}]}}
++    , .{ layers, types.items });
++}
++
++test "glm_moe_dsa's shape parses to the dsa template; other widths do not" {
++    const gpa = std.testing.allocator;
++    const real = try dsaText(gpa, 78, &.{ 0, 4, 8 });
++    defer gpa.free(real);
++    const c = try parse(gpa, real);
++    try std.testing.expect(c.dsa and whole(c));
++    try std.testing.expectEqual(@as(u32, 78), c.countKind(.mla)); // every layer MLA, none KDA
++    try std.testing.expectEqual(@as(u32, 0), c.countKind(.kda));
++    try std.testing.expectEqual(@as(u32, 2048), c.keyWidth()); // per-token keys: i_topk with kpool 1
++    try std.testing.expectEqual(@as(u32, 0), c.hc);
++    try std.testing.expectEqual(@as(u32, 64), c.rope);
++    try std.testing.expectEqual(@as(u32, 12288), c.dense_inter);
++    try std.testing.expectEqual(@as(u32, 16), c.attnBlocks()); // 2048 keys in blocks of attn_span
++    try std.testing.expect(c.ifull.isSet(0) and c.ifull.isSet(4) and !c.ifull.isSet(1));
++    try std.testing.expectEqual(Kind.mla, c.kind(78)); // the MTP layer
++    const small = try dsaText(gpa, 4, &.{0});
++    defer gpa.free(small);
++    const s = try parse(gpa, small);
++    try std.testing.expect(s.dsa and !whole(s)); // a subset checkpoint's config: widths exact, layers fewer
++    try std.testing.expectEqual(@as(u32, 4), s.countKind(.mla));
++    const shared0 = try dsaText(gpa, 78, &.{1}); // layer 0 not full: nothing owns the top-k the shared layers reuse
++    defer gpa.free(shared0);
++    try std.testing.expectError(error.BadConfig, parse(gpa, shared0));
++}
++
++test "glm_moe_dsa splits cleanly at TP4: 16 heads, 3072 dense rows, 2048 moe rows a rank" {
++    var c = dsaWant();
++    try splitHeads(&c, 3, 4);
++    try std.testing.expectEqual(@as(u32, 16), c.mla_heads);
++    try std.testing.expectEqual(@as(u32, 3072), c.dense_inter);
++    try std.testing.expectEqual(@as(u32, 3), c.tp_rank);
++    try splitRows(&c, 3, 4);
++    try std.testing.expectEqual(@as(u32, 512), c.inter[1] - c.inter[0]);
++    try split(&c, 3, 4);
++    try std.testing.expectEqual(@as(u32, 64), c.own[1] - c.own[0]);
++    try std.testing.expectEqual(@as(u32, 38720), c.vocabPart()[1] - c.vocabPart()[0]);
++}
++
+ test "a layer subset keeps the MTP layer's place and refuses an empty or oversized count" {
+     var c = Config{};
+     try subset(&c, 8);
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index c8f0735..1214ed0 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -34,12 +34,13 @@ pub const records = true;
+ pub const backends: []const []const u8 = &.{"cuda"};
+ pub const serves: []const []const u8 = &.{ "--mtp-drafts", "--mtp-confidence", "--policy", "--checkpoint-slots", "--spill-gib" };
+ pub const families: []const api.Family = blk: {
+-    var out: [registry.len + 4]api.Family = undefined;
++    var out: [registry.len + 5]api.Family = undefined;
+     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
+     out[registry.len] = lfm2.family;
+     out[registry.len + 1] = .{ .model_type = "fish_omni", .formats = &.{"fp8-block128"} };
+     out[registry.len + 2] = .{ .model_type = "qwen4", .formats = @import("qwen4").family.native_host.formats };
+     out[registry.len + 3] = .{ .model_type = "qwen4_text", .formats = @import("qwen4").family.native_host.formats };
++    out[registry.len + 4] = .{ .model_type = "glm_moe_dsa", .formats = &.{"exl3"} }; // full GLM-5.3: the glm family's second shape
+     const final = out;
+     break :blk &final;
+ };
+@@ -190,6 +191,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
+     }
+     if (std.mem.eql(u8, o.model_type, "fish_omni")) return openDrama(a, gpa, io, o, problem);
+     if (std.mem.eql(u8, o.model_type, "qwen4") or std.mem.eql(u8, o.model_type, "qwen4_text")) return @import("qwen4_cuda.zig").open(a, gpa, io, o, problem);
++    if (std.mem.eql(u8, o.model_type, "glm_moe_dsa")) return openWith(glm.native, a, gpa, io, o, problem); // full GLM-5.3: the glm family's second shape
+     inline for (registry) |F| if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
+     if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
+         if (refusals.lfm2(o)) |why| {
+diff --git a/zig/src/native/cuda_refusal.zig b/zig/src/native/cuda_refusal.zig
+index a698ff6..1c87e56 100644
+--- a/zig/src/native/cuda_refusal.zig
++++ b/zig/src/native/cuda_refusal.zig
+@@ -11,8 +11,12 @@ pub fn backend(o: api.Open) ?[]const u8 {
+         return deepseek_release_message;
+     if (o.mtp_drafts) |n| if (n > nemotron.native.max_drafts) return std.fmt.comptimePrint("--mtp-drafts: the CUDA engine drafts at most {d}", .{nemotron.native.max_drafts});
+     if (o.mtp_confidence) |c| if (!(c >= 0 and c <= 1)) return "--mtp-confidence must be from 0 to 1";
+-    if (std.mem.eql(u8, o.model_type, glm_model_type)) {
+-        if (o.mtp_drafts != null) return "--mtp-drafts: GLM-5.3-Flash's MTP head drafts at the lanes' depth; serve it without --mtp-drafts (--mtp-confidence stops its chains)";
++    const glm_dsa = std.mem.eql(u8, o.model_type, "glm_moe_dsa"); // full GLM-5.3: the glm family's second shape
++    if (std.mem.eql(u8, o.model_type, glm_model_type) or glm_dsa) {
++        if (o.mtp_drafts != null) return if (glm_dsa)
++            "--mtp-drafts: GLM-5.3's MTP head drafts at the lanes' depth; serve it without --mtp-drafts (--mtp-confidence stops its chains)"
++        else
++            "--mtp-drafts: GLM-5.3-Flash's MTP head drafts at the lanes' depth; serve it without --mtp-drafts (--mtp-confidence stops its chains)";
+         if (o.mtp_confidence != null and o.drafter != null) return "--mtp-confidence stops the MTP head's chains, and with --drafter DFlash2 drafts instead: serve without one of them";
+     } else if (o.mtp_drafts != null or o.mtp_confidence != null) {
+         if (!std.mem.eql(u8, o.model_type, nemotron.native.model_type) and
+-- 
+2.43.0
+
+

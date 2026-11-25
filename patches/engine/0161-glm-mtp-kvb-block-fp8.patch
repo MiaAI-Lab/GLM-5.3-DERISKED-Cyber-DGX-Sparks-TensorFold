@@ -1,0 +1,36 @@
+From dd42de536221ca66db1f0cfa218ed7895162083b Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:40:27 +0200
+Subject: [PATCH] glm: the MTP layer's FP8 kv_b with weight_scale_inv blocks is
+ block FP8, not MXFP8
+
+The MTP loader took any FP8 kv_b on layer 78 for MXFP8 (FP4-Local's), so
+EXL3-K4-v1, whose layer 78 keeps its FP8 source's block-scaled kv_b
+([28672, 512] + weight_scale_inv [224, 4]), failed with drafts on. Block
+scales present now mean block FP8 (dequantized to bf16 as on layers 0-77).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_weights.zig | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 926c95a..d1a205d 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -261,7 +261,10 @@ const Loader = struct {
+         const wants: []const formats.Format = if (mtp) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb };
+         var kb: [96]u8 = undefined;
+         const kv_name = try std.fmt.bufPrint(&kb, "{s}layers.{d}.self_attn.kv_b_proj", .{ L.pfx, i });
+-        const kv_mx = mtp and (try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i})).dtype == .f8_e4m3;
++        // an FP8 kv_b with 128x128 weight_scale_inv blocks is block FP8 even on the MTP layer (EXL3-K4-v1 keeps its
++        // FP8 source's layer 78): only an FP8 kv_b without them is MXFP8 (FP4-Local's MTP layer)
++        const kv_blocked = if (L.get("layers.{d}.self_attn.kv_b_proj.weight_scale_inv", .{i})) |_| true else |_| false;
++        const kv_mx = mtp and !kv_blocked and (try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i})).dtype == .f8_e4m3;
+         // a block FP8 kv_b (EXL3-K4-v1 keeps its FP8 source's): dequantized on the host to the bf16 its absorb reads
+         const kv_f8 = !kv_mx and (try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i})).dtype == .f8_e4m3;
+         try L.format("layers.{d}.self_attn.kv_b_proj", .{i}, if (kv_mx) .mxfp8 else if (kv_f8) .fp8_pb else .bf16);
+-- 
+2.43.0
+

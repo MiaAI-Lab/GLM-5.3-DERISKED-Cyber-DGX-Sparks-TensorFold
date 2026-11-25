@@ -1,0 +1,200 @@
+From e30b8226c3bbb2af109f75fd019e738d0fb25697 Mon Sep 17 00:00:00 2001
+From: port <port@local>
+Date: Tue, 24 Nov 2026 19:23:47 +0200
+Subject: [PATCH 241/242] glm tp6 wave3: split DFlash2 qkv and o_proj across
+ ranks (TF_GLM_NEON_DF_ATTN, bit-exact)
+
+---
+ zig/src/families/glm/dflash.zig       |  3 ++
+ zig/src/families/glm/dflash_block.zig | 20 ++++++++-
+ zig/src/families/glm/dflash_load.zig  | 63 ++++++++++++++++++++++++---
+ 3 files changed, 78 insertions(+), 8 deletions(-)
+
+diff --git a/zig/src/families/glm/dflash.zig b/zig/src/families/glm/dflash.zig
+index 0d36023b9..a3de61e14 100644
+--- a/zig/src/families/glm/dflash.zig
++++ b/zig/src/families/glm/dflash.zig
+@@ -170,6 +170,8 @@ pub const Drafter = struct {
+     shape: Shape = flash,
+     fc: Lin = undefined,
+     fc_cols: usize = 0, // TF_GLM_NEON_DF_FC=1 (neon N3 #3): this rank's fc output columns (D / world), gathered; 0: whole
++    o_cols: usize = 0, // TF_GLM_NEON_DF_ATTN: this rank's o_proj output rows (D / world), gathered; 0: whole
++    qkv_cw: usize = 0, // TF_GLM_NEON_DF_ATTN: padded per-rank qkv output rows (64-aligned), gathered; 0: whole
+     hproj: mm.Tiled = undefined,
+     hnorm: u64 = 0,
+     norm: u64 = 0,
+@@ -194,6 +196,7 @@ pub const Drafter = struct {
+     y2: u64 = 0,
+     dyn: u64 = 0,
+     qkv: u64 = 0,
++    qkv_g: u64 = 0, // gathered qkv shards [world][MAX_M][qkv_cw] when qkv_cw != 0
+     q: u64 = 0,
+     kb: u64 = 0,
+     vb: u64 = 0,
+diff --git a/zig/src/families/glm/dflash_block.zig b/zig/src/families/glm/dflash_block.zig
+index 1fa1b07c6..dbcce968e 100644
+--- a/zig/src/families/glm/dflash_block.zig
++++ b/zig/src/families/glm/dflash_block.zig
+@@ -147,7 +147,15 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+         try glue.rmsnorm(set(e), e.stream, dr.x, D, l.in_norm, dr.y, D, null, df.EPS, M, D);
+         try lin(dr, e, dr.y, l.a_proj, dr.dyn, M, false);
+         try conv(dr, e, dr.y, 0, l.a_base, dr.y2, false, M);
+-        try lin(dr, e, dr.y2, l.qkv, dr.qkv, M, false);
++        if (dr.qkv_cw != 0) {
++            const cw = dr.qkv_cw;
++            const bytes = M * cw * 2;
++            try lin(dr, e, dr.y2, l.qkv, dr.qkv_g + e.share.rank * bytes, M, false);
++            try gather(e, dr.qkv_g, bytes);
++            var u: cuda.Args = .{};
++            inline for (.{ dr.qkv_g, dr.qkv, @as(c_int, @intCast(M)), @as(c_int, @intCast(cw)), @as(c_int, @intCast(dr.shape.qkv())), @as(i64, @intCast(dr.shape.qkv())) }) |v| u.add(v);
++            try go(e.m.glue.unblock, .{ .x = @intCast(M) }, 256, e, &u);
++        } else try lin(dr, e, dr.y2, l.qkv, dr.qkv, M, false);
+         {
+             var a: cuda.Args = .{};
+             a.add(dr.qkv);
+@@ -180,7 +188,15 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+             for ([_]u64{ dr.pm, dr.pl, dr.pacc, dr.att }) |p| b.add(p);
+             try go(dr.k.attn_merge, .{ .x = @intCast(M), .y = @intCast(dr.shape.qh) }, df.HD, e, &b);
+         }
+-        try lin(dr, e, dr.att, l.o, dr.a, M, false);
++        if (dr.o_cols != 0) {
++            const cw = dr.o_cols;
++            const bytes = M * cw * 2;
++            try lin(dr, e, dr.att, l.o, dr.y + e.share.rank * bytes, M, false);
++            try gather(e, dr.y, bytes);
++            var u: cuda.Args = .{};
++            inline for (.{ dr.y, dr.a, @as(c_int, @intCast(M)), @as(c_int, @intCast(cw)), @as(c_int, @intCast(D)), @as(i64, @intCast(D)) }) |v| u.add(v);
++            try go(e.m.glue.unblock, .{ .x = @intCast(M) }, 256, e, &u);
++        } else try lin(dr, e, dr.att, l.o, dr.a, M, false);
+         try conv(dr, e, dr.a, 1, l.a_base + 2 * D * 2, dr.x, true, M);
+         // the MLP, wrapped in the MLP conv
+         try glue.rmsnorm(set(e), e.stream, dr.x, D, l.post_norm, dr.y, D, null, df.EPS, M, D);
+diff --git a/zig/src/families/glm/dflash_load.zig b/zig/src/families/glm/dflash_load.zig
+index 742566916..06a83d266 100644
+--- a/zig/src/families/glm/dflash_load.zig
++++ b/zig/src/families/glm/dflash_load.zig
+@@ -65,6 +65,22 @@ pub const Loader = struct {
+         if (l.bits == 0) return .{ .bf16 = try l.linearB(names, rows, kk, part) };
+         const n = try l.stack(names, rows, kk, part);
+         const k = if (part) |p| p[3] else kk;
++        return l.packTmp(n, k);
++    }
++
++    /// Rows [r_lo .. r_lo + r_n) across the concatenated `names` (total rows = sum(rows)), all `kk` columns.
++    pub fn linearRange(l: *Loader, names: []const []const u8, rows: []const usize, kk: usize, r_lo: usize, r_n: usize) !df.Lin {
++        const n = try l.stackRange(names, rows, kk, r_lo, r_n);
++        if (l.bits == 0) {
++            const dst = try l.take(n * kk * 2);
++            try mm.tile(l.mk, l.stream, l.tmp.ptr, dst, n, kk);
++            try l.stream.synchronize();
++            return .{ .bf16 = .{ .w = dst, .n = n, .k = kk } };
++        }
++        return l.packTmp(n, kk);
++    }
++
++    fn packTmp(l: *Loader, n: usize, k: usize) !df.Lin {
+         if (l.q32) {
+             const sz = q4.bytes(n, k);
+             const words = l.qraw.ptr;
+@@ -87,6 +103,25 @@ pub const Loader = struct {
+         return .{ .q4 = q };
+     }
+ 
++    fn stackRange(l: *Loader, names: []const []const u8, rows: []const usize, kk: usize, r_lo: usize, r_n: usize) !usize {
++        var base: usize = 0;
++        var out_r: usize = 0;
++        const r_hi = r_lo + r_n;
++        for (names, rows) |name, r| {
++            const lo = @max(r_lo, base);
++            const hi = @min(r_hi, base + r);
++            if (hi > lo) {
++                const src: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, try l.read(name, r * kk * 2)));
++                const slice = src[(lo - base) * kk .. (hi - base) * kk];
++                try l.tmp.upload(out_r * kk * 2, std.mem.sliceAsBytes(slice));
++                out_r += hi - lo;
++            }
++            base += r;
++        }
++        if (out_r != r_n) return error.DrafterTensorShape;
++        return out_r;
++    }
++
+     /// Rows row0.. (rn of each tensor's `rows`) and columns col0.. (cn of `kk`) of `names`, stacked and tiled bf16.
+     pub fn linearB(l: *Loader, names: []const []const u8, rows: []const usize, kk: usize, part: ?[4]usize) !mm.Tiled {
+         const n = try l.stack(names, rows, kk, part);
+@@ -126,6 +161,12 @@ fn envOn(name: [*:0]const u8) bool {
+     return std.mem.eql(u8, std.mem.span(v), "1");
+ }
+ 
++fn attnSplitOn(world: usize) bool {
++    if (world < 3) return false;
++    if (std.c.getenv("TF_GLM_NEON_DF_ATTN")) |v| return !std.mem.eql(u8, std.mem.span(v), "0");
++    return true;
++}
++
+ fn q32env() bool {
+     const v = std.c.getenv("TF_GLM_DFLASH2_Q32") orelse return false;
+     return !std.mem.eql(u8, std.mem.span(v), "0");
+@@ -179,9 +220,19 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     const down4 = bits == 4 and !q32env() and envOn("TF_GLM_NEON_DF_DOWN");
+     const fc_cols: usize = if (world >= 2 and D % world == 0 and (D / world) % 64 == 0 and envOn("TF_GLM_NEON_DF_FC")) D / world else 0;
+     const fc_rows: usize = if (fc_cols != 0) fc_cols else D;
++    // TP>=3 attention projection split (TF_GLM_NEON_DF_ATTN, default on at world >= 3; =0 disables):
++    // o_proj and qkv output rows split across ranks (128-aligned for q4.npadOf) and gathered over the RoCE mesh + unblocked (bit-exact).
++    const attn_split = attnSplitOn(world);
++    const o_cols: usize = if (attn_split and D % world == 0 and (D / world) % 128 == 0) D / world else 0;
++    const o_rows: usize = if (o_cols != 0) o_cols else D;
++    const qkv_total = shape.qkv();
++    const qkv_cw_raw = std.mem.alignForward(usize, (qkv_total + world - 1) / world, 128);
++    const qkv_cw: usize = if (attn_split and qkv_cw_raw * (world - 1) < qkv_total and (qkv_total - qkv_cw_raw * (world - 1)) % 128 == 0) qkv_cw_raw else 0;
++    const qkv_lo: usize = if (qkv_cw != 0) rank * qkv_cw else 0;
++    const qkv_rn: usize = if (qkv_cw != 0) @min(qkv_cw, qkv_total - qkv_lo) else qkv_total;
+     const small: u64 = 6 * D * 2 + 2 * 128 * 2 + 2 * 2 * 2 * D * 2 + 16 * 256;
+     const per: u64 = if (bits == 4) 1 else 4; // quarter-bytes a weight: 4 bits (plus scales and biases below) or bf16
+-    const lin_elems: u64 = shape.qkv() * D + 2 * KVW * D + D * QW + 2 * ff * D + 2 * DYN * D + (NT * D * fc_rows + shape.layers - 1) / shape.layers + (if (down4) D * ff else 0);
++    const lin_elems: u64 = q4.npadOf(qkv_rn) * D + 2 * KVW * D + q4.npadOf(o_rows) * QW + 2 * ff * D + 2 * DYN * D + (NT * D * q4.npadOf(fc_rows) + shape.layers - 1) / shape.layers + (if (down4) D * ff else 0);
+     const q32 = q32env();
+     const gextra: u64 = if (q32) lin_elems / 16 else 0; // the 32 groups' second half of scales and biases
+     const total: u64 = shape.layers * (lin_elems * per / 2 + lin_elems / 16 + gextra + (if (down4) 0 else D * ff * 2) + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
+@@ -200,7 +251,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     }
+     const dr = try gpa.create(Drafter);
+     errdefer gpa.destroy(dr);
+-    dr.* = .{ .gpa = gpa, .d = d, .module = module, .k = try df.Kernels.loadAt(module, D != df.D), .weights = wbuf, .split = split, .ff = ff, .rank = rank, .world = world, .shape = shape, .tap_row = shape.tapRow(), .ring_size = shape.ringBytes() };
++    dr.* = .{ .gpa = gpa, .d = d, .module = module, .k = try df.Kernels.loadAt(module, D != df.D), .weights = wbuf, .o_cols = o_cols, .qkv_cw = qkv_cw, .split = split, .ff = ff, .rank = rank, .world = world, .shape = shape, .tap_row = shape.tapRow(), .ring_size = shape.ringBytes() };
+     defer @import("cuda_load_owner.zig").drain(e.stream, d);
+     var nb: [4][96]u8 = undefined;
+     for (dr.layers[0..shape.layers], 0..) |*lw, i| {
+@@ -213,9 +264,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+         const q = try layerName(&nb[1], i, "self_attn.q_proj.weight");
+         const kq = try layerName(&nb[2], i, "self_attn.k_proj.weight");
+         const v = try layerName(&nb[3], i, "self_attn.v_proj.weight");
+-        lw.qkv = try l.linear(&.{ q, kq, v }, &.{ QW, KVW, KVW }, D, null);
++        lw.qkv = if (qkv_cw != 0) try l.linearRange(&.{ q, kq, v }, &.{ QW, KVW, KVW }, D, qkv_lo, qkv_rn) else try l.linear(&.{ q, kq, v }, &.{ QW, KVW, KVW }, D, null);
+         lw.kv = try l.linear(&.{ kq, v }, &.{ KVW, KVW }, D, null);
+-        lw.o = try l.linear(&.{try layerName(&nb[1], i, "self_attn.o_proj.weight")}, &.{D}, QW, null);
++        lw.o = try l.linear(&.{try layerName(&nb[1], i, "self_attn.o_proj.weight")}, &.{D}, QW, if (o_cols != 0) .{ rank * o_cols, o_cols, 0, QW } else null);
+         const gate = try layerName(&nb[1], i, "mlp.gate_proj.weight");
+         const up = try layerName(&nb[2], i, "mlp.up_proj.weight");
+         const down = try layerName(&nb[3], i, "mlp.down_proj.weight");
+@@ -240,7 +291,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     try @import("dflash_load_owner.zig").acquire(gpa, dr, &tail, Tail, .{ .book = df.VOCAB * df.RANK, .ctx = df.MAX_CTX, .cand = candidates.host, .hidden = df.MAX_M * df.RANK });
+     if (std.c.getenv("TF_GLM_DFLASH2_LOG")) |v| dr.log = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
+     if (std.c.getenv("TF_GLM_DFLASH2_PROF") != null) dr.prof = io;
+-    if (down4 or fc_cols != 0) std.log.info("dflash2: neon N3: down at {s}, fc {s} ({d} columns a rank)", .{ if (down4) "4 bits (TF_GLM_NEON_DF_DOWN=1)" else "bf16", if (fc_cols != 0) "split over the ranks (TF_GLM_NEON_DF_FC=1)" else "whole", if (fc_cols != 0) fc_cols else D });
++    if (down4 or fc_cols != 0 or o_cols != 0 or qkv_cw != 0) std.log.info("dflash2: neon N3: down at {s}, fc {s} ({d}), o {d}, qkv {d}/{d}", .{ if (down4) "4 bits (TF_GLM_NEON_DF_DOWN=1)" else "bf16", if (fc_cols != 0) "split" else "whole", if (fc_cols != 0) fc_cols else D, o_rows, qkv_rn, qkv_cw });
+     std.log.info("dflash2: drafter from {s} ({s}), linears at {d} bits, {d:.2} GiB on the device", .{ dir, if (shape.dsa) "incoai/GLM-5.3-DFlash2 at full GLM-5.3's shape: D 6144, 6 layers, taps after 5/19/33/47/61/75" else "CC BY-NC-ND 4.0: non-commercial use only", if (bits == 0) 16 else bits, @as(f64, @floatFromInt(l.at)) / (1 << 30) });
+     return dr;
+ }
+@@ -283,7 +334,7 @@ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
+     const gwidth: u64 = if (dr.fc == .q4g32) 32 else 64; // the group sums' width (TF_GLM_DFLASH2_Q32)
+     const fields = .{
+         .{ "x", M * D * 2 },                                                                     .{ "y", M * D * 2 },                        .{ "y2", M * D * 2 },                .{ "dyn", M * sh.dynw() * 2 },
+-        .{ "qkv", M * sh.qkv() * 2 },                                                            .{ "q", M * sh.qw() * 2 },                  .{ "kb", M * KVW_ * 2 },             .{ "vb", M * KVW_ * 2 },
++        .{ "qkv", M * sh.qkv() * 2 },                                                            .{ "qkv_g", if (dr.qkv_cw != 0) dr.world * M * dr.qkv_cw * 2 else 16 }, .{ "q", M * sh.qw() * 2 },                  .{ "kb", M * KVW_ * 2 },             .{ "vb", M * KVW_ * 2 },
+         .{ "att", M * sh.qw() * 2 },                                                             .{ "a", M * D * 2 },                        .{ "gu", M * 2 * FF * 2 },           .{ "act", M * FF * 2 },
+         .{ "hn", M * D * 2 },                                                                    .{ "xs", M * (D / gwidth) * 4 },            .{ "g", M * df.RANK * 4 },           .{ "logits", M * head_n * 2 },
+         .{ "part", part },                                                                       .{ "gs", C * sh.taps.len * (D / gwidth) * 4 }, .{ "sums", dr.world * M * D * 4 }, .{ "cin", C * TAP_ROW },
+-- 
+2.43.0
+

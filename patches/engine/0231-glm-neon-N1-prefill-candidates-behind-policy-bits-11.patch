@@ -1,0 +1,790 @@
+From c8ae949d88f9d8f3088f4c720494872693a4cfce Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:40:34 +0200
+Subject: [PATCH] glm: neon N1 prefill candidates behind policy bits 11-14 and
+ bit 4 for bf16 projections
+
+bit 11: tf_glm_dsa_scores_w8 (8 warps, a prompt row a warp in registers; tf_glm_dsa_scores_r8's bits)
+bit 12: glm_mm8_p128x64 / p64x128 prompt tilings of glm_mm8_128s2's sums, picked by shape and rows
+bit 13: tf_glm_msa_w576_i8_f3 / dense_i8_f3 (bf16-pair int8 dequant, three CTAs an SM; the same bits)
+bit 14: tf_glm_router_fused (router slices summed in registers, slice_sum's order) from 512 rows
+bit 4: ownerProjects allows tiled bf16 / packed projections (one K slice in prompts)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj5qARY3iLJfisqfnh
+---
+ zig/kernels/cuda/glm_dsa_scores_rows.cuh | 123 +++++++++++++++++
+ zig/kernels/cuda/glm_glue_bmm.cuh        | 109 +++++++++++++++
+ zig/kernels/cuda/glm_glue_msa.cuh        |  69 ++++++++++
+ zig/kernels/cuda/glm_mm.cu               | 165 +++++++++++++++++++++++
+ zig/src/families/glm/cuda_dsa_block.zig  |  14 +-
+ zig/src/families/glm/cuda_glue.zig       |  16 +++
+ zig/src/families/glm/cuda_mm.zig         |  24 ++++
+ zig/src/families/glm/cuda_native.zig     |   4 +
+ zig/src/families/glm/cuda_sparse.zig     |   6 +-
+ zig/src/families/glm/policy.zig          |  23 +++-
+ 10 files changed, 545 insertions(+), 8 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_dsa_scores_rows.cuh b/zig/kernels/cuda/glm_dsa_scores_rows.cuh
+index 3391e0177..1f343e8fe 100644
+--- a/zig/kernels/cuda/glm_dsa_scores_rows.cuh
++++ b/zig/kernels/cuda/glm_dsa_scores_rows.cuh
+@@ -115,3 +115,126 @@ extern "C" __global__ void __launch_bounds__(128)
+                          int64_t heads, int loop) {
+   glm_dsa_rows::scores_rows<8>(qr, wts, w_stride, ik, out, pos, rows, np, nb, scale, wscale, heads, loop);
+ }
++
++// tf_glm_dsa_scores_w8 (neon rank #1, GLM policy bit 11): the same scores as tf_glm_dsa_scores_r8 / _roped with the
++// layout turned round: 8 warps a CTA, one prompt row a warp, that row's 32 x 128 roped query fragments held in
++// registers for the whole key walk (staged through shared memory once), and all 8 warps sharing each double-buffered
++// 64-key block (2 x 64 x 128 x 2 = 32 KiB of dynamic shared memory: three CTAs an SM, no spill). The MMA chain, scale,
++// ReLU, head-weight FMAs and the reduction are tf_glm_dsa_scores_r8's per (row, key), so every score is the same bits;
++// blocks no row sees score -inf as there. 32-bit loop coordinates (keys, rows and blocks fit easily); the stores index
++// in 64 bits.
++namespace glm_dsa_rows {
++__device__ __forceinline__ void scores_w8(const __nv_bfloat16* __restrict__ qr, const __nv_bfloat16* __restrict__ wts,
++                                          int w_stride, const __nv_bfloat16* __restrict__ ik, float* __restrict__ out,
++                                          const int* __restrict__ pos, int rows, int np, int nb, float scale, float wscale,
++                                          int heads, int loop) {
++  constexpr int RB = 8, D = 128, HP = 32, BP = 64, THREADS = RB * 32, QSLOTS = (2 * BP) / HP;
++  extern __shared__ __align__(16) unsigned char dsw_smem[];
++  __nv_bfloat16* sm = reinterpret_cast<__nv_bfloat16*>(dsw_smem);
++  auto at = [](int row, int u) { return row * D + ((u ^ (row & 7)) << 3); };
++  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
++  const int r0 = (int)blockIdx.x * RB;
++  const int nr = min(rows - r0, RB);
++  const int my_r = r0 + warp;
++  const bool row_ok = warp < nr;
++  const int p0_pos = pos[0];
++  const int n = p0_pos + (row_ok ? my_r : r0) + 1;
++  const int nmax = p0_pos + r0 + nr;  // the last row's visible keys
++  uint32_t aq[D / 16][2][4];
++  for (int wb = 0; wb < RB; wb += QSLOTS) {  // QSLOTS rows' queries at a time through the key buffers
++    const int wend = min(RB, wb + QSLOTS), nq = wend - wb;
++    for (int idx = tid; idx < nq * HP * (D / 8); idx += THREADS) {
++      const int rw = idx / (HP * (D / 8)), hh = (idx / (D / 8)) % HP, u = idx % (D / 8);
++      const int rr = wb + rw;
++      const bool ok = rr < nr && hh < heads;
++      glm_attn::cp16(sm + rw * HP * D + at(hh, u), qr + ((int64_t)(r0 + (ok ? rr : 0)) * heads + (ok ? hh : 0)) * D + u * 8, ok);
++    }
++    glm_attn::commit();
++    glm_attn::wait<0>();
++    __syncthreads();
++    if (warp >= wb && warp < wend) {
++      const __nv_bfloat16* my_q = sm + (warp - wb) * HP * D;
++#pragma unroll
++      for (int kq = 0; kq < D / 16; ++kq)
++#pragma unroll
++        for (int i = 0; i < 2; ++i) glm_attn::ldm4<false>(aq[kq][i], my_q + at(i * 16 + (lane & 15), kq * 2 + (lane >> 4)));
++    }
++    __syncthreads();
++  }
++  float wv[4];
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++    const int hh = g + 8 * i;
++    wv[i] = (row_ok && hh < heads) ? glm_triton::fmul(__bfloat162float(wts[(int64_t)my_r * w_stride + hh]), wscale) : 0.0f;
++  }
++  auto stage = [&](int buf, int k0) {
++    __nv_bfloat16* dst = sm + buf * BP * D;
++    constexpr int PER = BP * (D / 8) / THREADS;
++    const __nv_bfloat16* src = ik + (int64_t)(k0 < nmax ? k0 : 0) * D;
++#pragma unroll
++    for (int t = 0; t < PER; ++t) {
++      const int idx = tid + t * THREADS, row = idx / (D / 8), u = idx % (D / 8);
++      const bool ok = (k0 + row) < nmax;
++      glm_attn::cp16(dst + at(row, u), src + (int64_t)(ok ? row : 0) * D + u * 8, ok);
++    }
++  };
++  const int first = (int)blockIdx.y * loop;
++  const int total = min(loop, nb - first);
++  auto live = [&](int t) { return t < total && (first + t) * BP < nmax; };
++  float* my_out = out + (int64_t)my_r * np;
++  if (live(0)) stage(0, first * BP);
++  glm_attn::commit();
++  for (int t = 0; t < total; ++t) {
++    const int k0 = (first + t) * BP;
++    if (!live(t)) {  // no row sees this block: -inf, as the one-row kernel writes it
++      if (row_ok)
++        for (int e = lane; e < BP; e += 32)
++          if (k0 + e < np) my_out[k0 + e] = -INFINITY;
++      continue;
++    }
++    if (live(t + 1)) stage((t + 1) & 1, k0 + BP);
++    glm_attn::commit();
++    glm_attn::wait<1>();
++    __syncthreads();
++    if (row_ok) {
++      const __nv_bfloat16* keys = sm + (t & 1) * BP * D;
++      for (int kg = 0; kg < BP / 16; ++kg) {
++        const int p0 = k0 + kg * 16;
++        const __nv_bfloat16* kp = keys + kg * 16 * D;
++        float acc[2][2][4] = {};
++#pragma unroll
++        for (int kq = 0; kq < D / 16; ++kq) {
++          uint32_t b[4];
++          glm_attn::ldm4<false>(b, kp + at((lane >> 4) * 8 + (lane & 7), kq * 2 + ((lane >> 3) & 1)));
++#pragma unroll
++          for (int nt = 0; nt < 2; ++nt)
++#pragma unroll
++            for (int i = 0; i < 2; ++i) glm_router::mma16816(acc[i][nt], aq[kq][i], b + 2 * nt);
++        }
++#pragma unroll
++        for (int nt = 0; nt < 2; ++nt)
++#pragma unroll
++          for (int e = 0; e < 2; ++e) {
++            const float v0 = fmaxf(__fmul_rn(acc[0][nt][e], scale), 0.0f), v1 = fmaxf(__fmul_rn(acc[0][nt][e + 2], scale), 0.0f);
++            const float v2 = fmaxf(__fmul_rn(acc[1][nt][e], scale), 0.0f), v3 = fmaxf(__fmul_rn(acc[1][nt][e + 2], scale), 0.0f);
++            float s = glm_triton::fmul(wv[1], v1);
++            s = __fmaf_rn(wv[0], v0, s);
++            s = __fmaf_rn(wv[2], v2, s);
++            s = __fmaf_rn(wv[3], v3, s);
++            for (int o = 16; o >= 4; o >>= 1) s = s + __shfl_xor_sync(0xffffffffu, s, o);
++            const int p = p0 + nt * 8 + q * 2 + e;
++            if (g == 0 && p < np) my_out[p] = p < n ? s : -INFINITY;
++          }
++      }
++    }
++    __syncthreads();
++  }
++}
++}  // namespace glm_dsa_rows
++
++extern "C" __global__ void __launch_bounds__(256, 2)
++    tf_glm_dsa_scores_w8(const __nv_bfloat16* qr, const __nv_bfloat16* wts, int w_stride, const __nv_bfloat16* ik,
++                         float* out, const int* pos, int rows, int np, int nb, float scale, float wscale, int heads,
++                         int loop) {
++  glm_dsa_rows::scores_w8(qr, wts, w_stride, ik, out, pos, rows, np, nb, scale, wscale, heads, loop);
++}
+diff --git a/zig/kernels/cuda/glm_glue_bmm.cuh b/zig/kernels/cuda/glm_glue_bmm.cuh
+index 3b09d6e50..875f8ce19 100644
+--- a/zig/kernels/cuda/glm_glue_bmm.cuh
++++ b/zig/kernels/cuda/glm_glue_bmm.cuh
+@@ -375,6 +375,115 @@ extern "C" __global__ void __launch_bounds__(128)
+       }
+ }
+ 
++// neon rank #13 (GLM policy bit 14): tf_glm_router_tile then tf_glm_slice_sum in one launch for prompt rows. A block of
++// 8 warps holds 128 rows x 64 experts; for each K slice s in order it runs that slice's MMA chain from zero over the
++// same 16-wide steps (32 inputs a stage, three stages) and adds it to the running total (s = 0 takes it as is):
++// router_tile's per-slice dots and slice_sum's adds in slice order, bit for bit, with no slice partials in memory.
++// Dynamic shared memory: 3 x (128 + 64) x 40 bf16 = 46,080 bytes.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_router_fused(const __nv_bfloat16* x, const __nv_bfloat16* w, float* out, int64_t rows, int64_t x_stride,
++                        int64_t d, int64_t ne, int ks) {
++  glm_triton::pdl_trigger();
++  constexpr int KS = 32, STAGES = 3, BM = 128, BE = 64, LD = KS + 8, A = BM * LD, B = BE * LD, STAGE = (A + B) * 2;
++  constexpr int WN = 2, MT = 2, NT = 4, THREADS = 256, CH = KS / 8, RPI = THREADS / CH;
++  extern __shared__ __align__(16) __nv_bfloat16 rf_sm[];
++  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
++  const int wm = warp / WN, wn = warp % WN;
++  const int64_t m0 = (int64_t)blockIdx.x * BM, e0 = (int64_t)blockIdx.y * BE, span = d / ks;
++  const int steps_per_s = static_cast<int>(span / KS), total_steps = steps_per_s * ks;
++  const int lr = tid / CH, lc = (tid % CH) * 8;
++  const __nv_bfloat16* ga[BM / RPI];
++  const __nv_bfloat16* gb[BE / RPI];
++  unsigned oka = 0, okb = 0;
++#pragma unroll
++  for (int i = 0; i < BM / RPI; ++i) {
++    const int64_t row = m0 + lr + i * RPI;
++    oka |= (row < rows ? 1u : 0u) << i;
++    ga[i] = x + (row < rows ? row : 0) * x_stride + lc;
++  }
++#pragma unroll
++  for (int i = 0; i < BE / RPI; ++i) {
++    const int64_t e = e0 + lr + i * RPI;
++    okb |= (e < ne ? 1u : 0u) << i;
++    gb[i] = w + (e < ne ? e : 0) * d + lc;
++  }
++  const unsigned sbase = static_cast<unsigned>(__cvta_generic_to_shared(rf_sm)), soff = (lr * LD + lc) * 2;
++  auto load = [&](int st, int step) {
++    const unsigned a = sbase + st * STAGE + soff;
++    const int64_t koff = (int64_t)step * KS;
++#pragma unroll
++    for (int i = 0; i < BM / RPI; ++i) glm_bmm::cp16s(a + i * RPI * LD * 2, ga[i] + koff, (oka >> i) & 1);
++#pragma unroll
++    for (int i = 0; i < BE / RPI; ++i) glm_bmm::cp16s(a + A * 2 + i * RPI * LD * 2, gb[i] + koff, (okb >> i) & 1);
++  };
++  const unsigned fa = sbase + ((wm * 32 + (lane & 15)) * LD + (lane >> 4) * 8) * 2;
++  const unsigned fb = sbase + A * 2 + ((wn * 32 + (lane >> 4) * 8 + (lane & 7)) * LD + ((lane >> 3) & 1) * 8) * 2;
++  float tot[MT][NT][4], cur[MT][NT][4];
++#pragma unroll
++  for (int i = 0; i < MT; ++i)
++#pragma unroll
++    for (int j = 0; j < NT; ++j)
++#pragma unroll
++      for (int e = 0; e < 4; ++e) tot[i][j][e] = 0.0f;
++#pragma unroll
++  for (int st = 0; st < STAGES - 1; ++st) {
++    if (st < total_steps) load(st, st);
++    glm_bmm::commit();
++  }
++  int step = 0;
++  for (int s = 0; s < ks; ++s) {
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++      for (int j = 0; j < NT; ++j)
++#pragma unroll
++        for (int e = 0; e < 4; ++e) cur[i][j][e] = 0.0f;
++    for (int kt = 0; kt < steps_per_s; ++kt, ++step) {
++      const int nxt_step = step + STAGES - 1;
++      if (nxt_step < total_steps) load(nxt_step % STAGES, nxt_step);
++      glm_bmm::commit();
++      glm_bmm::wait<STAGES - 1>();
++      __syncthreads();
++      const unsigned st = (step % STAGES) * STAGE;
++#pragma unroll
++      for (int k16 = 0; k16 < KS; k16 += 16) {
++        uint32_t a[MT][4], b[NT][2];
++#pragma unroll
++        for (int i = 0; i < MT; ++i) glm_bmm::ldm4s(a[i], fa + st + (i * 16 * LD + k16) * 2);
++#pragma unroll
++        for (int j = 0; j < NT; j += 2) {
++          uint32_t r[4];
++          glm_bmm::ldm4s(r, fb + st + (j * 8 * LD + k16) * 2);
++          b[j][0] = r[0], b[j][1] = r[1], b[j + 1][0] = r[2], b[j + 1][1] = r[3];
++        }
++#pragma unroll
++        for (int i = 0; i < MT; ++i)
++#pragma unroll
++          for (int j = 0; j < NT; ++j) glm_router::mma16816(cur[i][j], a[i], b[j]);
++      }
++      __syncthreads();
++    }
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++      for (int j = 0; j < NT; ++j)
++#pragma unroll
++        for (int e = 0; e < 4; ++e) tot[i][j][e] = (s == 0) ? cur[i][j][e] : (tot[i][j][e] + cur[i][j][e]);
++  }
++  glm_bmm::wait<0>();
++#pragma unroll
++  for (int i = 0; i < MT; ++i)
++#pragma unroll
++    for (int j = 0; j < NT; ++j)
++#pragma unroll
++      for (int h = 0; h < 2; ++h)
++#pragma unroll
++        for (int jj = 0; jj < 2; ++jj) {
++          const int64_t r = m0 + wm * 32 + i * 16 + g + h * 8, col = e0 + wn * 32 + j * 8 + q * 2 + jj;
++          if (r < rows && col < ne) out[r * ne + col] = tot[i][j][h * 2 + jj];
++        }
++}
++
+ // Decode windows (under 128 rows): 16 x 64 a block of 4 warps, K 64 at a time, one K slice a block along z.
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_bmm_decode(const __nv_bfloat16* x, const __nv_bfloat16* w, void* out, float* part, int64_t m,
+diff --git a/zig/kernels/cuda/glm_glue_msa.cuh b/zig/kernels/cuda/glm_glue_msa.cuh
+index c245d409d..d8aa9da63 100644
+--- a/zig/kernels/cuda/glm_glue_msa.cuh
++++ b/zig/kernels/cuda/glm_glue_msa.cuh
+@@ -172,6 +172,61 @@ struct Cache8T {
+ using Cache8 = Cache8T<Raw8>;
+ using Cache8I = Cache8T<Raw8I>;
+ 
++// neon rank #9 (GLM policy bit 13): Cache8I's rows dequantized in bf16 pairs. lat_write_i8 stores power-of-two scales
++// (2^(e-127), e in 1..254), so with u = q ^ 0x80 the pair a = 0x4300 | (u & 127), c = (u & 128) ^ 0x4380 gives a - c
++// = q exactly in bf16 (as bpairs8_fast), and bf16(q) * bf16(s) is exact (or the same inf) as fmul_rn(q, s) then the
++// round to bf16 in deq2<true>: the same bits, fewer registers (tf_glm_msa_w576_i8_f3 runs three CTAs an SM).
++struct Raw8IF {
++    uint4 c[4];
++    uint2 r;
++    __nv_bfloat162 s, s2;  // the latent and rope planes' scales, as bf16 pairs
++};
++__device__ __forceinline__ uint32_t deq2_i8f(uint32_t two_xor80, __nv_bfloat162 s2) {
++    const uint32_t k43 = 0x43004300u, k438 = 0x43804380u;
++    const uint32_t t = __byte_perm(two_xor80, 0u, 0x4140);
++    uint32_t a, c;
++    asm("lop3.b32 %0, %1, 0x007F007F, %2, 0xea;" : "=r"(a) : "r"(t), "r"(k43));
++    asm("lop3.b32 %0, %1, 0x00800080, %2, 0x6a;" : "=r"(c) : "r"(t), "r"(k438));
++    const __nv_bfloat162 d = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&a), *reinterpret_cast<const __nv_bfloat162*>(&c));
++    const __nv_bfloat162 r = __hmul2(d, s2);
++    return *reinterpret_cast<const uint32_t*>(&r);
++}
++__device__ __forceinline__ uint4 deq8_i8f(uint32_t lo, uint32_t hi, __nv_bfloat162 s2) {
++    const uint32_t l = lo ^ 0x80808080u, h = hi ^ 0x80808080u;
++    return make_uint4(deq2_i8f(l, s2), deq2_i8f(l >> 16, s2), deq2_i8f(h, s2), deq2_i8f(h >> 16, s2));
++}
++__device__ __forceinline__ void put(const Raw8IF& x, __nv_bfloat16* __restrict__ krow, int h) {
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        *reinterpret_cast<uint4*>(krow + 64 * h + 16 * i) = deq8_i8f(x.c[i].x, x.c[i].y, x.s);
++        *reinterpret_cast<uint4*>(krow + 64 * h + 16 * i + 8) = deq8_i8f(x.c[i].z, x.c[i].w, x.s);
++    }
++    *reinterpret_cast<uint4*>(krow + WC + 8 * h) = deq8_i8f(x.r.x, x.r.y, x.s2);
++}
++struct Cache8IF {
++    const unsigned char* __restrict__ p;
++    const float* __restrict__ sc;
++    using R = Raw8IF;
++    __device__ __forceinline__ void load(Raw8IF& x, int tok, int w, int h) const {
++        if (tok < 0) {
++#pragma unroll
++            for (int i = 0; i < 4; ++i) x.c[i] = make_uint4(0u, 0u, 0u, 0u);
++            x.r = make_uint2(0u, 0u);
++            x.s = __float2bfloat162_rn(1.f);
++            x.s2 = x.s;
++            return;
++        }
++        const unsigned char* row = p + (long long)tok * ROW;
++        const uint4* src = reinterpret_cast<const uint4*>(row + WC * w + 64 * h);
++#pragma unroll
++        for (int i = 0; i < 4; ++i) x.c[i] = __ldg(src + i);
++        x.r = __ldg(reinterpret_cast<const uint2*>(row + LW + WR * w + 8 * h));
++        const float2 sf = __ldg(reinterpret_cast<const float2*>(sc + 2 * (long long)tok));
++        x.s = __float2bfloat162_rn(sf.x);
++        x.s2 = __float2bfloat162_rn(sf.y);
++    }
++};
++
+ // one tile of KT keys at t0: store the lane's raw values (then load the next tile's into them), the warp's partial
+ // scores, their sum over the warps in warp order, the online softmax and the warp's columns of O += P V
+ template <bool DENSE, class C>
+@@ -380,6 +435,20 @@ extern "C" __global__ void __launch_bounds__(glm_msa::NT, 2)
+     glm_msa::run<true>(qa, glm_msa::Cache8I{codes, scales}, nullptr, pos, out, H, 0, scale);
+ }
+ 
++// neon rank #9 (policy bit 13): the int8 pair over Cache8IF, three CTAs an SM (168 registers, no spill)
++extern "C" __global__ void __launch_bounds__(glm_msa::NT, 3)
++    tf_glm_msa_w576_i8_f3(const __nv_bfloat16* __restrict__ qa, const unsigned char* __restrict__ codes,
++                          const float* __restrict__ scales, const int* __restrict__ tokens,
++                          const int* __restrict__ counts, __nv_bfloat16* __restrict__ out, int H, int W, float scale) {
++    glm_msa::run<false>(qa, glm_msa::Cache8IF{codes, scales}, tokens, counts, out, H, W, scale);
++}
++extern "C" __global__ void __launch_bounds__(glm_msa::NT, 3)
++    tf_glm_msa_w576_dense_i8_f3(const __nv_bfloat16* __restrict__ qa, const unsigned char* __restrict__ codes,
++                                const float* __restrict__ scales, const int* __restrict__ pos,
++                                __nv_bfloat16* __restrict__ out, int H, float scale) {
++    glm_msa::run<true>(qa, glm_msa::Cache8IF{codes, scales}, nullptr, pos, out, H, 0, scale);
++}
++
+ // glm_moe_dsa's split [q_a | kv_a] in a decode window: every rank's columns gathered as [world][rows][cw] slots, rank
+ // q's slot holding [rows][n_q] (n_q = min(cw, total - q cw): its columns q cw ..), back into dst [rows][total] (rows
+ // dst_stride apart). Block a row, 256 threads, 16-byte pieces where they fall (column runs of 8).
+diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
+index 66b8cb9ed..182744380 100644
+--- a/zig/kernels/cuda/glm_mm.cu
++++ b/zig/kernels/cuda/glm_mm.cu
+@@ -355,6 +355,171 @@ GLM_MM_PROMPT2(4)
+ GLM_MM_PROMPT2(6)
+ GLM_MM_PROMPT2(8)
+ 
++// neon rank #2 (GLM policy bit 12): two more prompt tilings of glm_mm8_128s2's 8-bit sums (one K slice). Each output's
++// 64-groups run in the same order with bpairs8_fast's pairs (a word at a time), the same MMAs and the same scale FMAs, so
++// every output is glm_mm8_128s2's bit for bit; only the tile shape and the block order change.
++//   glm_mm8_p128x64: 128 x 64 tiles, 4 warps, 2 stages, blocks in groups of 4 column tiles walking all row tiles (the
++//                    weight tiles of a group stay in L2: o_proj's 25 MiB no longer streams once a row block)
++//   glm_mm8_p64x128: 64 x 128 tiles, 8 warps, 3 stages, column tiles fastest (q_b, the shared expert)
++// Dependent launch: the grid waits for the one ahead before its first load (weights included).
++namespace {
++template <int BM, int BN, int WM, int WN, int STAGES, int SWZ_N>
++__device__ __forceinline__ void mm8_tiled(const __nv_bfloat16* __restrict__ x, long long ldx, const uint32_t* __restrict__ w,
++        const __half* __restrict__ s, void* __restrict__ out, int f32, int M, int N, int K) {
++    constexpr int WARPS = WM * WN, THREADS = WARPS * 32;
++    constexpr int MT = BM / (WM * 16), NT = BN / (WN * 8);
++    constexpr int NTILES = BN / 8, WPC = 4, ROW = 128, CHUNKS = 8;
++    constexpr int X_SZ = BM * ROW, W_SZ = NTILES * 32 * WPC * 4, S_SZ = NTILES * 8 * 2, STAGE = X_SZ + W_SZ + S_SZ;
++    extern __shared__ __align__(128) unsigned char buf[];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int wm = warp / WN, wn = warp % WN;
++    const int KG = K >> 6, N8 = N >> 3;
++    const int n_tiles = (N + BN - 1) / BN, m_tiles = (M + BM - 1) / BM;
++    int col_blk, row_blk;
++    if constexpr (SWZ_N == 0) {
++        col_blk = blockIdx.x; row_blk = blockIdx.y;
++    } else {
++        const int bid = blockIdx.x, grp_sz = SWZ_N * m_tiles, grp = bid / grp_sz, rem = bid % grp_sz;
++        const int c0 = grp * SWZ_N, cw = min(SWZ_N, n_tiles - c0);
++        row_blk = rem / cw;
++        col_blk = c0 + (rem % cw);
++    }
++    const int n0 = col_blk * BN, m0 = row_blk * BM, t0 = n0 >> 3;
++    auto stage = [&](int st) { return buf + st * STAGE; };
++    constexpr int XPT = (BM * CHUNKS + THREADS - 1) / THREADS, PER_TILE = 32, WPT = (NTILES * PER_TILE + THREADS - 1) / THREADS;
++    const unsigned char* xsrc[XPT];
++    uint32_t xdst[XPT];
++    bool xin[XPT], xok[XPT];
++    const unsigned char* wsrc[WPT];
++    bool wok[WPT];
++#pragma unroll
++    for (int j = 0; j < XPT; ++j) {
++        const int c = tid + j * THREADS, r = c / CHUNKS, ch = c % CHUNKS;
++        xin[j] = c < BM * CHUNKS;
++        const int row = min(m0 + r, M - 1);
++        xsrc[j] = reinterpret_cast<const unsigned char*>(x + (long long)row * ldx + ch * 8);
++        xdst[j] = (uint32_t)(r * ROW + swz<CHUNKS>(r, ch) * 16);
++        xok[j] = m0 + r < M;
++    }
++#pragma unroll
++    for (int j = 0; j < WPT; ++j) {
++        const int c = tid + j * THREADS, tt = c / PER_TILE, off = c % PER_TILE;
++        wok[j] = c < NTILES * PER_TILE && t0 + tt < N8;
++        wsrc[j] = reinterpret_cast<const unsigned char*>(w) + (wok[j] ? ((long long)(t0 + tt) * KG) * 32 * WPC * 4 + off * 16 : 0);
++    }
++    const bool sok = tid < NTILES && t0 + tid < N8;
++    const unsigned char* ssrc = reinterpret_cast<const unsigned char*>(s + (sok ? ((long long)(t0 + tid) * KG) * 8 : 0));
++    auto load = [&](int st, int g) {
++        unsigned char* p = stage(st);
++        const long long dg = g;
++#pragma unroll
++        for (int j = 0; j < XPT; ++j)
++            if (xin[j]) cp16z(p + xdst[j], xsrc[j] + dg * 128, xok[j]);
++        unsigned char* pw = p + X_SZ;
++#pragma unroll
++        for (int j = 0; j < WPT; ++j)
++            if (wok[j]) cp16(pw + (tid + j * THREADS) * 16, wsrc[j] + dg * (32 * WPC * 4));
++        if (sok) cp16(pw + W_SZ + tid * 16, ssrc + dg * 16);
++    };
++    float acc[MT][NT][4];
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++        for (int j = 0; j < NT; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
++    grid_launch();
++    grid_wait();
++#pragma unroll
++    for (int st = 0; st < STAGES - 1; ++st) {
++        if (st < KG) load(st, st);
++        commit();
++    }
++    const uint32_t k43 = 0x43004300u, k438 = 0x43804380u;
++    for (int it = 0; it < KG; ++it) {
++        wait<STAGES - 2>();
++        __syncthreads();
++        const int next = it + STAGES - 1;
++        if (next < KG) load(next % STAGES, next);
++        commit();
++        const unsigned char* p = stage(it % STAGES);
++        const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + X_SZ);
++        const __half* ps = reinterpret_cast<const __half*>(p + X_SZ + W_SZ);
++        uint32_t raw[NT][4];
++#pragma unroll
++        for (int j = 0; j < NT; ++j) {
++            const uint4 u = *reinterpret_cast<const uint4*>(pw + ((wn * NT + j) * 32 + lane) * 4);
++            raw[j][0] = u.x; raw[j][1] = u.y; raw[j][2] = u.z; raw[j][3] = u.w;
++        }
++        float d[MT][NT][4];
++#pragma unroll
++        for (int kt = 0; kt < 4; ++kt) {
++            uint32_t a[MT][4];
++#pragma unroll
++            for (int i = 0; i < MT; ++i) {
++                const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
++                const int ch = kt * 2 + (lane >> 4);
++                ldmatrix4(a[i], p + r * ROW + swz<CHUNKS>(r, ch) * 16);
++            }
++#pragma unroll
++            for (int j = 0; j < NT; ++j) {
++                uint32_t bb[2];
++#pragma unroll
++                for (int hh = 0; hh < 2; ++hh) {  // bpairs8_fast's pairs 2 kt and 2 kt + 1
++                    const uint32_t t = __byte_perm(raw[j][kt], 0u, hh ? 0x4342 : 0x4140);
++                    const uint32_t a_ = low7_or(t, k43), c_ = top_xor(t, k438);
++                    const __nv_bfloat162 dd = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&a_), *reinterpret_cast<const __nv_bfloat162*>(&c_));
++                    bb[hh] = *reinterpret_cast<const uint32_t*>(&dd);
++                }
++#pragma unroll
++                for (int i = 0; i < MT; ++i) {
++                    if (kt == 0) mma0(d[i][j], a[i], bb[0], bb[1]);
++                    else mma(d[i][j], a[i], bb[0], bb[1]);
++                }
++            }
++        }
++#pragma unroll
++        for (int j = 0; j < NT; ++j) {
++            const __half2 h = *reinterpret_cast<const __half2*>(ps + (wn * NT + j) * 8 + (lane & 3) * 2);
++            const float s0 = __low2float(h), s1 = __high2float(h);
++#pragma unroll
++            for (int i = 0; i < MT; ++i)
++#pragma unroll
++                for (int e = 0; e < 4; ++e) acc[i][j][e] = __fmaf_rn(d[i][j][e], (e & 1) ? s1 : s0, acc[i][j][e]);
++        }
++    }
++    wait<0>();
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++        for (int j = 0; j < NT; ++j) {
++            const int col = n0 + (wn * NT + j) * 8 + (lane & 3) * 2;
++            if (col >= N) continue;
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
++                if (row >= M) continue;
++                const float v0 = acc[i][j][2 * h], v1 = acc[i][j][2 * h + 1];
++                if (f32) {
++                    float* dst = reinterpret_cast<float*>(out) + (long long)row * N + col;
++                    dst[0] = v0;
++                    dst[1] = v1;
++                } else {
++                    *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(out) + (long long)row * N + col) =
++                        __floats2bfloat162_rn(v0, v1);
++                }
++            }
++        }
++}
++}  // namespace
++// glm_mm8_128s2's parameters (part / SK unused: one slice) so the launch site passes the same arguments
++extern "C" __global__ void __launch_bounds__(128, 2) glm_mm8_p128x64(const __nv_bfloat16* __restrict__ x, long long ldx,
++        const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
++        int f32, int M, int N, int K, int SK) { mm8_tiled<128, 64, 2, 2, 2, 4>(x, ldx, w, s, out, f32, M, N, K); }
++extern "C" __global__ void __launch_bounds__(256, 2) glm_mm8_p64x128(const __nv_bfloat16* __restrict__ x, long long ldx,
++        const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
++        int f32, int M, int N, int K, int SK) { mm8_tiled<64, 128, 2, 4, 3, 0>(x, ldx, w, s, out, f32, M, N, K); }
++
+ // Two problems of one shape and one K slice in one launch (z picks the problem): the same blocks and sums as two
+ // launches of glm_mm*_16 (GLM's KDA f_b and g_b projections of a decode window).
+ struct MmPair {
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index ab297d9fe..db241b3c1 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -7,6 +7,7 @@ const projection = @import("cuda_proj.zig");
+ const latent = @import("cuda_latent.zig");
+ const sparse = @import("cuda_sparse.zig");
+ const prof = @import("cuda_prof.zig");
++const policy = @import("policy.zig");
+ 
+ /// A prompt chunk's rows one dense latent attention call takes (geometry.MLA_PROMPT_ATT_ROWS).
+ pub const prompt_att_rows = 512;
+@@ -217,11 +218,13 @@ pub fn parseOwner(text: ?[]const u8) Owner {
+ }
+ 
+ /// Whether a layer's [q_a | kv_a] can run on its row owners: a lane projection (block FP8 or MXFP8) whose calls hold
+-/// no slice partials (the owner call runs on the exchange stream, beside the main stream's mm_part).
++/// no slice partials (the owner call runs on the exchange stream, beside the main stream's mm_part), or (neon #8) a
++/// tiled bf16 / packed projection: in a prompt forward glm_mm runs one K slice at any row count (cuda_mm.matmul's
++/// `one` = set.prompt), so the owner's rows hold the replicated path's bits and no partials (ownerRows checks).
+ pub fn ownerProjects(l: Layer) bool {
+     return switch (l.proj) {
+-        .fp8g, .mxfp8 => true,
+-        .bf16, .x8 => false,
++        .fp8g, .mxfp8, .bf16 => true,
++        .x8 => false,
+     };
+ }
+ 
+@@ -231,6 +234,7 @@ pub fn ownerProjects(l: Layer) bool {
+ pub fn ownerRows(set: glue.Set, stream: cuda.Stream, l: Layer, norm: glue.Norm, eps: f32, h: u64, h_stride: usize, normed: u64, xs: u64, dp: u64, n: usize) !void {
+     if (n == 0) return;
+     if (!ownerProjects(l)) return error.OwnerProj;
++    if (l.proj == .bf16 and !(set.prompt and set.mm != null)) return error.OwnerProj; // one slice only in a prompt's glm_mm
+     try glue.rmsnormBy(set, stream, h, h_stride, norm, normed, l.dims, xs, eps, n, l.dims);
+     try projection.matmul(set, stream, l.proj, normed, l.dims, dp, 0, n, l.q_lora + l.rowW(), l.dims, false);
+ }
+@@ -364,7 +368,7 @@ fn msaSparse(set: glue.Set, stream: cuda.Stream, l: Layer, c: Caches, v: Scratch
+     a.add(c.lc);
+     if (c.ls != 0) a.add(c.ls); // KV=fp8: tf_glm_msa_w576_fp8 takes the codes' row scales after them
+     inline for (.{ v.tokens, v.counts, v.ol, @as(c_int, @intCast(l.heads)), @as(c_int, sparse.dsa_width), scale }) |x| a.add(x);
+-    try cuda.launch.launch(if (c.ls != 0) (if (latent.int8()) set.glue.msa_w576_i8 else set.glue.msa_w576_fp8) else set.glue.msa_w576, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 }, .shared = msa_smem }, stream, &a);
++    try cuda.launch.launch(if (c.ls != 0) (if (latent.int8()) (if (policy.on(set.policy, .msa_f3)) set.glue.msa_w576_i8_f3 else set.glue.msa_w576_i8) else set.glue.msa_w576_fp8) else set.glue.msa_w576, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 }, .shared = msa_smem }, stream, &a);
+ }
+ 
+ /// The first `n` prompt rows' dense attention: row r at position pos + r over keys 0 .. pos + r.
+@@ -375,7 +379,7 @@ fn msaDense(set: glue.Set, stream: cuda.Stream, l: Layer, c: Caches, v: Scratch,
+     a.add(c.lc);
+     if (c.ls != 0) a.add(c.ls);
+     inline for (.{ pos, v.ol, @as(c_int, @intCast(l.heads)), scale }) |x| a.add(x);
+-    try cuda.launch.launch(if (c.ls != 0) (if (latent.int8()) set.glue.msa_w576_dense_i8 else set.glue.msa_w576_dense_fp8) else set.glue.msa_w576_dense, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 128 }, .shared = msa_smem }, stream, &a);
++    try cuda.launch.launch(if (c.ls != 0) (if (latent.int8()) (if (policy.on(set.policy, .msa_f3)) set.glue.msa_w576_dense_i8_f3 else set.glue.msa_w576_dense_i8) else set.glue.msa_w576_dense_fp8) else set.glue.msa_w576_dense, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 128 }, .shared = msa_smem }, stream, &a);
+ }
+ 
+ fn attnScale(l: Layer) f32 {
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index ca75b78ff..d70b9ad41 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -126,6 +126,8 @@ pub const Kernels = struct {
+     chunks_16_w576_i8_skip: cuda.Function, // policy bit 26 (U5x): the dense chunks without their keyless tiles
+     chunks_16_w576_s4_i8: cuda.Function,
+     chunks_16_fused_w576_i8: cuda.Function,
++    router_fused: cuda.Function, // policy bit 14 (neon #13): a prompt's router slices summed in one launch (glm_glue_bmm.cuh)
++    dsa_scores_w8: cuda.Function, // policy bit 11 (neon #1): 8 warps a CTA, a prompt row a warp, 64-key blocks shared (glm_dsa_scores_rows.cuh)
+     dsa_scores_r8: cuda.Function, // policy bit 25 (U6.2): 8 prompt rows a CTA on shared key blocks (glm_dsa_scores_rows.cuh)
+     l2_paced_stop: cuda.Function, // TF_GLM_L2PF policy bit 16: a paced site that stops at its gather's end (glm_glue_l2.cuh)
+     unblock: cuda.Function, // a split [q_a | kv_a]'s gathered column slots back into rows (glm_glue_msa.cuh)
+@@ -135,9 +137,15 @@ pub const Kernels = struct {
+     msa_w576_dense_fp8: cuda.Function,
+     msa_w576_i8: cuda.Function,
+     msa_w576_dense_i8: cuda.Function,
++    msa_w576_i8_f3: cuda.Function, // policy bit 13 (neon #9): the int8 pair, bf16-pair dequant, three CTAs an SM
++    msa_w576_dense_i8_f3: cuda.Function,
+ 
+     /// tf_glm_dsa_scores_r8's dynamic shared memory: 8 rows x 32 heads x 128 queries, 4 warps x 2 x 16 keys x 128.
+     pub const dsa_scores_r8_smem: u32 = 8 * 32 * 128 * 2 + 4 * 2 * 16 * 128 * 2;
++    /// tf_glm_dsa_scores_w8's: two 64-key blocks of 128 bf16 (also the query staging).
++    pub const dsa_scores_w8_smem: u32 = 2 * 64 * 128 * 2;
++    /// tf_glm_router_fused's: three stages of 128 rows and 64 experts, 40 bf16 each.
++    pub const router_fused_smem: u32 = 3 * (128 + 64) * 40 * 2;
+ 
+     pub fn load(m: cuda.Module) !Kernels {
+         var k: Kernels = undefined;
+@@ -172,6 +180,8 @@ pub const Kernels = struct {
+         try k.latent_mma_kn.allowDynamicShared(latent_mma_smem[0]);
+         try k.latent_mma_kn_hs.allowDynamicShared(latent_mma_smem[0]);
+         try k.dsa_scores_r8.allowDynamicShared(dsa_scores_r8_smem);
++        try k.dsa_scores_w8.allowDynamicShared(dsa_scores_w8_smem);
++        try k.router_fused.allowDynamicShared(router_fused_smem);
+         try k.latent_mma_nk.allowDynamicShared(latent_mma_smem[1]);
+         return k;
+     }
+@@ -280,6 +290,12 @@ pub const router_ks = 8;
+ 
+ /// glue.router: out [m][ne] fp32 = x . w rows; d a multiple of router_ks x 64: K slices in `part`, added in order.
+ pub fn router(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, d: usize, ne: usize) !void {
++    // policy bit 14 (neon #13): a prompt's slices and their sum in one launch (tf_glm_router_fused, the same bits)
++    if (set.prompt and m >= 512 and @import("policy.zig").on(set.policy, .router_fused) and x % 16 == 0 and x_stride % 8 == 0 and d % (router_ks * 32) == 0) {
++        var a: cuda.Args = .{};
++        inline for (.{ x, w, out, i64of(m), i64of(x_stride), i64of(d), i64of(ne), @as(c_int, router_ks) }) |v| a.add(v);
++        return cuda.launch.launch(set.glue.router_fused, .{ .grid = .{ .x = cdiv(m, 128), .y = cdiv(ne, 64) }, .block = .{ .x = 256 }, .shared = Kernels.router_fused_smem }, stream, &a);
++    }
+     try routerSlices(set, stream, x, x_stride, w, part, m, d, ne);
+     try sliceSum(set, stream, part, out, m * ne, router_ks, true);
+ }
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index d36faca1a..a221553e9 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -92,6 +92,19 @@ pub const Kernels = struct {
+     decode: ?[stage_variants.len]Decode = null, // the 16- and 32-row kernels at each pipeline depth (TF_GLM_MM_STAGES); null (a table built without load): the 3-stage kernels
+     si: usize = default_stage_index, // the index into stage_variants the decode launches take
+     decode_p2: ?Decode = null, // policy bit 18 (U3a): decode[si] with the 8-bit forms as P2 (glm_mm8_*s{S}p), stages 5-8
++    prompt_tiles: ?[2]cuda.Function = null, // policy bit 12 (neon #2): glm_mm8_p128x64 (swizzled), glm_mm8_p64x128 (3 stages)
++
++    /// neon #2: the 8-bit one-slice prompt tile for m rows of an n x k weight under bit 12, from spark6's sweep
++    /// (night/neon/gputest t2b_mm8.out, 512-4,096 rows): 0 = glm_mm8_p128x64 (n, k >= 4096 to 2,048 rows: o_proj and the
++    /// dense MLP, +15-30%; and dense gate-up past that), 1 = glm_mm8_p64x128 (n = 6,144, k >= 4096 past 2,048 rows,
++    /// +10-13%; the shared expert's down (k <= 512) from 1,024 rows, +20%), null = glm_mm8_128s2 (q_b, [q_a | kv_a], the
++    /// shared gate-up and the rest, where neither wins).
++    pub fn promptTile(n: usize, kk: usize, m: usize) ?usize {
++        if (n >= 4096 and kk >= 4096) return if (m <= 2048 or n != 6144) 0 else 1;
++        if (n >= 4096 and kk <= 512 and m >= 1024) return 1;
++        return null;
++    }
++    pub const prompt_tile_smem = [2]u32{ 2 * (128 * 128 + 8 * 512 + 8 * 16), 3 * (64 * 128 + 16 * 512 + 16 * 16) };
+ 
+     /// Decode windows' kernels at one pipeline depth: by width (16, 4, 6, 8 bits) and rows a block (16, 32).
+     pub const Decode = struct {
+@@ -130,6 +143,8 @@ pub const Kernels = struct {
+             k.packed_prompt[wi] = try m.function(std.fmt.comptimePrint("glm_mm{d}_128s2", .{b}));
+             try k.packed_prompt[wi].allowDynamicShared(sharedBytesStages(b, 128, 2));
+         }
++        k.prompt_tiles = .{ try m.function("glm_mm8_p128x64"), try m.function("glm_mm8_p64x128") };
++        for (k.prompt_tiles.?, prompt_tile_smem) |f, sm| try f.allowDynamicShared(sm);
+         var two: [4][3]cuda.Function = undefined;
+         inline for (widths, 0..) |b, wi| {
+             k.pair[wi] = try m.function(std.fmt.comptimePrint("glm_mm{d}_16x2", .{b}));
+@@ -349,6 +364,15 @@ pub fn matmulFrom(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tile
+         const row_blocks: u32 = @intCast((rows + bm - 1) / bm);
+         if (big and wi == 0) {
+             try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = pdl }, s, &a);
++        } else if (big and w.bits == 8 and sk == 1 and k.prompt_tiles != null and @import("policy.zig").on(@import("policy.zig").live, .mm8_tiles) and Kernels.promptTile(w.n, w.k, rows) != null) {
++            const ti = Kernels.promptTile(w.n, w.k, rows).?; // policy bit 12 (neon #2): glm_mm8_128s2's sums on another tiling
++            const f = k.prompt_tiles.?[ti];
++            if (ti == 0) {
++                const rb: u32 = @intCast((rows + 127) / 128);
++                try cuda.launch.launch(f, .{ .grid = .{ .x = cols * rb }, .block = .{ .x = 128 }, .shared = Kernels.prompt_tile_smem[0], .pdl = pdl }, s, &a);
++            } else {
++                try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((w.n + 127) / 128), .y = @intCast((rows + 63) / 64) }, .block = .{ .x = 256 }, .shared = Kernels.prompt_tile_smem[1], .pdl = pdl }, s, &a);
++            }
+         } else if (big) { // packed prompts: the 128-row blocks in two stages, two an SM (the 3-stage kernel's sums)
+             try cuda.launch.launch(k.packed_prompt[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = 256 }, .shared = sharedBytesStages(w.bits, bm, 2), .pdl = pdl }, s, &a);
+         } else {
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index e17e180e4..aaa275016 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -558,6 +558,10 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+     b.offered |= policy.bit(.scores_rows); // 25: tf_glm_dsa_scores_r8 (with bit 24)
+     b.offered |= policy.bit(.attn_skip); // 26: tf_glm_chunks_16_w576_i8_skip
+     b.offered |= policy.bit(.prompt_topk_multi); // 27: the prompt buffers' bit words (cuda_state ls)
++    b.offered |= policy.bit(.mm8_tiles); // 12 (neon #2): glm_mm8_p128x64 / p64x128 (cuda_mm prompt_tiles)
++    b.offered |= policy.bit(.msa_f3); // 13 (neon #9): tf_glm_msa_w576_i8_f3 / dense_i8_f3
++    b.offered |= policy.bit(.router_fused); // 14 (neon #13): tf_glm_router_fused
++    b.offered |= policy.bit(.scores_w8); // 11 (neon #1): tf_glm_dsa_scores_w8 (with bit 24)
+     std.log.info("request policies on (TF_GLM_POLICY_REQUESTS=1): default 0x{x}, offered 0x{x}", .{ b.default & b.offered, b.offered });
+     return b;
+ }
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index b697539a2..bf0a3eed7 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -205,7 +205,11 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+             q = s.qr;
+         }
+         const sl = hoist orelse loop;
+-        if (hoist != null and n > swift_rows and policy.on(set.policy, .scores_rows)) { // policy bit 25 (U6.2)
++        if (hoist != null and n > swift_rows and policy.on(set.policy, .scores_w8)) { // policy bit 11 (neon #1)
++            var ra: cuda.Args = .{};
++            inline for (.{ q, wts + a * stride * 2, @as(c_int, @intCast(stride)), ik, s.scores, at, @as(c_int, @intCast(n)), @as(c_int, @intCast(np)), @as(c_int, @intCast(nb)), scale, headScale(heads), @as(c_int, @intCast(heads)), @as(c_int, @intCast(sl)) }) |v| ra.add(v);
++            try cuda.launch.launch(set.glue.dsa_scores_w8, .{ .grid = .{ .x = @intCast(cdiv(n, 8)), .y = @intCast(cdiv(nb, sl)) }, .block = .{ .x = 256 }, .shared = glue.Kernels.dsa_scores_w8_smem }, stream, &ra);
++        } else if (hoist != null and n > swift_rows and policy.on(set.policy, .scores_rows)) { // policy bit 25 (U6.2)
+             var ra: cuda.Args = .{};
+             inline for (.{ q, wts + a * stride * 2, @as(i64, @intCast(stride)), ik, s.scores, at, @as(i64, @intCast(n)), @as(i64, @intCast(np)), @as(i64, @intCast(nb)), scale, headScale(heads), @as(i64, @intCast(heads)), @as(c_int, @intCast(sl)) }) |v| ra.add(v);
+             try cuda.launch.launch(set.glue.dsa_scores_r8, .{ .grid = .{ .x = @intCast(cdiv(n, 8)), .y = @intCast(cdiv(nb, sl)) }, .block = .{ .x = 128 }, .shared = glue.Kernels.dsa_scores_r8_smem }, stream, &ra);
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+index 087d935cc..fc8d10855 100644
+--- a/zig/src/families/glm/policy.zig
++++ b/zig/src/families/glm/policy.zig
+@@ -21,6 +21,11 @@ pub const Bit = enum(u5) {
+     dsa_pdl = 8, // the decode DSA chain (attention, index scores and selection, norms) as dependent launches
+     msg_cuts = 9, // prompt chunks also cut at the server's message starts (TF_GLM_MSG_CUTS=1); slot resume may stand there
+     index_scan_split = 10, // with bits 2 and 3: a long decode window's index scan and top-2048 split over the ranks' key blocks
++    // the neon run's candidates (night/neon): bits 11-15 and 28-31, each off unless a request (or the default) asks
++    router_fused = 14, // neon #13: a prompt's router on tf_glm_router_fused (slices summed in registers, no slice partials)
++    msa_f3 = 13, // neon #9: a prompt's int8 sparse/dense attention on tf_glm_msa_w576_i8_f3 / dense_i8_f3
++    mm8_tiles = 12, // neon #2: 8-bit prompt linears on glm_mm8_p128x64 / p64x128 by shape (cuda_mm promptTile)
++    scores_w8 = 11, // neon #1: with bit 24, a prompt select block's scores on tf_glm_dsa_scores_w8 (8 warps, a row a warp in registers)
+     // the unified-opt run's candidates (night/unified): bits 16-27, each off unless a request (or the default) asks
+     l2pf_v2 = 16, // U1: TF_GLM_L2PF's sites read what the window reads next (proj_dec, q_b, shared expert, head), stop at the gather's end
+     dflash_mesh = 17, // U2: DFlash2's gathers and greedyRows over the RoCE mesh, not NCCL
+@@ -39,6 +44,8 @@ pub const Bit = enum(u5) {
+ pub const reserved: Mask = 0x7ff;
+ /// The unified run's bits (16-27): offered where their kernels and tables loaded.
+ pub const unified: Mask = 0x0fff_0000;
++/// The neon run's bits (11-15, 28-31).
++pub const neon: Mask = 0xf000_f800;
+ /// The mask of the forward now running on this rank's thread (set at each forward's start; 0 outside one): the bits
+ /// read deep in shared kernel tables (glm_mm's decode table, the EXL3 experts) without threading the mask through.
+ pub var live: Mask = 0;
+@@ -101,7 +108,7 @@ pub const Boot = struct {
+     /// else the request's mask (or the default), less the bits this boot does not offer.
+     pub fn effective(b: Boot, asked: ?Mask) ?Mask {
+         if (!b.requests) return null;
+-        return (asked orelse b.default) & b.offered & (reserved | unified);
++        return (asked orelse b.default) & b.offered & (reserved | unified | neon);
+     }
+ };
+ 
+@@ -147,7 +154,7 @@ test "GLM policy: the accessor, the bits' places and a shared forward's common m
+     const t = std.testing;
+     try t.expectEqual(@as(Mask, 1), bit(.dflash2_coupled));
+     try t.expectEqual(@as(Mask, 0x20), bit(.qkva_bypass));
+-    for (std.enums.values(Bit)) |b| try t.expect(bit(b) & (reserved | unified) != 0);
++    for (std.enums.values(Bit)) |b| try t.expect(bit(b) & (reserved | unified | neon) != 0);
+     try t.expect(on(0x21, .qkva_bypass) and on(0x21, .dflash2_coupled) and !on(0x21, .router_small));
+     try t.expectEqual(@as(Mask, 0x20), common(&.{ 0x21, 0x30 }));
+     try t.expectEqual(@as(Mask, 0), common(&.{}));
+@@ -167,3 +174,15 @@ test "GLM policy: bit 8 (dsa_pdl) is reserved, offered and parsed like the rest;
+     try t.expectEqual(@as(?Mask, 0x104), b.effective(0x1c4)); // 6 and 7 not offered by this branch
+     try t.expectEqual(@as(Mask, 0x100), common(&.{ 0x104, 0x120 }));
+ }
++
++test "GLM policy: the neon bits (11-15, 28-31) are offered and taken like the unified ones, disjoint from them" {
++    const t = std.testing;
++    try t.expectEqual(@as(Mask, 0), neon & (reserved | unified));
++    try t.expectEqual(@as(Mask, 0x800), bit(.scores_w8));
++    try t.expectEqual(@as(Mask, 0x1000), bit(.mm8_tiles));
++    try t.expectEqual(@as(Mask, 0x2000), bit(.msa_f3));
++    try t.expectEqual(@as(Mask, 0x4000), bit(.router_fused));
++    var b = Boot.read(envOf(.{.{ "TF_GLM_POLICY_REQUESTS", "1" }}));
++    b.offered = bit(.scores_w8) | bit(.mm8_tiles) | bit(.msa_f3) | bit(.router_fused) | bit(.prompt_hoist);
++    try t.expectEqual(@as(?Mask, 0x0100_7800), b.effective(0xffff_ffff));
++}
+-- 
+2.43.0
+

@@ -1,0 +1,160 @@
+From 66e8e5d70108bbd196de8b7ebf52696f6fa549ab Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 06:42:46 +0200
+Subject: [PATCH 238/242] glm: neon #15 TF_GLM_NEON_FOLD=1: a fused chunk's
+ second half folds its shared slot in the shared down epilogue
+ (glm_mm8_p64x128_fold, the same bytes)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj5qARY3iLJfisqfnh
+---
+ zig/kernels/cuda/glm_mm.cu            | 20 ++++++++++--
+ zig/src/families/glm/cuda_forward.zig |  7 +++--
+ zig/src/families/glm/cuda_mm.zig      |  3 ++
+ zig/src/families/glm/cuda_moe.zig     | 45 +++++++++++++++++++++++++++
+ 4 files changed, 70 insertions(+), 5 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
+index 182744380..1a16ce780 100644
+--- a/zig/kernels/cuda/glm_mm.cu
++++ b/zig/kernels/cuda/glm_mm.cu
+@@ -363,9 +363,10 @@ GLM_MM_PROMPT2(8)
+ //   glm_mm8_p64x128: 64 x 128 tiles, 8 warps, 3 stages, column tiles fastest (q_b, the shared expert)
+ // Dependent launch: the grid waits for the one ahead before its first load (weights included).
+ namespace {
+-template <int BM, int BN, int WM, int WN, int STAGES, int SWZ_N>
++template <int BM, int BN, int WM, int WN, int STAGES, int SWZ_N, bool FOLD = false>
+ __device__ __forceinline__ void mm8_tiled(const __nv_bfloat16* __restrict__ x, long long ldx, const uint32_t* __restrict__ w,
+-        const __half* __restrict__ s, void* __restrict__ out, int f32, int M, int N, int K) {
++        const __half* __restrict__ s, void* __restrict__ out, int f32, int M, int N, int K,
++        const float* __restrict__ wts = nullptr, int wstride = 0, int wslot = 0) {
+     constexpr int WARPS = WM * WN, THREADS = WARPS * 32;
+     constexpr int MT = BM / (WM * 16), NT = BN / (WN * 8);
+     constexpr int NTILES = BN / 8, WPC = 4, ROW = 128, CHUNKS = 8;
+@@ -500,7 +501,12 @@ __device__ __forceinline__ void mm8_tiled(const __nv_bfloat16* __restrict__ x, l
+                 const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
+                 if (row >= M) continue;
+                 const float v0 = acc[i][j][2 * h], v1 = acc[i][j][2 * h + 1];
+-                if (f32) {
++                if constexpr (FOLD) {  // tf_glm_fold_slot on the fp32 value glm_mm would store: out = fma(bf16(v), w, out)
++                    float* dst = reinterpret_cast<float*>(out) + (long long)row * N + col;
++                    const float wv = wts[(long long)row * wstride + wslot];
++                    dst[0] = __fmaf_rn(__bfloat162float(__float2bfloat16_rn(v0)), wv, dst[0]);
++                    dst[1] = __fmaf_rn(__bfloat162float(__float2bfloat16_rn(v1)), wv, dst[1]);
++                } else if (f32) {
+                     float* dst = reinterpret_cast<float*>(out) + (long long)row * N + col;
+                     dst[0] = v0;
+                     dst[1] = v1;
+@@ -519,6 +525,14 @@ extern "C" __global__ void __launch_bounds__(128, 2) glm_mm8_p128x64(const __nv_
+ extern "C" __global__ void __launch_bounds__(256, 2) glm_mm8_p64x128(const __nv_bfloat16* __restrict__ x, long long ldx,
+         const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
+         int f32, int M, int N, int K, int SK) { mm8_tiled<64, 128, 2, 4, 3, 0>(x, ldx, w, s, out, f32, M, N, K); }
++// neon rank #15 (TF_GLM_NEON_FOLD=1): the shared expert's down projection of a fused chunk's second half straight into its
++// fp32 partial rows: glm_mm8_p64x128's sums (glm_mm8_128s2's bits), then tf_glm_fold_slot's step on each value,
++// out = fma(bf16(v), wts[row][wslot], out), instead of storing sy and folding it in a second launch.
++extern "C" __global__ void __launch_bounds__(256, 2) glm_mm8_p64x128_fold(const __nv_bfloat16* __restrict__ x, long long ldx,
++        const uint32_t* __restrict__ w, const __half* __restrict__ s, float* __restrict__ out, const float* __restrict__ wts,
++        int wstride, int wslot, int M, int N, int K) {
++    mm8_tiled<64, 128, 2, 4, 3, 0, true>(x, ldx, w, s, out, 1, M, N, K, wts, wstride, wslot);
++}
+ 
+ // Two problems of one shape and one K slice in one launch (z picks the problem): the same blocks and sums as two
+ // launches of glm_mm*_16 (GLM's KDA f_b and g_b projections of a decode window).
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 761650881..07ed8484e 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -920,8 +920,11 @@ pub const Forward = struct {
+                 try f.sideExchange(p, 0, side_comm, part[0], part[0] + span_bytes, hidden[0], rows[0], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[0] } else null, ow.next(j, 0));
+                 // half 1's shared expert and sum under half 0's exchange
+                 if (fused) {
+-                    try moe.sharedOnly(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[1], R);
+-                    try moe.foldRows(f.moeKernels(), f.stream, m, b.moe, lo[1], R, part[1]);
++                    // TF_GLM_NEON_FOLD (neon #15): the shared down folds the slot into part[1] itself (the same bytes)
++                    if (!(moe.neonFold() and try moe.sharedFoldRows(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[1], R, part[1]))) {
++                        try moe.sharedOnly(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[1], R);
++                        try moe.foldRows(f.moeKernels(), f.stream, m, b.moe, lo[1], R, part[1]);
++                    }
+                 } else {
+                     try moe.sharedSlot(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[1], R);
+                     try moe.combineRows(f.moeKernels(), f.stream, m, b.moe, lo[1], R, part[1]);
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index a221553e9..8a528e5fc 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -92,6 +92,7 @@ pub const Kernels = struct {
+     decode: ?[stage_variants.len]Decode = null, // the 16- and 32-row kernels at each pipeline depth (TF_GLM_MM_STAGES); null (a table built without load): the 3-stage kernels
+     si: usize = default_stage_index, // the index into stage_variants the decode launches take
+     decode_p2: ?Decode = null, // policy bit 18 (U3a): decode[si] with the 8-bit forms as P2 (glm_mm8_*s{S}p), stages 5-8
++    prompt_fold: ?cuda.Function = null, // TF_GLM_NEON_FOLD (neon #15): glm_mm8_p64x128_fold, the shared down with the slot fold
+     prompt_tiles: ?[2]cuda.Function = null, // policy bit 12 (neon #2): glm_mm8_p128x64 (swizzled), glm_mm8_p64x128 (3 stages)
+ 
+     /// neon #2: the 8-bit one-slice prompt tile for m rows of an n x k weight under bit 12, from spark6's sweep
+@@ -145,6 +146,8 @@ pub const Kernels = struct {
+         }
+         k.prompt_tiles = .{ try m.function("glm_mm8_p128x64"), try m.function("glm_mm8_p64x128") };
+         for (k.prompt_tiles.?, prompt_tile_smem) |f, sm| try f.allowDynamicShared(sm);
++        k.prompt_fold = m.function("glm_mm8_p64x128_fold") catch null;
++        if (k.prompt_fold) |f| try f.allowDynamicShared(prompt_tile_smem[1]);
+         var two: [4][3]cuda.Function = undefined;
+         inline for (widths, 0..) |b, wi| {
+             k.pair[wi] = try m.function(std.fmt.comptimePrint("glm_mm{d}_16x2", .{b}));
+diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.zig
+index ae081dc5a..42a7f5672 100644
+--- a/zig/src/families/glm/cuda_moe.zig
++++ b/zig/src/families/glm/cuda_moe.zig
+@@ -118,6 +118,51 @@ pub fn sharedOnly(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
+     try sharedRows(k, stream, l, s, x, x_stride, lo, hi, true, false);
+ }
+ 
++/// TF_GLM_NEON_FOLD=1 (neon #15, default off), read once.
++pub fn neonFold() bool {
++    const S = struct {
++        var once: ?bool = null;
++    };
++    if (S.once) |v| return v;
++    const v = if (std.c.getenv("TF_GLM_NEON_FOLD")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
++    if (v) std.log.info("TF_GLM_NEON_FOLD=1: a fused chunk's second half folds its shared slot in the shared down epilogue", .{});
++    S.once = v;
++    return v;
++}
++
++/// neon #15: sharedOnly then foldRows for rows lo..hi in two launches fewer: the shared gate-up and SwiGLU as
++/// sharedRows runs them, then the 8-bit shared down on glm_mm8_p64x128_fold straight into `out` (glm_mm8's sums,
++/// then fold_slot's fma on each value: the same bytes, night/neon/gputest t7_fold.out). False: not taken (an
++/// unpacked or other-width shared down, no kernel): the caller runs sharedOnly + foldRows.
++pub fn sharedFoldRows(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, out: u64) !bool {
++    if (hi <= lo or forks(k, true)) return false;
++    const mk = k.set.mm orelse return false;
++    const f = mk.prompt_fold orelse return false;
++    const pk = k.set.packs orelse return false;
++    const b = switch (l.shared_down) {
++        .bf16 => |b| b,
++        else => return false,
++    };
++    const d = l.routed.dims;
++    const t = pk.tiled(b, d, l.shared);
++    if (t.bits != 8 or l.shared % 64 != 0 or d % 8 != 0) return false;
++    const n = hi - lo;
++    const stamp = prof_mod.span(k.prof, stream, .shared_expert);
++    defer stamp.end();
++    try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
++    try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
++    var a: cuda.Args = .{};
++    a.add(s.sact + lo * l.shared * 2);
++    a.add(@as(c_longlong, @intCast(l.shared)));
++    a.add(t.w);
++    a.add(t.s);
++    a.add(out);
++    a.add(s.wts + lo * (l.top_k + 1) * 4);
++    for ([_]usize{ l.top_k + 1, l.top_k, n, d, l.shared }) |v| a.add(@as(c_int, @intCast(v)));
++    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((d + 127) / 128), .y = @intCast((n + 63) / 64) }, .block = .{ .x = 256 }, .shared = mm_mod.Kernels.prompt_tile_smem[1] }, stream, &a);
++    return true;
++}
++
+ /// After bodyFused: rows lo..hi (the second half, lo = split) take their shared slot, out [hi - lo][dims] fp32 =
+ /// fma(bf16(sy), wts[row][top_k], out): tf_glm_combine's last step on put_slot's value.
+ pub fn foldRows(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, out: u64) !void {
+-- 
+2.43.0
+

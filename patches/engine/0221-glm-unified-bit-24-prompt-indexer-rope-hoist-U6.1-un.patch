@@ -1,0 +1,93 @@
+From b11d352b18be8315ef85f65a922eb867a23e61a3 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Mon, 23 Nov 2026 02:35:26 +0200
+Subject: [PATCH 221/222] glm: unified bit 24 prompt indexer rope hoist (U6.1);
+ unified mask bits 16-27
+
+---
+ zig/src/families/glm/cuda_native.zig | 1 +
+ zig/src/families/glm/cuda_sparse.zig | 4 +++-
+ zig/src/families/glm/cuda_state.zig  | 4 ++--
+ zig/src/families/glm/policy.zig      | 7 ++++---
+ 4 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index d4f473bd4..e6f509d87 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -538,6 +538,7 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+     b.offered |= policy.bit(.down_nodead); // 19: tf_exl3_down_combine_nd (falls back to the storing kernel if absent)
+     b.offered |= policy.bit(.scatter_inplace); // 22: the prompt exchange's in-place sums and gather (exact)
+     b.offered |= policy.bit(.absorb_one); // 23: tf_glm_latent_mma_kn_hs, every rank loads glm_glue
++    b.offered |= policy.bit(.prompt_hoist); // 24: the prompt buffers' roped-query block (cuda_state, p[76])
+     std.log.info("request policies on (TF_GLM_POLICY_REQUESTS=1): default 0x{x}, offered 0x{x}", .{ b.default & b.offered, b.offered });
+     return b;
+ }
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index 86f5df7ea..377870b85 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -180,7 +180,9 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(d), -0.5));
+         var stamp = prof_mod.span(profile, stream, .index_score);
+         // policy bit 2 (rope_hoist): a decode window's queries roped once a row into s.qr, then `sl` key blocks a CTA
+-        const hoist = if (split == null and s.qr != 0) hoistLoop(policy.on(set.policy, .rope_hoist), n, np, host_pos + rows - 1) else null;
++        // policy bit 24 (U6.1): a prompt chunk's select blocks (more than swift_rows rows) roped once a row too, the
++        // CTAs keeping their `loop` key blocks (the scores are per key: the same values either way)
++        const hoist = if (s.qr != 0 and n > swift_rows and policy.on(set.policy, .prompt_hoist)) loop else if (split == null and s.qr != 0 and !set.prompt) hoistLoop(policy.on(set.policy, .rope_hoist), n, np, host_pos + rows - 1) else null; // (prompt buffers held no qr before bit 24: their small blocks stay unhoisted)
+         var q = qi + a * heads * d * 2;
+         if (hoist != null) {
+             var ra: cuda.Args = .{};
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 2c3626e0a..847df3349 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -371,7 +371,7 @@ pub const Buffers = struct {
+             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
+             x3[0], x3[1], x3[2], x3[3], // EXL3 experts: 8-slot picks, rotated inputs, a decode window's partials
+             if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // a split KDA stack's part rows
+-            if (prefill or !c.dsa) 4 else rows * c.i_heads * c.i_dim * 2, // a decode window's roped index queries (TF_GLM_DSA_ROPE_HOIST)
++            if (!c.dsa) 4 else if (prefill) @min(rows, sparse.select_rows) * c.i_heads * c.i_dim * 2 else rows * c.i_heads * c.i_dim * 2, // roped index queries: a decode window's (TF_GLM_DSA_ROPE_HOIST), a prompt select block's (policy bit 24)
+         };
+         var held = sizes;
+         if (twin) |tw| for (&held, 0..) |*bytes, i| { // a twin allocates its own rows only
+@@ -412,7 +412,7 @@ pub const Buffers = struct {
+                 .qi = p[30],
+                 .partials = .{ .po = p[31], .pm = p[32], .pl = p[33], .rows = partial_rows },
+                 .dummy = p[34],
+-                .select = .{ .scores = p[35], .ls = p[36], .li = p[37], .pools = p[38], .at = p[39], .bits_rows = if (prefill) 0 else @min(seg, sparse.wide_rows), .qr = if (prefill or !c.dsa) 0 else p[76] },
++                .select = .{ .scores = p[35], .ls = p[36], .li = p[37], .pools = p[38], .at = p[39], .bits_rows = if (prefill) 0 else @min(seg, sparse.wide_rows), .qr = if (!c.dsa) 0 else p[76] },
+                 .tokens = p[40],
+                 .counts = p[41],
+                 .mm_part = p[42],
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+index 80ed00ea4..0219f8114 100644
+--- a/zig/src/families/glm/policy.zig
++++ b/zig/src/families/glm/policy.zig
+@@ -16,7 +16,7 @@ pub const Bit = enum(u5) {
+     topk_multi_cta = 3, // multi-CTA top-2048 selection
+     owner_rows = 4, // prefill q_a/kv_a (and indexer query) on owner rows, then gather
+     qkva_bypass = 5, // a decode window's [q_a | kv_a] on the replicated projection, not the split slices
+-    // the unified-opt run's candidates (night/unified): bits 16-23, each off unless a request (or the default) asks
++    // the unified-opt run's candidates (night/unified): bits 16-27, each off unless a request (or the default) asks
+     l2pf_v2 = 16, // U1: TF_GLM_L2PF's sites read what the window reads next (proj_dec, q_b, shared expert, head), stop at the gather's end
+     dflash_mesh = 17, // U2: DFlash2's gathers and greedyRows over the RoCE mesh, not NCCL
+     mm8_p2 = 18, // U3a: decode glm_mm8 16/32-row forms with bpairs8_fast and precomputed stage pointers
+@@ -25,11 +25,12 @@ pub const Bit = enum(u5) {
+     kw_overlap = 21, // U3d: the indexer key write on the side stream behind the [q_a | kv_a] gather
+     scatter_inplace = 22, // U7a: a prompt exchange's reduce-scatter sums added in place into the residual rows and gathered there (R % world == 0)
+     absorb_one = 23, // U8b: glm_moe_dsa's prompt absorb_q in one head-batched launch (tf_glm_latent_mma_kn_hs)
++    prompt_hoist = 24, // U6.1: a prompt chunk's indexer queries roped once a row (tf_glm_dsa_qrope + tf_glm_dsa_scores_roped)
+ };
+ 
+ pub const reserved: Mask = 0x3f;
+-/// The unified run's bits (16-23): offered where their kernels and tables loaded.
+-pub const unified: Mask = 0x00ff_0000;
++/// The unified run's bits (16-27): offered where their kernels and tables loaded.
++pub const unified: Mask = 0x0fff_0000;
+ /// The mask of the forward now running on this rank's thread (set at each forward's start; 0 outside one): the bits
+ /// read deep in shared kernel tables (glm_mm's decode table, the EXL3 experts) without threading the mask through.
+ pub var live: Mask = 0;
+-- 
+2.43.0
+

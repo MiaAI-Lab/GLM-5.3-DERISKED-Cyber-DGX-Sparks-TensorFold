@@ -1,0 +1,82 @@
+From ddc345a611415fa999cf4b1d4b42736ff2d09cb8 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 02:42:11 +0200
+Subject: [PATCH] glm_moe_dsa: o_proj read into L2 during a decode window's
+ attention
+
+TF_GLM_L2PF's o site was empty for MLA layers. A decode window's
+out-projection, the largest GEMV of the step, is now read into L2 from
+the projections' end, under the attention core (the idea of a prefetch
+window through the attention is knapcio's gr8 patch 0009). Same bits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_dsa_block.zig | 6 ++++--
+ zig/src/families/glm/cuda_forward.zig   | 4 ++--
+ zig/src/families/glm/cuda_l2pf.zig      | 2 +-
+ 3 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index 757ae1e..17b68c7 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -98,7 +98,7 @@ pub const Kernels = struct { set: glue.Set, ops: cuda.Module, prof: ?*prof.Prof
+ 
+ /// forward.dsa_block (latent path) of `rows` rows at pos to an fp32 partial; `nch`: 512-key chunks, `part_rows`: block.
+ pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize, out: u64) !void {
+-    try body(k, stream, l, c, s, x, x_stride, rows, pos, host_pos, nch, part_rows);
++    try body(k, stream, l, c, s, x, x_stride, rows, pos, host_pos, nch, part_rows, null);
+     try fill(k.set, stream, l, s, 0, rows, out);
+ }
+ 
+@@ -109,8 +109,10 @@ pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize,
+ }
+ 
+ /// The block up to its out_proj (s.vn holds the expanded rows).
+-pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize) !void {
++/// `o_site` (TF_GLM_L2PF, a decode window): the out-projection read into L2 from the projections' end, under the attention.
++pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize, o_site: ?@import("cuda_l2pf.zig").At) !void {
+     try prepareProfile(k.set, stream, l, s, x, x_stride, rows, sparseRows(l, host_pos, rows), k.prof);
++    if (o_site) |at| try at.fork(stream);
+     try attend(k, stream, l, c, s, 0, rows, pos, host_pos, nch, part_rows);
+     const stamp = prof.span(k.prof, stream, .projections);
+     defer stamp.end();
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 9d6b780..a6df89e 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -318,7 +318,7 @@ pub const Forward = struct {
+             .mla => |a| {
+                 const k: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof, .split = f.indexSplit(r) };
+                 // TF_GLM_KV_SHARD: one rank holds this sequence's latent rows, so it attends for both ranks' heads
+-                if (kv_attn.wanted(f, r)) try kv_attn.single(f, r, a, di, rows, nch, k) else try dsa_block.body(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
++                if (kv_attn.wanted(f, r)) try kv_attn.single(f, r, a, di, rows, nch, k) else try dsa_block.body(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, if (f.prefetch()) |pf| .{ .l2 = pf, .layer = l.index } else null);
+                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
+             },
+         }
+@@ -644,7 +644,7 @@ pub const Forward = struct {
+                 if (j > 0) try f.stream.wait(p.gathered[h]); // this half's ffn exchange of the layer before
+                 try glue.rmsnormBy(f.set(), f.stream, hidden[h], D, l.in_norm, normed[h], D, xs[h], c.eps, rows[h], D);
+                 const nch = @min(latent.chunksFor(st.pos + lo[h] + rows[h]), b.nch);
+-                try dsa_block.body(k, f.stream, a, st.caches[di], dsa[h], normed[h], D, rows[h], pos_dev[h], st.pos + lo[h], nch, b.part_rows);
++                try dsa_block.body(k, f.stream, a, st.caches[di], dsa[h], normed[h], D, rows[h], pos_dev[h], st.pos + lo[h], nch, b.part_rows, null);
+                 try dsa_block.fill(f.set(), f.stream, a, dsa[h], 0, rows[h], part[h]);
+                 try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h]);
+             }
+diff --git a/zig/src/families/glm/cuda_l2pf.zig b/zig/src/families/glm/cuda_l2pf.zig
+index 636d17f..627734d 100644
+--- a/zig/src/families/glm/cuda_l2pf.zig
++++ b/zig/src/families/glm/cuda_l2pf.zig
+@@ -106,7 +106,7 @@ fn sources(l: weights.Layer, site: Site) Sources {
+         },
+         .o => switch (l.mixer) {
+             .kda => |k| s.proj(k.o),
+-            .mla => {},
++            .mla => |a| s.proj(a.o), // glm_moe_dsa: o_proj (its largest GEMV) read into L2 while the attention runs
+         },
+     }
+     return s;
+-- 
+2.43.0
+

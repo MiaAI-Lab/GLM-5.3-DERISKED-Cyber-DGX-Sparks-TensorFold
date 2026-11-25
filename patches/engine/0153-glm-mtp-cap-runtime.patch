@@ -1,0 +1,70 @@
+From 3979b169cf92881adee2879ca81932e3edeaf349 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 08:33:39 +0200
+Subject: [PATCH] glm_moe_dsa: TF_GLM_MTP_CAP sets the MTP chain cap at run
+ time (room for 6)
+
+max_drafts (4) sized the held drafts and capped the lanes' depth at
+compile time, so trying a deeper chain under --mtp-confidence's early
+stop meant a rebuild a depth. The held drafts now have room for 6 and
+the lanes' cap is draftCap(): TF_GLM_MTP_CAP (1..6), default 4. The
+first copy keeps 1 + the cap rows, so the default rounds are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_engine.zig | 9 ++++++++-
+ zig/src/families/glm/cuda_lanes.zig  | 6 +++---
+ 2 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 3857981..572f433 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -29,7 +29,14 @@ pub const Options = @import("cuda_engine_types.zig").Options;
+ pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
+ 
+ /// The most drafts a chain holds (decode.DepthPolicy's top depth).
+-pub const max_drafts = 4; // glm_moe_dsa at TP6 (a six-Spark sweep of fixed depths peaked at 3; 7 lost a fifth)
++pub const max_drafts = 6; // the held drafts' room; the lanes' cap is draftCap()
++/// The lanes' draft cap: TF_GLM_MTP_CAP (1..max_drafts), default 4 (at TP6 a six-Spark sweep of fixed depths peaked at
++/// 3 and 7 lost a fifth; with --mtp-confidence's early stop a chain past 4 costs only when its chance holds).
++pub fn draftCap() usize {
++    const v = std.c.getenv("TF_GLM_MTP_CAP") orelse return 4;
++    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return 4;
++    return @max(1, @min(n, max_drafts));
++}
+ /// A greedy pick as it crosses ranks: (value, id) and padding, so the RoCE gather (16-byte packs) can carry it.
+ const pair_bytes = 16;
+ /// The rows one gather of greedy picks holds (cuda_engine_pick.greedyRows): a shared window's.
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 95c0dcd..a192b34 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -119,12 +119,12 @@ pub const Lanes = struct {
+         const sharing = drafting and !self.alone;
+         return .{
+             .exact_width = if (drafting) max_rows else 1,
+-            .first_copy_rows = mtp_rows, // a first copy as wide as a head round; it grows as its tokens land
++            .first_copy_rows = if (block) mtp_rows else @intCast(1 + engine.draftCap()), // a first copy as wide as a head round; it grows as its tokens land
+             .gpu_tokens = false,
+             .mtp = drafting,
+             .speculate = drafting,
+             .speculate_early = false,
+-            .drafts = if (block) max_held else engine.max_drafts,
++            .drafts = if (block) max_held else @intCast(engine.draftCap()),
+             .draft_streams = block, // one block pass drafts every stream of the round
+             .mtp_step_ms = if (block) 1.6 / @as(f64, max_held) else 0, // a block's 7 drafts in one pass (about 1.6 ms)
+             .draft_probabilities = block or self.mtp_confidence != null, // chances size each window (DFlash2's by the costs)
+@@ -553,7 +553,7 @@ pub const Lanes = struct {
+             const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
+             if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
+             if (r.lanes != null) return error.TreesNotBuilt;
+-            const depth = @min(r.depth, engine.max_drafts);
++            const depth = @min(r.depth, engine.draftCap());
+             const chances: ?[]f64 = if (self.mtp_confidence != null) l.chances[0..depth] else null;
+             if (r.rows) |rows| {
+                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
+-- 
+2.43.0
+

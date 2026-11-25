@@ -1,0 +1,223 @@
+From 100c43bc783c8a748e8a035d32a7141f0ea36bd9 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 06:30:38 +0200
+Subject: [PATCH] glm: DSpark takes each rank's 64 best a slot (ds_top64_part /
+ ds_top64_merge, the 3x recipe's TOP_K); the twin's 16-candidate chains
+ differed on 21.6% of draft slots, acceptance +4% at 64
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/glm_dspark.cu  | 74 +++++++++++++++++++++++++++++++++
+ zig/src/families/glm/dflash.zig |  2 +-
+ zig/src/families/glm/dspark.zig | 30 +++++++------
+ 3 files changed, 92 insertions(+), 14 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_dspark.cu b/zig/kernels/cuda/glm_dspark.cu
+index 1b5e5a1..34d9f27 100644
+--- a/zig/kernels/cuda/glm_dspark.cu
++++ b/zig/kernels/cuda/glm_dspark.cu
+@@ -200,3 +200,77 @@ extern "C" __global__ void __launch_bounds__(256) ds_add(__nv_bfloat16* __restri
+ #pragma unroll
+   for (int j = 0; j < 4; ++j) x[r * n + c + j] = __float2bfloat16_rn(bf(x[r * n + c + j]) + bf(y[r * n + c + j]));
+ }
++
++// After glm_dflash.cu's df_top16_part / df_top16_merge (TensorFold), at 64 candidates.
++// A rank's 64 largest logits (DSpark's candidates, as the 3x recipe's TOP_K) a head row as global ids and fp32 values: per-chunk part, then merge; ties keep low id.
++namespace ds_top {
++constexpr int CHUNK_COLS = 4096;
++constexpr int TOP = 64;
++
++__device__ __forceinline__ bool better(float a, int ia, float b, int ib) { return a > b || (a == b && ia < ib); }
++
++// The block's best (value, index) of sv/si [n] (256 threads), the winner's slot cleared to -inf.
++__device__ void takeBest(float* sv, int* si, int n, float* rv, int* ri, float* outv, int* outi) {
++    float bv = -INFINITY;
++    int bi = 0x7fffffff, bs = -1;
++    for (int j = threadIdx.x; j < n; j += blockDim.x)
++        if (better(sv[j], si[j], bv, bi)) { bv = sv[j]; bi = si[j]; bs = j; }
++    for (int o = 16; o > 0; o >>= 1) {
++        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, bi, o), os = __shfl_xor_sync(0xffffffffu, bs, o);
++        if (better(ov, oi, bv, bi)) { bv = ov; bi = oi; bs = os; }
++    }
++    const int w = threadIdx.x >> 5;
++    if ((threadIdx.x & 31) == 0) { rv[w] = bv; ri[w] = bi; ri[8 + w] = bs; }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        int best = 0;
++        for (int k = 1; k < (int)(blockDim.x >> 5); ++k)
++            if (better(rv[k], ri[k], rv[best], ri[best])) best = k;
++        *outv = rv[best];
++        *outi = ri[best];
++        if (ri[8 + best] >= 0) sv[ri[8 + best]] = -INFINITY;
++    }
++    __syncthreads();
++}
++}  // namespace ds_top
++using namespace ds_top;
++
++extern "C" __global__ void __launch_bounds__(256) ds_top64_part(const __nv_bfloat16* __restrict__ logits, int cols, int offset,
++                                                                float* __restrict__ pv, int* __restrict__ pi) {
++    __shared__ float sv[CHUNK_COLS];
++    __shared__ int si[CHUNK_COLS];
++    __shared__ float rv[8];
++    __shared__ int ri[16];
++    const int r = blockIdx.x, c0 = blockIdx.y * CHUNK_COLS;
++    const int n = min(CHUNK_COLS, cols - c0);
++    for (int j = threadIdx.x; j < n; j += blockDim.x) {
++        sv[j] = bf(logits[(long long)r * cols + c0 + j]);
++        si[j] = offset + c0 + j;
++    }
++    __syncthreads();
++    const long long base = ((long long)r * gridDim.y + blockIdx.y) * TOP;
++    for (int t = 0; t < TOP; ++t) takeBest(sv, si, n, rv, ri, pv + base + t, pi + base + t);
++}
++
++extern "C" __global__ void __launch_bounds__(256) ds_top64_merge(const float* __restrict__ pv, const int* __restrict__ pi, int chunks,
++                                                                 int* __restrict__ out) {
++    __shared__ float sv[16 * TOP];
++    __shared__ int si[16 * TOP];
++    __shared__ float rv[8];
++    __shared__ int ri[16];
++    __shared__ float ov[TOP];
++    __shared__ int oi[TOP];
++    const int r = blockIdx.x, n = chunks * TOP;
++    for (int j = threadIdx.x; j < n; j += blockDim.x) {
++        sv[j] = pv[(long long)r * n + j];
++        si[j] = pi[(long long)r * n + j];
++    }
++    __syncthreads();
++    for (int t = 0; t < TOP; ++t) takeBest(sv, si, n, rv, ri, ov + t, oi + t);
++    if (threadIdx.x < TOP) {
++        out[r * 2 * TOP + threadIdx.x] = oi[threadIdx.x];
++        out[r * 2 * TOP + TOP + threadIdx.x] = __float_as_int(ov[threadIdx.x]);
++    }
++}
++
+diff --git a/zig/src/families/glm/dflash.zig b/zig/src/families/glm/dflash.zig
+index 92177c7..ab9032b 100644
+--- a/zig/src/families/glm/dflash.zig
++++ b/zig/src/families/glm/dflash.zig
+@@ -374,7 +374,7 @@ pub const Drafter = struct {
+             try dspark.pass(dr, e, S);
+             tm = try dr.mark(e, .{ tm, 2 });
+             if (rank0) {
+-                try block.download(dr, e, std.mem.sliceAsBytes(dr.cand[0..@import("dflash_candidates.zig").Layout.init(dr.world, M, CW).read]), dr.gtk);
++                try block.download(dr, e, std.mem.sliceAsBytes(dr.cand[0..@import("dflash_candidates.zig").Layout.init(dr.world, M, dspark.CW).read]), dr.gtk);
+                 try block.download(dr, e, std.mem.sliceAsBytes(sp.h_hn[0 .. M * dspark.D]), sp.hn);
+                 for (reqs, 0..) |q, i| dspark.select(dr, i, M, q);
+                 if (dr.log > dr.calls) for (reqs) |q| std.log.info("dspark round {d}: slot {d} pos {d} kept {d} anchor {d} drafts {any} chances {any}", .{ dr.calls, q.slot, q.pos, q.n, q.anchor, q.out.?[0 .. BLOCK - 1], if (q.probs) |p| p[0 .. BLOCK - 1] else &[_]f64{} });
+diff --git a/zig/src/families/glm/dspark.zig b/zig/src/families/glm/dspark.zig
+index 53cd695..ae0554c 100644
+--- a/zig/src/families/glm/dspark.zig
++++ b/zig/src/families/glm/dspark.zig
+@@ -44,6 +44,8 @@ pub const CH: usize = 16; // the window's 128-key chunks (glm_dspark.cu: ds_attn
+ pub const TAP_ROW: usize = AUX * D * 2;
+ pub const CTX: usize = df.MAX_CTX; // context rows one ingest takes (a prompt chunk's)
+ pub const DRAFTS: usize = df.BLOCK - 1; // slots 0..6: 7 drafts a pass (the lanes' max_held)
++pub const TOPK: usize = 64; // candidates a slot (the 3x recipe's TOP_K): each rank's 64 best, merged on rank 0
++pub const CW: usize = 2 * TOPK; // a row's gathered ints: 64 ids, then 64 values' bits
+ 
+ /// Device bytes a stream's context ring takes (K and V of every layer, WIN slots).
+ pub const ring_bytes: u64 = LAYERS * 2 * @as(u64, @intCast(df.WIN)) * HW * 2;
+@@ -55,6 +57,8 @@ pub const Kernels = struct {
+     attn_part: cuda.Function,
+     attn_merge: cuda.Function,
+     add: cuda.Function,
++    top64_part: cuda.Function,
++    top64_merge: cuda.Function,
+ 
+     pub fn load(m: cuda.Module) !Kernels {
+         var k: Kernels = undefined;
+@@ -263,7 +267,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     try carveCommon(dr, d, head.n);
+     dr.h_cpos = try gpa.alloc(i64, CTX);
+     dr.h_crings = try gpa.alloc(u64, CTX);
+-    dr.cand = try gpa.alloc(i32, @import("dflash_candidates.zig").Layout.init(world, df.MAX_M, df.CW).host);
++    dr.cand = try gpa.alloc(i32, @import("dflash_candidates.zig").Layout.init(world, df.MAX_M, CW).host);
+     if (std.c.getenv("TF_GLM_DFLASH2_LOG")) |v| dr.log = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
+     if (std.c.getenv("TF_GLM_DFLASH2_PROF") != null) dr.prof = io;
+     std.log.info("dspark: drafter from {s} (RedHatAI/GLM-5.3-speculator.dspark), linears at {d} bits, fc bf16, {d:.2} GiB weights + {d:.2} GiB scratch on the device", .{ dir, if (bits == 0) 16 else bits, @as(f64, @floatFromInt(l.at)) / (1 << 30), @as(f64, @floatFromInt(sp.scratch.len + dr.scratch.len)) / (1 << 30) });
+@@ -311,7 +315,7 @@ fn carveCommon(dr: *df.Drafter, d: *const cuda.Driver, head_n: usize) !void {
+         .{ "part", part },                   .{ "gs", C * (AUX * D / 64) * 4 }, .{ "cin", C * TAP_ROW },         .{ "taps_step", df.STEP_ROWS * TAP_ROW },
+         .{ "taps_prefill", C * TAP_ROW },    .{ "ids", M * 4 },                 .{ "bpos", M * 4 },              .{ "rings", df.MAX_S * 8 },
+         .{ "starts", df.MAX_S * 8 },         .{ "froms", df.MAX_S * 8 },        .{ "cpos", C * 8 },              .{ "crings", C * 8 },
+-        .{ "gtk", @import("dflash_candidates.zig").Layout.init(dr.world, M, df.CW).device * 4 }, .{ "pv", M * chunks * df.TOPK * 4 }, .{ "pi", M * chunks * df.TOPK * 4 },
++        .{ "gtk", @import("dflash_candidates.zig").Layout.init(dr.world, M, CW).device * 4 }, .{ "pv", M * chunks * TOPK * 4 }, .{ "pi", M * chunks * TOPK * 4 },
+     };
+     var at: u64 = 0;
+     inline for (fields) |f| {
+@@ -444,7 +448,7 @@ pub fn pass(dr: *df.Drafter, e: anytype, S: usize) !void {
+         }
+     }
+     const chunks = (cols + 4095) / 4096;
+-    const nw = M * df.CW;
++    const nw = M * CW;
+     {
+         var a: cuda.Args = .{};
+         a.add(sp.logits);
+@@ -452,13 +456,13 @@ pub fn pass(dr: *df.Drafter, e: anytype, S: usize) !void {
+         a.add(@as(i32, @intCast(e.share.vocab.lo)));
+         a.add(dr.pv);
+         a.add(dr.pi);
+-        try go(dr.k.top16_part, .{ .x = @intCast(M), .y = @intCast(chunks) }, 256, e, &a);
++        try go(sp.k.top64_part, .{ .x = @intCast(M), .y = @intCast(chunks) }, 256, e, &a);
+         var b: cuda.Args = .{};
+         b.add(dr.pv);
+         b.add(dr.pi);
+         b.add(@as(i32, @intCast(chunks)));
+         b.add(dr.gtk + e.share.rank * nw * 4);
+-        try go(dr.k.top16_merge, .{ .x = @intCast(M) }, 256, e, &b);
++        try go(sp.k.top64_merge, .{ .x = @intCast(M) }, 256, e, &b);
+     }
+     try gather(e, dr.gtk, nw * 4);
+ }
+@@ -479,19 +483,19 @@ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
+     _ = &alive;
+     for (0..DRAFTS) |t| {
+         const r = i * df.BLOCK + t;
+-        var c: [df.TOPK * 8]Cand = undefined;
++        var c: [TOPK * 8]Cand = undefined;
+         var n: usize = 0;
+         for (0..dr.world) |rk| {
+-            const blk = dr.cand[rk * M * df.CW + r * df.CW ..][0..df.CW];
+-            for (0..df.TOPK) |j| {
++            const blk = dr.cand[rk * M * CW + r * CW ..][0..CW];
++            for (0..TOPK) |j| {
+                 // a padded head row (ids past the vocabulary) is never a draft
+                 if (blk[j] < 0 or @as(usize, @intCast(blk[j])) >= sp.vocab or n == c.len) continue;
+-                c[n] = .{ .v = @bitCast(blk[df.TOPK + j]), .id = @intCast(blk[j]) };
++                c[n] = .{ .v = @bitCast(blk[TOPK + j]), .id = @intCast(blk[j]) };
+                 n += 1;
+             }
+         }
+         std.mem.sort(Cand, c[0..n], {}, better);
+-        n = @min(n, df.TOPK);
++        n = @min(n, TOPK);
+         // the Markov embedding of prev, in f64 (0125: bf16 rows kept, products in f64)
+         var emb: [RANK]f64 = undefined;
+         for (&emb, sp.w1[prev * RANK ..][0..RANK]) |*o, x| o.* = bf(x);
+@@ -554,16 +558,16 @@ test "GLM DSpark: the chain merges ranks' candidates by value then id, biases by
+     sp.conf_m[1] = 2;
+     const world: usize = 2;
+     const M: usize = df.BLOCK;
+-    const cand = try gpa.alloc(i32, world * M * df.CW);
++    const cand = try gpa.alloc(i32, world * M * CW);
+     defer gpa.free(cand);
+     @memset(cand, -1);
+     // every slot: rank 0 offers ids 1 (value 2.0) and 9 (1.0); rank 1 offers 3 (0.5) and 2 (2.0, ties 1: lower id wins)
+     for (0..M) |r| {
+         const put = struct {
+             fn f(c: []i32, rk: usize, row: usize, j: usize, id: i32, v: f32) void {
+-                const base = rk * M * df.CW + row * df.CW;
++                const base = rk * M * CW + row * CW;
+                 c[base + j] = id;
+-                c[base + df.TOPK + j] = @bitCast(v);
++                c[base + TOPK + j] = @bitCast(v);
+             }
+         }.f;
+         put(cand, 0, r, 0, 1, 2.0);
+-- 
+2.43.0
+

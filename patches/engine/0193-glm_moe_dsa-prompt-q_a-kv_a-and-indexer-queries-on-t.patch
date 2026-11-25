@@ -1,0 +1,770 @@
+From b704fd62be95014e48019a268a00cb8b18a11860 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 17:14:14 +0200
+Subject: [PATCH 193/194] glm_moe_dsa: prompt [q_a | kv_a] and indexer queries
+ on their row owners (TF_GLM_PROMPT_OWNER_PROJ, default off)
+
+The two-halves prompt path computed every row's replicated [q_a | kv_a] (2624 x 6144 block FP8) on every rank,
+right after the ffn exchange had summed each row on one owner. TF_GLM_PROMPT_OWNER_PROJ (a mask, read at each chunk
+through dsa_block.ownerPolicy):
+- 1 (fused): inside the ffn exchange, each row owner norms its summed residual rows with the next layer's input
+  norm and projects them (dsa_block.ownerRows), and the compact rows ride the residual all-gather in one NCCL group
+  (in place into a per-half room); the next mixer takes them as proj_done.
+- 2 (separate): the owners project from the main stream's normed rows after the exchange, then one all-gather on
+  the main stream (the simple form, to price the fusion).
+- 4 (qb): the indexer's wq_b only for the query rows this rank selects (sparse.splitRows, dsaSelect's own rule,
+  TF_GLM_INDEX_SPLIT); index keys are still written by every rank.
+The rooms sit in the gathered buffer past both halves' exchange spans (ownRoom; host test for every chunk length at
+TP3-TP8): no new memory. Layer 0, the KV-split path and whole (non-halves) chunks keep the replicated projection.
+
+Exact: qmmf's K slices come from the shape alone, so a row's sums do not depend on the call's row count.
+tf-cuda-test glm-owner-proj (real EXL3-K4 layers 6, 40, 41; R 4096/2048/1088/961/1984/1857/300; TP4 owners):
+105 byte comparisons equal ([q_a | kv_a] fused and separate, q_norm, kv_norm rows, split qb rows, DSA picks and
+counts), and a flipped byte and a one-row shift are caught at every shape. test-glm-owner-proj-host: switch parse,
+split rows, rooms.
+
+Idea: Codex's (OpenAI) analysis docs/gpt-sol-new.md section 5.1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/build/glm_family_host.zig           |   1 +
+ zig/src/families/glm/cuda.zig           |   1 +
+ zig/src/families/glm/cuda_dsa_block.zig |  70 +++++-
+ zig/src/families/glm/cuda_forward.zig   | 152 +++++++++++-
+ zig/src/families/glm/cuda_sparse.zig    |  29 ++-
+ zig/tests/cuda/glm_owner_proj.zig       | 300 ++++++++++++++++++++++++
+ zig/tests/cuda/main.zig                 |   3 +
+ 7 files changed, 541 insertions(+), 15 deletions(-)
+ create mode 100644 zig/tests/cuda/glm_owner_proj.zig
+
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 1e49369f5..87f67257f 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -9,6 +9,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     step.dependOn(&startup_run.step);
+     b.step("test-glm-tp3-host", "Uneven KDA head shares through actual projection and load planning, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM TP3:"} })).step);
+     b.step("test-glm-halves-host", "A prompt chunk's two halves and their exchange rooms (TF_GLM_DSA_HALVES), without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM halves room:"} })).step);
++    b.step("test-glm-owner-proj-host", "TF_GLM_PROMPT_OWNER_PROJ's switch, split rows and rooms, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM owner proj:"} })).step);
+     b.step("test-glm-exl3-host", "GLM EXL3 admission, mixed-width expert loading and scratch sizing, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM EXL3:"} })).step);
+     // TF_GLM_INDEX_CUDA: the launch rules, and (its own slower step) glm_index_*.cuh as host C++ against plain models
+     const index_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM index:"} }));
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index 40d0aa26a..6416a3995 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -11,6 +11,7 @@ pub const image = image_core.For(@import("core").picture);
+ pub const glue = @import("cuda_glue.zig");
+ pub const kda = @import("cuda_kda.zig");
+ pub const b16 = @import("cuda_b16.zig");
++pub const proj = @import("cuda_proj.zig");
+ pub const latent = @import("cuda_latent.zig");
+ pub const sparse = @import("cuda_sparse.zig");
+ pub const index = @import("cuda_index.zig");
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index 195c8612b..5b9959fcc 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -121,7 +121,13 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x:
+ 
+ /// `body` with s.dp's [q_a | kv_a] already in place when `proj_done` (fw.Forward.splitProj).
+ pub fn bodyPre(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize, o_site: ?@import("cuda_l2pf.zig").At, proj_done: bool) !void {
+-    try prepareProfile(k.set, stream, l, s, x, x_stride, rows, sparseRows(l, host_pos, rows), k.prof, proj_done);
++    return bodyRows(k, stream, l, c, s, x, x_stride, rows, pos, host_pos, nch, part_rows, o_site, proj_done, null);
++}
++
++/// `bodyPre` with the indexer's queries projected for rows `qi_rows` alone (TF_GLM_PROMPT_OWNER_PROJ's qb bit: the
++/// rows a split selection picks for on this rank, sparse.splitRows); null: every row, as bodyPre.
++pub fn bodyRows(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize, o_site: ?@import("cuda_l2pf.zig").At, proj_done: bool, qi_rows: ?[2]usize) !void {
++    try prepareRows(k.set, stream, l, s, x, x_stride, rows, sparseRows(l, host_pos, rows), k.prof, proj_done, qi_rows);
+     if (o_site) |at| try at.fork(stream);
+     try attend(k, stream, l, c, s, 0, rows, pos, host_pos, nch, part_rows);
+     const stamp = prof.span(k.prof, stream, .projections);
+@@ -141,6 +147,13 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
+ 
+ /// `proj_done`: s.dp already holds the rows' [q_a | kv_a] (a decode window's split projection, gathered).
+ pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool, profile: ?*prof.Prof, proj_done: bool) !void {
++    return prepareRows(set, stream, l, s, x, x_stride, rows, qi, profile, proj_done, null);
++}
++
++/// `prepareProfile` with the indexer's queries (s.qi) projected for rows `qi_rows` [lo, hi) alone (null: every row).
++/// The lane's sums for a row do not depend on the call's row count (qmmf.splitK, from the shape alone), so those
++/// rows' bytes are the whole call's; the other rows of s.qi are left as they were (a split selection reads only its own).
++pub fn prepareRows(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool, profile: ?*prof.Prof, proj_done: bool, qi_rows: ?[2]usize) !void {
+     var stamp = prof.span(profile, stream, .replicated_qakva);
+     const width = l.q_lora + l.rowW();
+     const ix = l.index;
+@@ -161,7 +174,60 @@ pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch,
+     if (!two_kw and has_ix) try projection.matmul(set, stream, ix.kw, x, x_stride, s.ikr, s.mm_part, rows, kw_n, l.dims, false);
+     if (ix.gate != 0) try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
+     try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk - l.rope, l.qk, l.lw, l.rowW());
+-    if (qi and !two_qb and has_ix) try projection.matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
++    if (qi and !two_qb and has_ix) {
++        const qr = qi_rows orelse [2]usize{ 0, rows };
++        if (qr[1] > qr[0]) try projection.matmul(set, stream, ix.qb, s.qr + qr[0] * l.q_lora * 2, l.q_lora, s.qi + qr[0] * ix.heads * ix.d * 2, s.mm_part, qr[1] - qr[0], ix.heads * ix.d, l.q_lora, false);
++    }
++}
++
++/// TF_GLM_PROMPT_OWNER_PROJ (default 0: off), a prompt chunk's replicated projections on their row owners, read
++/// at each chunk (the one place this switch is read; the request policy's bit 4 replaces it): a mask of 1, [q_a | kv_a] of the next
++/// layer's rows on each row owner inside the ffn exchange, gathered with the residual rows (one NCCL group);
++/// 2, the same projection on the owners after the exchange, gathered alone on the main stream (1 wins over 2);
++/// 4, the indexer's queries (ix.qb) only for the rows this rank selects (a split selection, TF_GLM_INDEX_SPLIT).
++/// Every switch leaves each row's bytes as the replicated path makes them (qmmf's sums do not depend on the row count).
++pub const Owner = struct { publish: Publish = .off, qb: bool = false };
++pub const Publish = enum { off, fused, separate };
++
++pub fn ownerPolicy() Owner {
++    return parseOwner(if (std.c.getenv("TF_GLM_PROMPT_OWNER_PROJ")) |e| std.mem.span(e) else null);
++}
++
++pub fn parseOwner(text: ?[]const u8) Owner {
++    const t = text orelse return .{};
++    const m = std.fmt.parseInt(u32, t, 10) catch return .{};
++    return .{ .publish = if (m & 1 != 0) .fused else if (m & 2 != 0) .separate else .off, .qb = m & 4 != 0 };
++}
++
++/// Whether a layer's [q_a | kv_a] can run on its row owners: a lane projection (block FP8 or MXFP8) whose calls hold
++/// no slice partials (the owner call runs on the exchange stream, beside the main stream's mm_part).
++pub fn ownerProjects(l: Layer) bool {
++    return switch (l.proj) {
++        .fp8g, .mxfp8 => true,
++        .bf16 => false,
++    };
++}
++
++/// The owner's share of a layer's [q_a | kv_a]: `n` rows of residual `h` (bf16 [n][dims], rows `h_stride` apart)
++/// normed by `norm` into `normed` (and `xs`), projected into `dp` ([n][q_lora + rowW] bf16): the replicated path's
++/// rmsnormBy and matmul on these rows alone. The lane's part buffer is never read (ownerProjects).
++pub fn ownerRows(set: glue.Set, stream: cuda.Stream, l: Layer, norm: glue.Norm, eps: f32, h: u64, h_stride: usize, normed: u64, xs: u64, dp: u64, n: usize) !void {
++    if (n == 0) return;
++    if (!ownerProjects(l)) return error.OwnerProj;
++    try glue.rmsnormBy(set, stream, h, h_stride, norm, normed, l.dims, xs, eps, n, l.dims);
++    try projection.matmul(set, stream, l.proj, normed, l.dims, dp, 0, n, l.q_lora + l.rowW(), l.dims, false);
++}
++
++test "GLM owner proj: TF_GLM_PROMPT_OWNER_PROJ is off unless set, a mask of fused (1), separate (2) and qb (4); fused wins" {
++    try std.testing.expectEqual(Owner{}, parseOwner(null));
++    try std.testing.expectEqual(Owner{}, parseOwner("0"));
++    try std.testing.expectEqual(Owner{}, parseOwner("on"));
++    try std.testing.expectEqual(Owner{ .publish = .fused }, parseOwner("1"));
++    try std.testing.expectEqual(Owner{ .publish = .separate }, parseOwner("2"));
++    try std.testing.expectEqual(Owner{ .publish = .fused }, parseOwner("3"));
++    try std.testing.expectEqual(Owner{ .qb = true }, parseOwner("4"));
++    try std.testing.expectEqual(Owner{ .publish = .fused, .qb = true }, parseOwner("5"));
++    try std.testing.expectEqual(Owner{ .publish = .separate, .qb = true }, parseOwner("6"));
+ }
+ 
+ /// The rows' roped query tails into their absorbed rows' top (glm_glue_latent.cuh's tf_glm_qa_rope), after the
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 965cfa3bd..2f970155c 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -680,7 +680,7 @@ pub const Forward = struct {
+         const stamp = prof_mod.span(f.prof, f.stream, .all_gather);
+         defer stamp.end();
+         const r = f.ranks[0];
+-        try f.scatterRows(f.stream, f.exchange.nccl.comm, r.b.gathered, r.b.gathered + r.w.share.world * r.b.rows * D * 4, r.b.hidden, R);
++        try f.scatterRows(f.stream, f.exchange.nccl.comm, r.b.gathered, r.b.gathered + r.w.share.world * r.b.rows * D * 4, r.b.hidden, R, null);
+     }
+ 
+     /// The room a reduce-scatter exchange of R rows takes from `part` (fp32 bytes): this rank's partial padded to
+@@ -689,8 +689,15 @@ pub const Forward = struct {
+         return scatterRoom(R, f.ranks[0].w.share.world, f.ranks[0].w.config.hidden);
+     }
+ 
++    /// TF_GLM_PROMPT_OWNER_PROJ=1: the next layer's [q_a | kv_a] of an ffn exchange's rows, made by each row owner
++    /// from its summed residual rows and gathered with them: layer `l`'s input norm `norm`, the rows' projections into
++    /// `dp` (world x per rows of q_lora + rowW, the owner's at rank x per), the owner's normed rows and sums at
++    /// `normed` and `xs` (per rows; the exchange stream's own, apart from the main stream's).
++    pub const OwnNext = struct { l: dsa_block.Layer, norm: glue.Norm, eps: f32, dp: u64, normed: u64, xs: u64 };
++
+     /// hidden[0..R) += every rank's partial at `part` (R rows, this rank's), on `stream` over `comm`; `end` bounds the room.
+-    fn scatterRows(f: *const Forward, stream: cuda.Stream, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, R: usize) !void {
++    /// With `own`, the owner's rows of the next layer's [q_a | kv_a] gathered in the same NCCL group as the residual rows.
++    fn scatterRows(f: *const Forward, stream: cuda.Stream, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, R: usize, own: ?OwnNext) !void {
+         const r = f.ranks[0];
+         const n = f.exchange.nccl;
+         const D = r.w.config.hidden;
+@@ -705,7 +712,16 @@ pub const Forward = struct {
+         const lo = @min(R, rank * per);
+         const mine = @min(R, lo + per) - lo;
+         if (mine > 0) try glue.residualAdd(f.set(), stream, hidden + lo * D * 2, rows_b16 + rank * per * D * 2, recv, mine, D, 1);
+-        try n.lib.check(n.lib.api.ncclAllGather(rows_b16 + rank * per * D * 2, rows_b16, per * D, .bf16, comm, stream.handle), "ncclAllGather");
++        if (own) |o| {
++            const w = o.l.q_lora + o.l.rowW();
++            try dsa_block.ownerRows(f.set(), stream, o.l, o.norm, o.eps, rows_b16 + rank * per * D * 2, D, o.normed, o.xs, o.dp + rank * per * w * 2, mine);
++            try n.lib.check(n.lib.api.ncclGroupStart(), "ncclGroupStart");
++            const ga = n.lib.check(n.lib.api.ncclAllGather(rows_b16 + rank * per * D * 2, rows_b16, per * D, .bf16, comm, stream.handle), "ncclAllGather");
++            const gb = n.lib.check(n.lib.api.ncclAllGather(o.dp + rank * per * w * 2, o.dp, per * w, .bf16, comm, stream.handle), "ncclAllGather");
++            try n.lib.check(n.lib.api.ncclGroupEnd(), "ncclGroupEnd"); // the group closes on every path
++            try ga;
++            try gb;
++        } else try n.lib.check(n.lib.api.ncclAllGather(rows_b16 + rank * per * D * 2, rows_b16, per * D, .bf16, comm, stream.handle), "ncclAllGather");
+         try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(hidden, rows_b16, R * D * 2, stream.handle), "cuMemcpyDtoDAsync");
+     }
+ 
+@@ -761,6 +777,7 @@ pub const Forward = struct {
+         // the second half's token lists after the first's (the shared layers reuse each half's own)
+         dsa[1].tokens += RA * sparse.dsa_width * 4;
+         dsa[1].counts += RA * 4;
++        var ow = OwnHalves.init(f, R);
+         var di: usize = 0;
+         for (r.w.layers, 0..) |l, j| {
+             prof_mod.context(f.prof, j, null, .mixer);
+@@ -770,9 +787,13 @@ pub const Forward = struct {
+                 if (j > 0) try f.stream.wait(p.gathered[h]); // this half's ffn exchange of the layer before
+                 try glue.rmsnormBy(f.set(), f.stream, hidden[h], D, l.in_norm, normed[h], D, xs[h], c.eps, rows[h], D);
+                 const nch = @min(latent.chunksFor(st.pos + lo[h] + rows[h]), b.nch);
+-                try dsa_block.body(k, f.stream, a, st.caches[di], dsa[h], normed[h], D, rows[h], pos_dev[h], st.pos + lo[h], nch, b.part_rows, null);
++                const done = try ow.mixer(j, h, a, normed[h], rows[h]);
++                var sh = dsa[h];
++                if (done) sh.dp = ow.dp[h];
++                const qi_rows = if (ow.pol.qb and a.rope != 0) sparse.splitRows(k.split, rows[h]) else null;
++                try dsa_block.bodyRows(k, f.stream, a, st.caches[di], sh, normed[h], D, rows[h], pos_dev[h], st.pos + lo[h], nch, b.part_rows, null, done, qi_rows);
+                 try dsa_block.fill(f.set(), f.stream, a, dsa[h], 0, rows[h], part[h]);
+-                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h], null);
++                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h], null, null);
+             }
+             prof_mod.context(f.prof, j, null, .ffn);
+             if (l.ffn == .moe and l.ffn.moe.exl3 != null and wholeExperts()) { // (EXL3) the routed experts once over both halves (every expert's weights read once)
+@@ -785,11 +806,11 @@ pub const Forward = struct {
+                 try glue.rmsnormBy(f.set(), f.stream, hidden[1], D, l.post_norm, normed[1], D, xs[1], c.eps, rows[1], D);
+                 try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, D, R, true);
+                 try moe.combineRows(f.moeKernels(), f.stream, m, b.moe, 0, rows[0], part[0]);
+-                try f.sideExchange(p, 0, side_comm, part[0], part[0] + span_bytes, hidden[0], rows[0], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[0] } else null);
++                try f.sideExchange(p, 0, side_comm, part[0], part[0] + span_bytes, hidden[0], rows[0], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[0] } else null, ow.next(j, 0));
+                 // half 1's shared expert and sum under half 0's exchange
+                 try moe.sharedSlot(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[1], R);
+                 try moe.combineRows(f.moeKernels(), f.stream, m, b.moe, lo[1], R, part[1]);
+-                try f.sideExchange(p, 1, side_comm, part[1], part[1] + span_bytes, hidden[1], rows[1], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[1] } else null);
++                try f.sideExchange(p, 1, side_comm, part[1], part[1] + span_bytes, hidden[1], rows[1], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[1] } else null, ow.next(j, 1));
+                 di += 1;
+                 continue;
+             }
+@@ -806,7 +827,7 @@ pub const Forward = struct {
+                         try moe.fill(f.moeKernels(), f.stream, m, b.moe, normed[h], D, 0, rows[h], true, part[h]);
+                     },
+                 }
+-                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[h] } else null);
++                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[h] } else null, ow.next(j, h));
+             }
+             di += 1;
+         }
+@@ -817,10 +838,10 @@ pub const Forward = struct {
+     /// A layer's ffn exchange taps its half's finished residual rows on the side stream before `gathered` (DSpark).
+     const HalfTap = struct { t: taps_mod.Taps, j: usize, x: u64, lo: usize };
+ 
+-    fn sideExchange(f: *const Forward, p: *const Pieces, h: usize, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, rows: usize, tap: ?HalfTap) !void {
++    fn sideExchange(f: *const Forward, p: *const Pieces, h: usize, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, rows: usize, tap: ?HalfTap, own: ?OwnNext) !void {
+         try p.filled[h].record(f.stream);
+         try p.side.wait(p.filled[h]);
+-        try f.scatterRows(p.side, comm, part, end, hidden, rows);
++        try f.scatterRows(p.side, comm, part, end, hidden, rows, own);
+         // the half's rows of the layer, gathered whole in hidden on this stream: the next layer's exchange of this half
+         // (the only writer of these rows) follows on the same stream, and the chunk's end waits for `gathered`
+         if (tap) |q| try q.t.at(p.side, q.j, q.x, q.lo, rows);
+@@ -979,6 +1000,117 @@ pub const Forward = struct {
+     }
+ };
+ 
++/// TF_GLM_PROMPT_OWNER_PROJ's rooms in wholeDsaHalves, past the halves' two exchange spans of the gathered room
++/// (fixed scratch the prompt path already holds: no new allocation): each half's [q_a | kv_a] rows (world x per rows
++/// of `wq`), and the exchange stream's normed rows and their sums for one owner's per rows. Byte offsets from the
++/// room's start; null when they do not fit before the second half's position (room - 256): the replicated path.
++pub const OwnRoom = struct { dp: [2]usize, normed: usize, xs: usize, end: usize };
++
++pub fn ownRoom(R: usize, cap: usize, world: usize, D: usize, wq: usize) ?OwnRoom {
++    const RA = halfRows(R)[0];
++    const per = (RA + world - 1) / world; // the longer half's (the second is never longer: halfRows)
++    const span = std.mem.alignForward(usize, scatterRoom(RA, world, D), 256);
++    const dp_bytes = std.mem.alignForward(usize, per * world * wq * 2, 256);
++    const at = 2 * span;
++    const normed = at + 2 * dp_bytes;
++    const xs = normed + std.mem.alignForward(usize, per * D * 2, 256);
++    const end = xs + std.mem.alignForward(usize, per * (D / 64) * 4, 256);
++    if (end + 256 > world * cap * D * 4) return null;
++    return .{ .dp = .{ at, at + dp_bytes }, .normed = normed, .xs = xs, .end = end };
++}
++
++/// wholeDsaHalves' owner projections (TF_GLM_PROMPT_OWNER_PROJ): `ready[h]`, half h's dp[h] holds the next mixer's
++/// [q_a | kv_a], published by the ffn exchange before it (fused) or gathered at the mixer (separate).
++const OwnHalves = struct {
++    f: *const Forward,
++    pol: dsa_block.Owner,
++    on: bool = false,
++    dp: [2]u64 = .{ 0, 0 },
++    normed: u64 = 0,
++    xs: u64 = 0,
++    ready: [2]bool = .{ false, false },
++
++    fn init(f: *const Forward, R: usize) OwnHalves {
++        const pol = dsa_block.ownerPolicy();
++        var o: OwnHalves = .{ .f = f, .pol = pol };
++        if (pol.publish == .off) return o;
++        const r = f.ranks[0];
++        const c = &r.w.config;
++        const room = ownRoom(R, r.b.rows, r.w.share.world, c.hidden, c.q_lora + c.kv_lora + c.rope) orelse return o;
++        o.dp = .{ r.b.gathered + room.dp[0], r.b.gathered + room.dp[1] };
++        o.normed = r.b.gathered + room.normed;
++        o.xs = r.b.gathered + room.xs;
++        o.on = true;
++        return o;
++    }
++
++    /// The ffn exchange of layer j's half h: the next layer's projection to make on the owners (fused), or null.
++    fn next(o: *OwnHalves, j: usize, h: usize) ?Forward.OwnNext {
++        o.ready[h] = false;
++        if (!o.on or o.pol.publish != .fused) return null;
++        const layers = o.f.ranks[0].w.layers;
++        if (j + 1 >= layers.len) return null;
++        const nl = layers[j + 1];
++        const a = switch (nl.mixer) {
++            .mla => |a| a,
++            .kda => return null,
++        };
++        if (!dsa_block.ownerProjects(a) or a.q_lora + a.rowW() != o.f.ranks[0].w.config.q_lora + o.f.ranks[0].w.config.kv_lora + o.f.ranks[0].w.config.rope) return null;
++        o.ready[h] = true;
++        return .{ .l = a, .norm = nl.in_norm, .eps = o.f.ranks[0].w.config.eps, .dp = o.dp[h], .normed = o.normed, .xs = o.xs };
++    }
++
++    /// Layer j's mixer of half h (its rows normed at `normed`): whether dp[h] holds their [q_a | kv_a] now. Separate:
++    /// this rank's rows projected from the normed rows and gathered on the main stream.
++    fn mixer(o: *OwnHalves, j: usize, h: usize, a: dsa_block.Layer, normed: u64, rows: usize) !bool {
++        _ = j;
++        if (!o.on) return false;
++        switch (o.pol.publish) {
++            .off => return false,
++            .fused => {
++                const was = o.ready[h];
++                o.ready[h] = false;
++                return was;
++            },
++            .separate => {
++                const f = o.f;
++                const r = f.ranks[0];
++                const c = &r.w.config;
++                if (!dsa_block.ownerProjects(a) or a.q_lora + a.rowW() != c.q_lora + c.kv_lora + c.rope) return false;
++                const n = f.exchange.nccl;
++                const world = r.w.share.world;
++                const rank = r.w.share.rank;
++                const w = a.q_lora + a.rowW();
++                const per = (rows + world - 1) / world;
++                const lo = @min(rows, rank * per);
++                const mine = @min(rows, lo + per) - lo;
++                if (mine > 0) try projection.matmul(f.set(), f.stream, a.proj, normed + lo * c.hidden * 2, c.hidden, o.dp[h] + rank * per * w * 2, 0, mine, w, a.dims, false);
++                try n.lib.check(n.lib.api.ncclAllGather(o.dp[h] + rank * per * w * 2, o.dp[h], per * w, .bf16, n.comm, f.stream.handle), "ncclAllGather");
++                return true;
++            },
++        }
++    }
++};
++
++test "GLM owner proj: the owner projections' rooms fit past both exchange spans for every TP4 chunk (and TP3-TP8)" {
++    for (3..9) |world| for (2048..prefill_rows + 1) |R| {
++        const room = ownRoom(R, prefill_rows, world, 6144, 2048 + 512 + 64) orelse {
++            std.debug.print("GLM halves room: R {d} at world {d}: no owner projection room\n", .{ R, world });
++            return error.TestUnexpectedResult;
++        };
++        const span = std.mem.alignForward(usize, scatterRoom(halfRows(R)[0], world, 6144), 256);
++        try std.testing.expect(room.dp[0] >= 2 * span); // past the second half's exchange span
++        const rows = halfRows(R);
++        for (0..2) |h| { // each half's gathered rows (world x its per) inside its own dp room
++            const per = (rows[h] + world - 1) / world;
++            try std.testing.expect(room.dp[h] + per * world * 2624 * 2 <= if (h == 0) room.dp[1] else room.normed);
++        }
++        try std.testing.expect(room.end + 256 <= world * prefill_rows * 6144 * 4); // clear of the second half's position
++    };
++    // a room too small for them: null (the replicated path)
++    try std.testing.expectEqual(@as(?OwnRoom, null), ownRoom(4096, 2048, 4, 6144, 2624));
++}
++
+ test "GLM halves room: every prompt chunk's two halves fit their exchange rooms (TP3-TP8, GLM-5.3's D 6144)" {
+     for (3..9) |world| for (2048..prefill_rows + 1) |R| {
+         const rows = halfRows(R);
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index c50212f6d..86f5df7ea 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -159,10 +159,11 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+     const b = @min(rows, select_rows);
+     const loop: usize = if (rows >= score_loop_from) score_loop else 1;
+     const add = try ops.function("tf_glm_add_i32");
+-    const split: ?Split = if (split_in) |x| (if (x.world > 1 and rows >= 64 * x.world) x else null) else null;
++    const split: ?Split = if (split_in) |x| (if (splitRows(x, rows) != null) x else null) else null;
+     const per = if (split) |x| cdiv(rows, x.world) else rows;
+-    const lo = if (split) |x| @min(rows, x.rank * per) else 0;
+-    const hi = @min(rows, lo + per);
++    const own = splitRows(split, rows) orelse [2]usize{ 0, rows };
++    const lo = own[0];
++    const hi = own[1];
+     var a: usize = lo;
+     while (a < hi) : (a += b) {
+         const n = @min(b, hi - a);
+@@ -313,6 +314,28 @@ pub const Scratch = struct { scores: u64, ls: u64, li: u64, pools: u64, at: u64,
+ /// A prompt chunk's indexer rows split across the ranks (TF_GLM_INDEX_SPLIT): a block each, the picks all-gathered.
+ pub const Split = struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize };
+ 
++/// The rows [lo, hi) of a pass's `rows` this rank selects for under `split` (dsaSelect's rule: two ranks or more and
++/// 64 rows a rank); null when the pass does not split (every rank picks every row).
++pub fn splitRows(split: ?Split, rows: usize) ?[2]usize {
++    const x = split orelse return null;
++    if (x.world <= 1 or rows < 64 * x.world) return null;
++    const per = cdiv(rows, x.world);
++    const lo = @min(rows, x.rank * per);
++    return .{ lo, @min(rows, lo + per) };
++}
++
++test "GLM owner proj: a split selection's rows: dsaSelect's blocks of ceil(rows / world), none below 64 rows a rank" {
++    var s: Split = .{ .lib = undefined, .comm = null, .rank = 0, .world = 4 };
++    try std.testing.expectEqual(@as(?[2]usize, null), splitRows(null, 2048));
++    try std.testing.expectEqual(@as(?[2]usize, null), splitRows(s, 255));
++    try std.testing.expectEqual(@as(?[2]usize, .{ 0, 512 }), splitRows(s, 2048));
++    s.rank = 3;
++    try std.testing.expectEqual(@as(?[2]usize, .{ 1536, 2048 }), splitRows(s, 2048));
++    try std.testing.expectEqual(@as(?[2]usize, .{ 723, 961 }), splitRows(s, 961));
++    s.world = 1;
++    try std.testing.expectEqual(@as(?[2]usize, null), splitRows(s, 4096));
++}
++
+ /// Whether rank 0 splits a prompt chunk's indexer rows at `start`: from `from` on (0: never), over two ranks or more.
+ pub fn splitAt(start: usize, from: usize, world: usize) bool {
+     return from > 0 and world > 1 and start >= from;
+diff --git a/zig/tests/cuda/glm_owner_proj.zig b/zig/tests/cuda/glm_owner_proj.zig
+new file mode 100644
+index 000000000..c79b5cf60
+--- /dev/null
++++ b/zig/tests/cuda/glm_owner_proj.zig
+@@ -0,0 +1,300 @@
++//! `glm-owner-proj <ckpt> <layers> [reps]`: TF_GLM_PROMPT_OWNER_PROJ's rows against the replicated prompt path's, byte
++//! for byte, on a checkpoint's own block-FP8 [q_a | kv_a] and indexer wq_b (packed as the loader packs them).
++//! Each TP4 rank's owner rows (dsa_block.ownerRows from its summed residual rows: the fused publish; projection.matmul
++//! from the normed rows: the separate gather) land where the in-place all-gather puts them, and must equal the
++//! replicated call's rows; then the q/kv norms over them, the indexer's queries of each rank's split rows, and the
++//! DSA picks (sparse.dsaSelect) over those queries. Two controls show the comparison catches a changed byte and a
++//! shifted row. With reps > 0, the GEMMs' times at the full and quarter row counts (warm and with L2 flushed).
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const glm = @import("glm_cuda");
++const check = @import("check.zig");
++const reference = @import("quant_ref_tests.zig");
++const Rig = reference.RigT;
++const fp8pb = glm.weights.formats.fp8pb;
++const dsa_block = glm.dsa_block;
++const sparse = glm.sparse;
++const proj = glm.proj;
++
++const world = 4;
++
++/// The replicated path's halves and whole chunks at TP4: a full chunk (4096), its halves (2048), the halves of a
++/// 2049-row tail (1088 / 961: the owners' quarters straddle the lane's fused-rows threshold of 256), of 3841 (1984 /
++/// 1857) and a short chunk (300: quarters of 75 rows, the cluster tiles).
++const shapes = [_]usize{ 4096, 2048, 1088, 961, 1984, 1857, 300 };
++
++fn lane(r: *Rig, ck: *core.Checkpoint, mods: []const []const u8) !cuda.qmmf.Weight {
++    var stored: [2]fp8pb.Fp8pb = undefined;
++    var shares: [2]fp8pb.Share = undefined;
++    for (mods, 0..) |m, j| {
++        stored[j] = try fp8pb.Fp8pb.read(r.a, ck, m);
++        shares[j] = .{ .p = &stored[j], .lo = 0, .hi = stored[j].n, .klo = 0, .khi = stored[j].k };
++    }
++    const z = try fp8pb.sizes(shares[0..mods.len]);
++    const codes = try r.a.alloc(u8, z.codes);
++    const tiles = try r.a.alloc(f32, z.scales);
++    try fp8pb.pack(r.a, shares[0..mods.len], codes, tiles); // cuda_formats.fp8g's packing
++    return cuda.fp8.weight(try r.dev(codes), try r.dev(std.mem.sliceAsBytes(tiles)), z.n, z.k);
++}
++
++fn tensor(r: *Rig, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype) !u64 {
++    var buf: [160]u8 = undefined;
++    return r.dev((try ck.get(try std.fmt.bufPrint(&buf, fmt, args))).bytes);
++}
++
++fn owners(R: usize, rank: usize) [3]usize {
++    const per = (R + world - 1) / world;
++    const lo = @min(R, rank * per);
++    return .{ per, lo, @min(R, lo + per) - lo };
++}
++
++pub fn run(gpu: check.Gpu, dir: []const u8, layers_s: []const u8, reps_s: ?[]const u8) !void {
++    const reps = if (reps_s) |v| try std.fmt.parseInt(usize, v, 10) else 0;
++    var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, try std.fs.path.join(a, &.{ dir, "config.json" }), a, .limited(1 << 24));
++    const c = try glm.config.parse(gpu.gpa, text);
++    var ck = try core.Checkpoint.openModel(gpu.gpa, gpu.io, dir);
++    defer ck.close();
++    var s = try cuda.Stream.init(gpu.d, false);
++    defer s.deinit();
++    var prng = std.Random.DefaultPrng.init(0x0e_a3e5);
++    var r: Rig = .{ .gpu = gpu, .a = a, .s = s, .rng = prng.random() };
++    defer {
++        cuda.completion.drain(gpu.d, s, "owner projection buffers released before completion");
++        for (r.bufs.items) |*b| b.free();
++        r.bufs.deinit(gpu.gpa);
++    }
++    var ln = try cuda.qmmf.Lane.load(gpu.d, (try gpu.ctx.capability()) / 10);
++    defer ln.unload();
++    var glue_mod = try cuda.Module.load(gpu.d, cuda.kernels.glm_glue);
++    defer glue_mod.unload();
++    var ops = try cuda.Module.load(gpu.d, cuda.kernels.glm_ops);
++    defer ops.unload();
++    const ks = try glm.glue.Kernels.load(glue_mod);
++    const set: glm.glue.Set = .{ .glue = &ks, .prompt = true, .linear = .{ .lane = &ln } };
++
++    const D: usize = c.hidden;
++    const W: usize = c.q_lora + c.kv_lora + c.rope;
++    const QI: usize = c.i_heads * c.i_dim;
++    const Rmax = shapes[0];
++    // the rope frequencies dsa_scores reads (theta^(-2i / 64))
++    var inv: [32]f32 = undefined;
++    for (&inv, 0..) |*v, i| v.* = @floatCast(std.math.pow(f64, 1e6, -@as(f64, @floatFromInt(2 * i)) / 64.0));
++    const d_inv = try r.dev(std.mem.sliceAsBytes(&inv));
++
++    var compared: usize = 0;
++    var it = std.mem.splitScalar(u8, layers_s, ',');
++    while (it.next()) |ls| {
++        const li = try std.fmt.parseInt(u32, ls, 10);
++        var nb: [2][96]u8 = undefined;
++        const mods = [_][]const u8{ try std.fmt.bufPrint(&nb[0], "model.layers.{d}.self_attn.q_a_proj", .{li}), try std.fmt.bufPrint(&nb[1], "model.layers.{d}.self_attn.kv_a_proj_with_mqa", .{li}) };
++        const wq = try lane(&r, &ck, &mods);
++        var qb_buf: [96]u8 = undefined;
++        const qb_name = try std.fmt.bufPrint(&qb_buf, "model.layers.{d}.self_attn.indexer.wq_b", .{li});
++        var qb_w: ?cuda.qmmf.Weight = null;
++        var wtest: [128]u8 = undefined;
++        if (ck.has(try std.fmt.bufPrint(&wtest, "{s}.weight", .{qb_name}))) qb_w = try lane(&r, &ck, &.{qb_name});
++        const in_norm: glm.glue.Norm = .{ .bf16 = try tensor(&r, &ck, "model.layers.{d}.input_layernorm.weight", .{li}) };
++        const q_norm = try tensor(&r, &ck, "model.layers.{d}.self_attn.q_a_layernorm.weight", .{li});
++        const kv_norm = try tensor(&r, &ck, "model.layers.{d}.self_attn.kv_a_layernorm.weight", .{li});
++        const none: glm.proj.Proj = .{ .bf16 = 0 };
++        const l: dsa_block.Layer = .{
++            .proj = .{ .fp8g = wq },
++            .q_norm = q_norm,
++            .kv_norm = kv_norm,
++            .q_b = none,
++            .wk = 0,
++            .wv = 0,
++            .o = none,
++            .index = .{ .kw = none, .gate = 0, .ln_w = 0, .ln_b = 0, .ape = 0, .qb = none, .heads = c.i_heads, .d = c.i_dim },
++            .heads = 0,
++            .qk = 0,
++            .dv = 0,
++            .lw = c.kv_lora,
++            .q_lora = c.q_lora,
++            .dims = D,
++            .eps = c.eps,
++            .dense_limit = 0,
++            .rope = c.rope,
++        };
++        try check.expect(dsa_block.ownerProjects(l) and wq.n == W and wq.k == D, "glm-owner-proj: layer {d}'s [q_a | kv_a] is not a {d} x {d} lane weight", .{ li, W, D });
++
++        // the residual rows (as the ffn exchange leaves them in every rank's hidden) and the replicated path's buffers
++        const hidden = try r.dev(std.mem.sliceAsBytes(try r.bfs(Rmax * D, 2.0)));
++        const normed = try r.zeros(Rmax * D * 2);
++        const xs = try r.zeros(Rmax * (D / 64) * 4);
++        const dp = try r.zeros(Rmax * W * 2);
++        const qr = try r.zeros(Rmax * c.q_lora * 2);
++        const xs_qr = try r.zeros(Rmax * (c.q_lora / 64) * 4);
++        const lat = try r.zeros(Rmax * W * 2);
++        const xs_lat = try r.zeros(Rmax * (c.kv_lora / 64) * 4);
++        const qi = try r.zeros(Rmax * QI * 2);
++        // the owners' (rank-major rows: the in-place all-gather's layout) and the exchange stream's scratch
++        const dp_own = try r.zeros((Rmax + world) * W * 2);
++        const dp_sep = try r.zeros((Rmax + world) * W * 2);
++        const qr_own = try r.zeros(Rmax * c.q_lora * 2);
++        const lat_own = try r.zeros(Rmax * W * 2);
++        const qi_own = try r.zeros(Rmax * QI * 2);
++        const o_normed = try r.zeros(Rmax * D * 2);
++        const o_xs = try r.zeros(Rmax * (D / 64) * 4);
++
++        for (shapes) |R| {
++            // the replicated path (dsa_block.prepareRows' first part, wholeDsaHalves' norm before it)
++            try glm.glue.rmsnormBy(set, s, hidden, D, in_norm, normed, D, xs, c.eps, R, D);
++            try proj.matmul(set, s, l.proj, normed, D, dp, 0, R, W, D, false);
++            try glm.glue.rmsnorm(set, s, dp, W, q_norm, qr, c.q_lora, xs_qr, c.eps, R, c.q_lora);
++            try glm.glue.rmsnorm(set, s, dp + c.q_lora * 2, W, kv_norm, lat, W, xs_lat, c.eps, R, c.kv_lora);
++            // each rank's owner rows, where the in-place all-gather puts them (rank x per)
++            for (0..world) |rank| {
++                const o = owners(R, rank);
++                try dsa_block.ownerRows(set, s, l, in_norm, c.eps, hidden + o[1] * D * 2, D, o_normed, o_xs, dp_own + rank * o[0] * W * 2, o[2]);
++                if (o[2] > 0) try proj.matmul(set, s, l.proj, normed + o[1] * D * 2, D, dp_sep + rank * o[0] * W * 2, 0, o[2], W, D, false);
++            }
++            try glm.glue.rmsnorm(set, s, dp_own, W, q_norm, qr_own, c.q_lora, xs_qr, c.eps, R, c.q_lora);
++            try glm.glue.rmsnorm(set, s, dp_own + c.q_lora * 2, W, kv_norm, lat_own, W, xs_lat, c.eps, R, c.kv_lora);
++            const want = try r.back(dp, R * W * 2);
++            var label: [128]u8 = undefined;
++            try check.sameBytes(try std.fmt.bufPrint(&label, "layer {d} R {d}: fused owners' [q_a | kv_a] rows", .{ li, R }), try r.back(dp_own, R * W * 2), want);
++            try check.sameBytes(try std.fmt.bufPrint(&label, "layer {d} R {d}: separate owners' [q_a | kv_a] rows", .{ li, R }), try r.back(dp_sep, R * W * 2), want);
++            try check.sameBytes(try std.fmt.bufPrint(&label, "layer {d} R {d}: q_norm rows", .{ li, R }), try r.back(qr_own, R * c.q_lora * 2), try r.back(qr, R * c.q_lora * 2));
++            try check.sameBytes(try std.fmt.bufPrint(&label, "layer {d} R {d}: kv_norm rows", .{ li, R }), try r.back(lat_own, R * W * 2), try r.back(lat, R * W * 2));
++            compared += 4;
++
++            // controls: one changed byte, and an owner whose rows start one row late, must both be caught
++            {
++                const bad = try r.a.dupe(u8, try r.back(dp_own, R * W * 2));
++                bad[bad.len / 2] ^= 0x01;
++                if (check.sameBytes("control: one byte changed (expected FAIL line)", bad, want)) |_| return error.ControlNotCaught else |_| {}
++                const o = owners(R, 1);
++                try dsa_block.ownerRows(set, s, l, in_norm, c.eps, hidden + (o[1] + 1) * D * 2, D, o_normed, o_xs, dp_own + o[0] * W * 2, o[2]);
++                if (check.sameBytes("control: rank 1's rows one late (expected FAIL line)", try r.back(dp_own, R * W * 2), want)) |_| return error.ControlNotCaught else |_| {}
++            }
++
++            const qbw = qb_w orelse continue;
++            // the indexer's queries: the replicated call, then each rank's split rows alone (dsa_block.prepareRows)
++            try proj.matmul(set, s, .{ .fp8g = qbw }, qr, c.q_lora, qi, 0, R, QI, c.q_lora, false);
++            var any = false;
++            for (0..world) |rank| {
++                const sp: sparse.Split = .{ .lib = undefined, .comm = null, .rank = rank, .world = world };
++                const qr_rows = sparse.splitRows(sp, R) orelse break;
++                any = true;
++                if (qr_rows[1] > qr_rows[0]) try proj.matmul(set, s, .{ .fp8g = qbw }, qr + qr_rows[0] * c.q_lora * 2, c.q_lora, qi_own + qr_rows[0] * QI * 2, 0, qr_rows[1] - qr_rows[0], QI, c.q_lora, false);
++            }
++            if (!any) continue; // under 64 rows a rank: every rank selects every row (the replicated qb stays)
++            try check.sameBytes(try std.fmt.bufPrint(&label, "layer {d} R {d}: indexer query rows of each rank's split", .{ li, R }), try r.back(qi_own, R * QI * 2), try r.back(qi, R * QI * 2));
++            compared += 1;
++            // the picks over those queries: random index keys and head weights, a chunk at position 4096
++            const host_pos: usize = 4096;
++            const np = host_pos + R;
++            const ik = try r.dev(std.mem.sliceAsBytes(try r.bfs(np * c.i_dim, 1.0)));
++            const ikr = try r.dev(std.mem.sliceAsBytes(try r.bfs(R * (c.i_dim + c.i_heads), 1.0)));
++            const pos = try r.dev(std.mem.asBytes(&@as(i32, @intCast(host_pos))));
++            const sel: sparse.Scratch = .{ .scores = try r.zeros(sparse.select_rows * np * 4), .ls = 0, .li = 0, .pools = 0, .at = try r.zeros(16) };
++            var picks: [2][2][]u8 = undefined;
++            for ([_]u64{ qi, qi_own }, 0..) |q, v| {
++                const tokens = try r.zeros(R * sparse.dsa_width * 4);
++                const counts = try r.zeros(R * 4);
++                try sparse.dsaSelect(set, ops, s, q, ikr + c.i_dim * 2, d_inv, ik, pos, host_pos, R, c.i_heads, c.i_dim, sel, tokens, counts, null, null);
++                picks[v] = .{ try r.back(tokens, R * sparse.dsa_width * 4), try r.back(counts, R * 4) };
++            }
++            try check.sameBytes(try std.fmt.bufPrint(&label, "layer {d} R {d}: DSA picks", .{ li, R }), picks[1][0], picks[0][0]);
++            try check.sameBytes(try std.fmt.bufPrint(&label, "layer {d} R {d}: DSA pick counts", .{ li, R }), picks[1][1], picks[0][1]);
++            compared += 2;
++        }
++        check.pass("glm-owner-proj: layer {d}: [q_a | kv_a] {d} x {d}, indexer qb {s}: owner rows equal the replicated rows at R {any}", .{ li, W, D, if (qb_w != null) "yes" else "none (shared layer)", shapes });
++        if (reps > 0) try bench(&r, set, l, qb_w, in_norm, c, hidden, normed, xs, dp, qr, qi, o_normed, o_xs, reps);
++    }
++    check.pass("glm-owner-proj: {d} byte comparisons equal, 2 controls per shape caught", .{compared});
++}
++
++const Timed = struct { warm: f64, cold: f64 };
++
++/// Mean ms of `call` over `reps` runs, back to back (warm) and with a 96 MiB write between runs (L2 flushed).
++fn timed(r: *Rig, reps: usize, flush: u64, ctx: anytype, comptime call: fn (@TypeOf(ctx)) anyerror!void) !Timed {
++    var e0 = try cuda.Event.init(r.gpu.d, true);
++    defer e0.deinit();
++    var e1 = try cuda.Event.init(r.gpu.d, true);
++    defer e1.deinit();
++    try call(ctx);
++    try e0.record(r.s);
++    for (0..reps) |_| try call(ctx);
++    try e1.record(r.s);
++    try e1.synchronize();
++    const warm = @as(f64, try cuda.Event.elapsedMs(e0, e1)) / @as(f64, @floatFromInt(reps));
++    var cold: f64 = 0;
++    for (0..reps) |_| {
++        const fb: cuda.DeviceBuffer = .{ .d = r.gpu.d, .ptr = flush, .len = 96 << 20 };
++        try fb.fill8(0x5a, r.s.handle);
++        try e0.record(r.s);
++        try call(ctx);
++        try e1.record(r.s);
++        try e1.synchronize();
++        cold += try cuda.Event.elapsedMs(e0, e1);
++    }
++    return .{ .warm = warm, .cold = cold / @as(f64, @floatFromInt(reps)) };
++}
++
++fn bench(r: *Rig, set: glm.glue.Set, l: dsa_block.Layer, qb_w: ?cuda.qmmf.Weight, in_norm: glm.glue.Norm, c: glm.config.Config, hidden: u64, normed: u64, xs: u64, dp: u64, qr: u64, qi: u64, o_normed: u64, o_xs: u64, reps: usize) !void {
++    const D: usize = c.hidden;
++    const W: usize = c.q_lora + c.kv_lora + c.rope;
++    const QI: usize = c.i_heads * c.i_dim;
++    const flush = try r.zeros(96 << 20);
++    const Mm = struct {
++        set: glm.glue.Set,
++        w: glm.proj.Proj,
++        x: u64,
++        out: u64,
++        m: usize,
++        n: usize,
++        k: usize,
++        s: cuda.Stream,
++        fn go(q: @This()) anyerror!void {
++            try glm.proj.matmul(q.set, q.s, q.w, q.x, q.k, q.out, 0, q.m, q.n, q.k, false);
++        }
++    };
++    const Own = struct {
++        set: glm.glue.Set,
++        l: dsa_block.Layer,
++        norm: glm.glue.Norm,
++        h: u64,
++        normed: u64,
++        xs: u64,
++        dp: u64,
++        m: usize,
++        s: cuda.Stream,
++        fn go(q: @This()) anyerror!void {
++            try dsa_block.ownerRows(q.set, q.s, q.l, q.norm, q.l.eps, q.h, q.l.dims, q.normed, q.xs, q.dp, q.m);
++        }
++    };
++    const Norm = struct {
++        set: glm.glue.Set,
++        norm: glm.glue.Norm,
++        h: u64,
++        normed: u64,
++        xs: u64,
++        m: usize,
++        eps: f32,
++        d: usize,
++        s: cuda.Stream,
++        fn go(q: @This()) anyerror!void {
++            try glm.glue.rmsnormBy(q.set, q.s, q.h, q.d, q.norm, q.normed, q.d, q.xs, q.eps, q.m, q.d);
++        }
++    };
++    for ([_]usize{ 4096, 2048, 1024, 512, 256 }) |m| {
++        const t = try timed(r, reps, flush, Mm{ .set = set, .w = l.proj, .x = normed, .out = dp, .m = m, .n = W, .k = D, .s = r.s }, Mm.go);
++        const tf = 2.0 * @as(f64, @floatFromInt(m * W * D)) / 1e9;
++        std.debug.print("RESULT owner-proj [q_a|kv_a] rows {d}: warm {d:.3} ms ({d:.1} TFLOPS), cold {d:.3} ms ({d:.1} TFLOPS)\n", .{ m, t.warm, tf / t.warm, t.cold, tf / t.cold });
++        const o = try timed(r, reps, flush, Own{ .set = set, .l = l, .norm = in_norm, .h = hidden, .normed = o_normed, .xs = o_xs, .dp = dp, .m = m, .s = r.s }, Own.go);
++        std.debug.print("RESULT owner-proj ownerRows (norm + [q_a|kv_a]) rows {d}: warm {d:.3} ms, cold {d:.3} ms\n", .{ m, o.warm, o.cold });
++        const n = try timed(r, reps, flush, Norm{ .set = set, .norm = in_norm, .h = hidden, .normed = normed, .xs = xs, .m = m, .eps = c.eps, .d = D, .s = r.s }, Norm.go);
++        std.debug.print("RESULT owner-proj rmsnorm 6144 rows {d}: warm {d:.3} ms, cold {d:.3} ms\n", .{ m, n.warm, n.cold });
++        if (qb_w) |qbw| {
++            const q = try timed(r, reps, flush, Mm{ .set = set, .w = .{ .fp8g = qbw }, .x = qr, .out = qi, .m = m, .n = QI, .k = c.q_lora, .s = r.s }, Mm.go);
++            const qf = 2.0 * @as(f64, @floatFromInt(m * QI * c.q_lora)) / 1e9;
++            std.debug.print("RESULT owner-proj indexer qb rows {d}: warm {d:.3} ms ({d:.1} TFLOPS), cold {d:.3} ms\n", .{ m, q.warm, qf / q.warm, q.cold });
++        }
++    }
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 6f7237303..4b00f3ba8 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -106,6 +106,7 @@ const paged_tests = @import("paged_tests.zig");
+ const glm_loader_gate = @import("glm_loader_gate.zig");
+ const glm_fp8g_shares = @import("glm_fp8g_shares.zig");
+ const glm_qkva_split_bits = @import("glm_qkva_split_bits.zig");
++const glm_owner_proj = @import("glm_owner_proj.zig");
+ 
+ const gdn_back_tests = @import("gdn_back_tests.zig");
+ const q4_back_tests = @import("q4_back_tests.zig");
+@@ -274,6 +275,7 @@ const usage =
+     \\  glm-loader-gate <ckpt>   every rank's uploads at TP 1, 2 and 3 against the checkpoint cut on the host, byte for byte
+     \\  glm-fp8g-shares          block-FP8 TP shares packed as GLM's loader packs them, on the lane, against FP64 of the cut
+     \\  glm-qkva-split-bits <ckpt>  [q_a | kv_a]'s split slices (TP3/4/6) against the replicated projection, bit for bit
++    \\  glm-owner-proj <ckpt> <layers> [reps]  prompt [q_a | kv_a] and indexer qb on TP4 row owners, bytes vs replicated
+     \\  aot-fallback <dir>        a launch's 1 from the runtime-parameter variant: the folded variant's bits (#1003)
+     \\
+ ;
+@@ -494,6 +496,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "glm-loader-gate")) return glm_loader_gate.run(gpu, try arg(rest, 0));
+     if (std.mem.eql(u8, cmd, "glm-fp8g-shares")) return glm_fp8g_shares.run(gpu);
+     if (std.mem.eql(u8, cmd, "glm-qkva-split-bits")) return glm_qkva_split_bits.run(gpu, try arg(rest, 0));
++    if (std.mem.eql(u8, cmd, "glm-owner-proj")) return glm_owner_proj.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else null);
+     if (std.mem.startsWith(u8, cmd, "dory-")) return dory_serve.run(gpu, cmd, rest);
+     if (std.mem.eql(u8, cmd, "gemma4-states")) return @import("gemma4_states_tests.zig").states(gpu, rest);
+     if (std.mem.eql(u8, cmd, "dory")) return dory_tests.greedy(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
+-- 
+2.43.0
+

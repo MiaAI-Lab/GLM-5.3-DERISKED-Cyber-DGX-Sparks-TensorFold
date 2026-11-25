@@ -1,0 +1,549 @@
+From 96ba5ea7f3208a96c595476c2501d75504738f9c Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:10:42 +0200
+Subject: [PATCH] glm: glm_moe_dsa streams take rounds one window at a time;
+ TF_GLM_DSA_SHARED=1 shares the decode window (default off)
+
+TensorFold never ran two glm_moe_dsa streams at once: cuda_shared.mixer refused every MLA layer with a rope plane
+(error.DsaSharedWindow), so the first concurrent round stopped every rank. Default (this patch): glm_moe_dsa uses the lanes'
+"one window a round" mode (Lanes.aloneAtStart; no prompt batching into the shared mixer, Lanes.batchesPrompts), so --parallel > 1
+is safe: each round verifies one stream's window through the solo path, exactly as that stream would alone.
+
+TF_GLM_DSA_SHARED=1 (default off): several streams' decode rows share one verify window. cuda_shared.dsaSegs runs the row-wise
+projections, router and MoE over every row and each stream's attention per segment (kv rope + latent write, query rope, top-2048
+selection and sparse attention on its own caches, offsets dp/q/token lists by the segment's first row; a lone stream passes the
+arguments it always did). Solo-only paths (KV split, owner rows, KV shard) stay out of the shared window.
+
+Rank 0 logs the first shared verify (and every 4,096th): "glm lanes: shared verify #N: streams, rows, ms", the stages' evidence that a shared window ran.
+
+Tests: test-glm-dsa-shared-host (the lanes' rule, the startup rule, the prompt batching gate, attend offsets) and
+tf-cuda-test glm-conc-rows / glm-conc-rows-e4m3 DIR (one real layer's rows: every stream's decode rows alone and in shared windows
+of 2..32 rows give the same bytes; controls: other codebook, swapped picks, same picks with other activations).
+Rebased from x7-dsa (K4: passed x7, exact 36/36 + 32/32, aggregate 44.7 tok/s at C=2, 54.8 at C=4 vs 36.7 at C=1) onto 0210.
+---
+ zig/build/glm_family_host.zig            |   1 +
+ zig/src/families/glm/cuda_dsa_block.zig  |   8 +-
+ zig/src/families/glm/cuda_lanes.zig      |  25 ++-
+ zig/src/families/glm/cuda_lanes_test.zig |  78 ++++++++
+ zig/src/families/glm/cuda_native.zig     |   8 +-
+ zig/src/families/glm/cuda_shared.zig     |  32 +++-
+ zig/tests/cuda/glm_conc_rows_tests.zig   | 226 +++++++++++++++++++++++
+ zig/tests/cuda/main.zig                  |   4 +
+ 8 files changed, 377 insertions(+), 5 deletions(-)
+ create mode 100644 zig/tests/cuda/glm_conc_rows_tests.zig
+
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 86a9a135d..00dfa654a 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -26,6 +26,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     b.step("test-glm-swift-krn-gpu", "Policy bits 2 and 3: the decode select through dsaSelect with the bits set and clear, bit for bit (TF_KRN_GPU: the fatbins' directory; skipped without)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM swift KRN GPU:"} })).step);
+     b.step("test-glm-kv-split-host", "TF_GLM_KV_SPLIT's ownership, head tables and switch, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"KV split:"} })).step);
+     b.step("test-glm-slot-resume-host", "TF_GLM_SLOT_RESUME: where a later prompt resumes on its slot's own rows (prefix, grid, stamps, drafter window), without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM slot resume:"} })).step);
++    b.step("test-glm-dsa-shared-host", "glm_moe_dsa's streams one window a round until its shared window is built (TF_GLM_DSA_SHARED), without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM dsa shared:"} })).step);
+     b.step("test-glm-seq-grow-host", "TF_GLM_SEQ_GROW: granules follow the rows, trims, a shared pool and its refusal, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM seq grow:"} })).step);
+     b.step("test-glm-seq-grow-gpu", "TF_GLM_SEQ_GROW on a device (TF_SEQ_GROW_GPU=1; skipped without): granules mapped zeroed, kept across trims, refused when spent").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM seq grow GPU:"} })).step);
+     b.step("test-glm-policy-host", "Request policies: the begin step's mask on every rank, the off state as before, bit 5's projection, DFlash2 coupled exactness, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM policy:"} })).step);
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index 7d19db239..6a70bca70 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -274,7 +274,7 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
+     const ix = l.index;
+     const kw_rows = ix.d + ix.heads;
+     const v = try attendWrite(k, stream, l, c, s, r0, rows, pos);
+-    if (l.rope != 0) try qaRope(set, stream, l, s.q, v.qa, pos, rows);
++    if (l.rope != 0) try qaRope(set, stream, l, s.q + r0 * l.heads * l.qk * 2, v.qa, pos, rows);
+     const t = table(l, c);
+     const scale = attnScale(l);
+     const msa = msaRows(l, c, rows);
+@@ -392,6 +392,10 @@ pub fn attendScratch(l: Layer, s: Scratch, r0: usize) Scratch {
+     v.qa += r0 * l.heads * l.rowW() * 2;
+     v.ol += r0 * l.heads * l.lw * 2;
+     v.qi += r0 * ix.heads * ix.d * 2;
++    if (l.rope != 0) { // glm_moe_dsa: a shared window's segment keeps its own token lists (a shared layer reuses them)
++        v.tokens += r0 * sparse.dsa_width * 4;
++        v.counts += r0 * 4;
++    }
+     return v;
+ }
+ 
+@@ -405,7 +409,7 @@ pub fn attendWrite(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scra
+     if (c.ps % (l.lw * 2) != 0 or c.latPs() % (l.lw * 2) != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
+     const t = table(l, c);
+     var stamp = prof.span(k.prof, stream, .cache_write);
+-    if (l.rope != 0) try kvRope(set, stream, l, s.dp, v.lat, pos, rows); // the latent row's roped tail, then the whole 576
++    if (l.rope != 0) try kvRope(set, stream, l, s.dp + r0 * (l.q_lora + l.rowW()) * 2, v.lat, pos, rows); // the latent row's roped tail, then the whole 576
+     try latent.latentWriteFormat(set, stream, v.lat, l.rowW(), c.lc, c.ls, latTable(l, c), pos, rows, l.rowW());
+     stamp.end();
+     if (l.ifull) { // a shared layer carries no indexer: it reuses the last full layer's token list whole
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 73f2d0353..985052f12 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -263,8 +263,9 @@ pub const Lanes = struct {
+         l.first = self.take(first);
+     }
+ 
+-    fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
++    pub fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
+         const self = of(ptr);
++        if (!batchesPrompts(self.x.e.c.dsa)) return false; // glm_moe_dsa: its prompts one at a time (dsaSegs: windows only)
+         if (!self.x.e.m.tiled or ss.len > engine.max_together) return false;
+         for (ss) |s| if (!canBatch(s)) return false;
+         var opened: usize = 0;
+@@ -608,6 +609,26 @@ pub const Lanes = struct {
+         }
+     }
+ 
++    /// Whether the lane core may put several streams' windows in one forward (Engine.verifyShared): TF_GLM_SHARED=0
++    /// says no for every model; glm_moe_dsa's shared window is not built (cuda_shared.mixer refuses it,
++    /// error.DsaSharedWindow), so its streams take rounds one window at a time (`alone`, the TF_GLM_SHARED=0 path),
++    /// each as its stream would alone, unless TF_GLM_DSA_SHARED=1 asks for the shared one.
++    pub fn sharesForward(shared_off: bool, dsa: bool, dsa_shared: bool) bool {
++        return !shared_off and (!dsa or dsa_shared);
++    }
++
++    /// The lanes' `alone` at startup (cuda_native.finishRank): TF_GLM_SHARED=0, or glm_moe_dsa without its shared window
++    /// built and asked for (TF_GLM_DSA_SHARED=1 and cuda_shared.dsa_built).
++    pub fn aloneAtStart(dsa: bool, shared_off: bool, dsa_shared_env: bool) bool {
++        return !sharesForward(shared_off, dsa, dsa_shared_env and @import("cuda_shared.zig").dsa_built);
++    }
++
++    /// Whether several queued prompts may run as one segmented pass (prefillManyFn, Engine.prefillMany): its forward is
++    /// shared.mixer's, whose glm_moe_dsa branch (dsaSegs) takes decode windows only, so glm_moe_dsa's prompts never batch.
++    pub fn batchesPrompts(dsa: bool) bool {
++        return !dsa;
++    }
++
+     /// A round's windows in one forward (Engine.verifyShared), each stream's rows on its own sequence.
+     fn verifyShared(self: *Lanes, windows: []const be.Window, out: []be.Verified) !void {
+         if (windows.len > engine.max_shared) return error.WindowTooWide;
+@@ -641,6 +662,8 @@ pub const Lanes = struct {
+         try self.x.verifyShared(parts[0..windows.len]);
+         const ms = self.since(t0);
+         self.shared += 1;
++        // evidence for the stages that a shared verify ran (TF_GLM_DSA_SHARED): the first one and every 4,096th
++        if (self.shared == 1 or self.shared % 4096 == 0) std.log.info("glm lanes: shared verify #{d}: {d} streams, {d} rows, {d:.1} ms", .{ self.shared, windows.len, row, ms });
+         for (windows, parts[0..windows.len], lane[0..windows.len]) |w, p, l| self.observe(l, w, p.ids[1..], p.out, ms, false);
+         for (out[0..windows.len], parts[0..windows.len], lane[0..windows.len]) |*o, p, l| {
+             const rows = p.ids.len;
+diff --git a/zig/src/families/glm/cuda_lanes_test.zig b/zig/src/families/glm/cuda_lanes_test.zig
+index b74981384..4c2c0fcc5 100644
+--- a/zig/src/families/glm/cuda_lanes_test.zig
++++ b/zig/src/families/glm/cuda_lanes_test.zig
+@@ -59,3 +59,81 @@ test "a prompt step pairs only while no other stream is past its prompt pass" {
+     _ = self.lanes.remove(&streams[2]); // released
+     try std.testing.expect(!self.othersDecode(&streams[0]));
+ }
++
++test "GLM dsa shared: glm_moe_dsa's streams take rounds one window at a time unless its shared window is built" {
++    // the truth table: TF_GLM_SHARED=0 stops sharing for every model; glm_moe_dsa shares only when asked and built
++    try std.testing.expect(Lanes.sharesForward(false, false, false)); // Flash and the rest: shared windows as before
++    try std.testing.expect(Lanes.sharesForward(false, false, true));
++    try std.testing.expect(!Lanes.sharesForward(true, false, false)); // TF_GLM_SHARED=0
++    try std.testing.expect(!Lanes.sharesForward(true, true, true));
++    try std.testing.expect(!Lanes.sharesForward(false, true, false)); // glm_moe_dsa: alone (error.DsaSharedWindow otherwise)
++    try std.testing.expect(Lanes.sharesForward(false, true, true)); // glm_moe_dsa with its shared window
++}
++
++test "GLM dsa shared: an alone lane set tells the core one stream a round, a sharing one up to max_shared" {
++    var e: engine.Engine = undefined;
++    e.drafts = true;
++    e.drafter = null;
++    const alone: Lanes = .{ .x = .{ .e = &e, .link = undefined }, .alone = Lanes.aloneAtStart(true, false, false) }; // not asked
++    try std.testing.expect(alone.alone); // glm_moe_dsa without TF_GLM_DSA_SHARED=1 never asks the core for a shared forward
++    const fa = alone.facts();
++    try std.testing.expectEqual(@as(@TypeOf(fa.max_streams), 1), fa.max_streams);
++    try std.testing.expect(!fa.hidden_rows);
++    try std.testing.expectEqual(@as(@TypeOf(fa.batch_rows), 0), fa.batch_rows);
++    const sharing: Lanes = .{ .x = .{ .e = &e, .link = undefined }, .alone = Lanes.aloneAtStart(false, false, false) };
++    const fs = sharing.facts();
++    try std.testing.expectEqual(@as(@TypeOf(fs.max_streams), engine.max_shared), fs.max_streams);
++    try std.testing.expect(fs.hidden_rows);
++}
++
++test "GLM dsa shared: the startup rule and prompt batching keep glm_moe_dsa's prompts off shared.mixer" {
++    try std.testing.expect(Lanes.aloneAtStart(true, false, false)); // glm_moe_dsa, nothing asked
++    try std.testing.expectEqual(@import("cuda_shared.zig").dsa_built, !Lanes.aloneAtStart(true, false, true)); // asked: shared (built)
++    try std.testing.expect(Lanes.aloneAtStart(true, true, true)); // TF_GLM_SHARED=0 wins
++    try std.testing.expect(!Lanes.aloneAtStart(false, false, false)); // Flash: shared as before
++    try std.testing.expect(Lanes.aloneAtStart(false, true, false)); // TF_GLM_SHARED=0
++    try std.testing.expect(!Lanes.batchesPrompts(true));
++    try std.testing.expect(Lanes.batchesPrompts(false));
++}
++
++test "GLM dsa shared: glm_moe_dsa never batches queued prompts into one segmented pass" {
++    var e: engine.Engine = undefined;
++    e.c.dsa = true;
++    e.m.tiled = true; // the path that would otherwise batch
++    var self: Lanes = .{ .x = .{ .e = &e, .link = undefined } };
++    var a: lanes.Stream = undefined;
++    var b: lanes.Stream = undefined;
++    const ss = [_]*lanes.Stream{ &a, &b };
++    // false before any stream is read or any slot opened (the streams are undefined here)
++    try std.testing.expect(!try Lanes.prefillManyFn(@ptrCast(&self), &ss));
++}
++
++test "GLM dsa shared: a segment's scratch from its first row keeps its own token lists on glm_moe_dsa only" {
++    const dsa_block = @import("cuda_dsa_block.zig");
++    const sparse = @import("cuda_sparse.zig");
++    var l: dsa_block.Layer = undefined;
++    l.index.d = 128;
++    l.index.heads = 32;
++    l.heads = 16;
++    l.lw = 512;
++    l.rope = 64;
++    var s: dsa_block.Scratch = undefined;
++    s.lat = 1 << 20;
++    s.ikr = 2 << 20;
++    s.igr = 3 << 20;
++    s.qa = 4 << 20;
++    s.ol = 5 << 20;
++    s.qi = 6 << 20;
++    s.tokens = 7 << 20;
++    s.counts = 8 << 20;
++    const r0: usize = 5;
++    const v = dsa_block.attendScratch(l, s, r0);
++    try std.testing.expectEqual(s.tokens + r0 * sparse.dsa_width * 4, v.tokens); // [rows][dsa_width] i32, its rows
++    try std.testing.expectEqual(s.counts + r0 * 4, v.counts);
++    try std.testing.expectEqual(s.qa + r0 * l.heads * l.rowW() * 2, v.qa);
++    try std.testing.expectEqual(s, dsa_block.attendScratch(l, s, 0)); // a lone stream (row 0): the scratch as before
++    l.rope = 0; // Flash: its shared path passes each segment's lists itself; attendScratch leaves them
++    const f = dsa_block.attendScratch(l, s, r0);
++    try std.testing.expectEqual(s.tokens, f.tokens);
++    try std.testing.expectEqual(s.counts, f.counts);
++}
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 9041219f7..8b00c6200 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -369,10 +369,16 @@ fn finishRank(a: OpenArgs) !Loaded {
+             return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+         }
+     }.get;
++    const on = struct {
++        fn get(name: [*:0]const u8) bool {
++            return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++        }
++    }.get;
+     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
+-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .mtp_confidence = o.mtp_confidence, .policy = policyBoot(own.e) };
++    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = @import("cuda_lanes.zig").Lanes.aloneAtStart(own.e.c.dsa, off("TF_GLM_SHARED"), on("TF_GLM_DSA_SHARED")), .mtp_confidence = o.mtp_confidence, .policy = policyBoot(own.e) };
+     // TF_GLM_SLOT_RESUME (default on, 0 off): a later prompt resumes on its slot's own rows (slot_resume.zig); glm_moe_dsa
+     // on its own windows only (Engine.rewindable refuses the rest on every rank)
++    if (own.e.c.dsa) std.log.info("shared windows: {s}", .{if (own.lanes.alone) "off, glm_moe_dsa's streams take rounds one window at a time (TF_GLM_DSA_SHARED=1: shared)" else "on, glm_moe_dsa's streams share decode windows (TF_GLM_DSA_SHARED=1)"});
+     own.lanes.slot_resume = @import("slot_resume.zig").enabled() and own.e.c.dsa and !set.pages;
+     std.log.info("slot resume: {s} (TF_GLM_SLOT_RESUME{s})", .{ if (own.lanes.slot_resume) "on, a later prompt resumes on its slot's own prompt rows" else "off", if (own.e.c.dsa) "" else "; glm_moe_dsa only" });
+     const extra: u64 = (if (own.e.drafter) |dr| dr.ringBytes() else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
+diff --git a/zig/src/families/glm/cuda_shared.zig b/zig/src/families/glm/cuda_shared.zig
+index 874cdc5d5..e2ffa41f8 100644
+--- a/zig/src/families/glm/cuda_shared.zig
++++ b/zig/src/families/glm/cuda_shared.zig
+@@ -34,6 +34,10 @@ fn segsKind(r: fw.Rank, a: dsa_block.Layer, di: usize) ?dsa_block.SegsKind {
+ }
+ 
+ /// Checks a shared window's segments (a prompt buffer's: whole prompts) against its `rows` rows; each holds its own.
++/// Whether mixer below runs glm_moe_dsa's layers over several streams' segments (dsaSegs). Rank 0's lanes still give
++/// glm_moe_dsa's streams their rounds one window at a time unless TF_GLM_DSA_SHARED=1 (cuda_lanes.Lanes.aloneAtStart).
++pub const dsa_built = true;
++
+ pub fn begin(r: fw.Rank, rows: usize, stream: cuda.Stream) !void {
+     const most: usize = if (r.b.prefill) fw.prefill_rows else fw.window_rows;
+     if (r.b.prefill and r.segs.len > @import("cuda_state.zig").prompt_heads) return error.BadWindow;
+@@ -124,7 +128,10 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di:
+             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
+         },
+         .mla => |a| {
+-            if (a.rope != 0) return error.DsaSharedWindow; // glm_moe_dsa serves one stream until its graph lands (patch 0303)
++            if (a.rope != 0) { // glm_moe_dsa (TF_GLM_DSA_SHARED=1): every segment's attention on its own rows and caches
++                if (!dsa_built) return error.DsaSharedWindow;
++                return dsaSegs(f, r, a, di, rows, out);
++            }
+             if (@import("cuda_kv_shard_attn.zig").wanted(f, r)) { // TF_GLM_KV_SHARD: a segment one rank holds alone
+                 try @import("cuda_kv_shard_attn.zig").shared(f, r, a, di, rows);
+                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
+@@ -186,3 +193,26 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di:
+         },
+     }
+ }
++
++/// glm_moe_dsa's layer over a shared window: every row's projections in one pass (prepare: [q_a | kv_a], the norms,
++/// q_b, the indexer's keys and queries, the absorbed query; their sums do not depend on the row count, qmmf.splitK),
++/// then each segment's attention in turn exactly as its stream alone runs it (dsa_block.attend at the segment's first
++/// row: its latent and index-key writes at its own positions, its roped query, its top-2048 over its own index ring,
++/// its dense or sparse attention), then o_proj's expand for every row. Segments run one after another on the stream,
++/// each with its own token lists (attend offsets them by its first row), so a shared layer (no indexer) reuses its own
++/// segment's last full-layer list. No owner-row or split-selection paths: the window is replicated on every rank.
++fn dsaSegs(f: *const fw.Forward, r: fw.Rank, a: dsa_block.Layer, di: usize, rows: usize, out: ?u64) !void {
++    const b = r.b;
++    const c = &r.w.config;
++    if (b.prefill) return error.DsaSharedWindow; // prompts never share a pass (cuda_lanes.Lanes.batchesPrompts)
++    var sparse_any = false;
++    for (r.segs) |g| sparse_any = sparse_any or dsa_block.sparseRows(a, g.st.pos, g.rows);
++    try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
++    const kk: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops() };
++    for (r.segs) |g| {
++        const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
++        try dsa_block.attend(kk, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
++    }
++    try latent.expandV(f.set(), f.stream, b.dsa.ol, a.wv, b.dsa.vn, rows, a.heads, a.dv, a.lw);
++    if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
++}
+diff --git a/zig/tests/cuda/glm_conc_rows_tests.zig b/zig/tests/cuda/glm_conc_rows_tests.zig
+new file mode 100644
+index 000000000..7f80a31ab
+--- /dev/null
++++ b/zig/tests/cuda/glm_conc_rows_tests.zig
+@@ -0,0 +1,226 @@
++//! TF_GLM_DSA_SHARED (patch 0211) and TF_GLM_SEQ_GROW (patch 0210) on the E4M3 image: several streams' decode rows in
++//! one verify window run the routed experts at a wider row count than each stream alone (shared window: 12, 24 or 32
++//! rows where one stream has 1 to 8). tilesFor picks the grouped kernel by the row count (rows <= 8: k8r8p, up to 32:
++//! k8r16p), so the shared window is exact only if a row's per-slot outputs are the same bytes at every window width.
++//! This reads one real up1 (EXLR8, codebook mcg_e4m3) layer's rank-0 share with its real tap rows and real top-8 routes
++//! (x9e extract.py's layer.bin, the exl3-prompt-once-e4m3 directory) and runs the decode call (Experts.runSlots, as
++//! glm.exl3.runGrouped does) on windows built from that layer's rows: each stream's rows alone, then every stream's
++//! rows together in two orders, and compares each row's [8][D] fp32 slot outputs byte for byte.
++//! `tf-cuda-test glm-conc-rows-e4m3 DIR` (and `glm-conc-rows DIR` for a K4 mcg layer); the closing line counts the cases.
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const t6 = @import("exl3_prompt_k6_tests.zig");
++const Gpu = check.Gpu;
++const ex = cuda.exl3_experts;
++const Bufs = t6.Bufs;
++
++const D = 6144;
++const N = 512; // a rank's expert width at TP4
++const K = 8;
++
++const Ctx = struct { gpu: Gpu, a: std.mem.Allocator, s: cuda.Stream, cases: usize = 0 };
++
++/// The decode call on `rows` rows (x: bf16 [rows][D], pk: i32 [rows][K]): y fp32 [rows][K][D] as bytes.
++fn decode(c: *Ctx, exp: *const ex.Experts, l: ex.Layer, x: []const u16, pk: []const i32, rows: usize) ![]u8 {
++    var b: Bufs = .{ .d = c.gpu.d, .gpa = c.gpu.gpa };
++    defer b.deinit();
++    const dx = try b.put(std.mem.sliceAsBytes(x[0 .. rows * D]));
++    const dpk = try b.put(std.mem.sliceAsBytes(pk[0 .. rows * K]));
++    const sc = try ex.scratch(try b.alloc(try ex.scratchBytes(l, rows, K)), l, rows, K);
++    try exp.runSlots(c.s, l, dx, D, .bf16, dpk, rows, sc);
++    try c.s.synchronize();
++    const out = try c.a.alloc(u8, rows * K * D * 4);
++    const buf: cuda.DeviceBuffer = .{ .d = c.gpu.d, .ptr = sc.y, .len = out.len };
++    try buf.download(0, out);
++    return out;
++}
++
++/// The rows `idx` of the layer's tap rows, as one window.
++fn gather(c: *Ctx, x: []const u16, pk: []const i32, idx: []const usize, xo: *[]u16, po: *[]i32) !void {
++    xo.* = try c.a.alloc(u16, idx.len * D);
++    po.* = try c.a.alloc(i32, idx.len * K);
++    for (idx, 0..) |r, i| {
++        @memcpy(xo.*[i * D ..][0..D], x[r * D ..][0..D]);
++        @memcpy(po.*[i * K ..][0..K], pk[r * K ..][0..K]);
++    }
++}
++
++pub fn run(gpu: Gpu, dir: []const u8) !void {
++    return suite(gpu, dir, false);
++}
++
++pub fn runE4m3(gpu: Gpu, dir: []const u8) !void {
++    return suite(gpu, dir, true);
++}
++
++fn suite(gpu: Gpu, dir: []const u8, e4m3: bool) !void {
++    var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
++    defer arena.deinit();
++    var stream = try cuda.Stream.init(gpu.d, false);
++    defer stream.deinit();
++    var exp = try (if (e4m3) ex.Experts.loadE4m3(gpu.d) else ex.Experts.load(gpu.d));
++    defer exp.unload();
++    var other = try (if (e4m3) ex.Experts.load(gpu.d) else ex.Experts.loadE4m3(gpu.d));
++    defer other.unload();
++    var c: Ctx = .{ .gpu = gpu, .a = arena.allocator(), .s = stream };
++    const io = gpu.io;
++    const d = try std.Io.Dir.cwd().openDir(io, dir, .{});
++    defer d.close(io);
++    const manifest = try d.readFileAlloc(io, "layer.json", c.a, .limited(1 << 20));
++    const blob = try d.readFileAlloc(io, "layer.bin", c.a, .limited(4 << 30));
++    const Arr = struct { name: []const u8, offset: usize, bytes: usize };
++    const M = struct { layer: u32, rows: usize, experts: usize, dims: usize, width: usize, codebook: []const u8 = "mcg", arrays: []const Arr };
++    const m = try std.json.parseFromSliceLeaky(M, c.a, manifest, .{ .ignore_unknown_fields = true });
++    try check.expect(m.dims == D and m.width == N and m.rows == 4096, "real layer: dims {d} width {d} rows {d}", .{ m.dims, m.width, m.rows });
++    try check.expect(std.mem.eql(u8, m.codebook, if (e4m3) "mcg_e4m3" else "mcg"), "real layer: the manifest's codebook is {s}, this arm reads {s}", .{ m.codebook, if (e4m3) "mcg_e4m3" else "mcg" });
++    var b: Bufs = .{ .d = gpu.d, .gpa = gpu.gpa };
++    defer b.deinit();
++    const get = struct {
++        fn f(mm: M, bb: []const u8, name: []const u8) ![]const u8 {
++            for (mm.arrays) |a| if (std.mem.eql(u8, a.name, name)) return bb[a.offset..][0..a.bytes];
++            return error.MissingArray;
++        }
++    }.f;
++    const E = m.experts;
++    const tables = struct {
++        fn f(cc: *Ctx, bb: *Bufs, bytes: []const u8, experts: usize) !u64 {
++            const base = try bb.put(bytes);
++            const t = try cc.a.alloc(u64, experts);
++            for (t, 0..) |*v, e| v.* = base + e * (bytes.len / experts);
++            return bb.put(std.mem.sliceAsBytes(t));
++        }
++    }.f;
++    const k2 = try c.a.alloc(i32, E);
++    @memset(k2, 8);
++    const k2p = try b.put(std.mem.sliceAsBytes(k2));
++    const l: ex.Layer = .{
++        .gate = try tables(&c, &b, try get(m, blob, "gate_proj.trellis"), E),
++        .up = try tables(&c, &b, try get(m, blob, "up_proj.trellis"), E),
++        .down = try tables(&c, &b, try get(m, blob, "down_proj.trellis"), E),
++        .gate_k2 = k2p,
++        .up_k2 = k2p,
++        .down_k2 = k2p,
++        .suh_g = try b.put(try get(m, blob, "gate_proj.suh")),
++        .suh_u = try b.put(try get(m, blob, "up_proj.suh")),
++        .svh_g = try b.put(try get(m, blob, "gate_proj.svh")),
++        .svh_u = try b.put(try get(m, blob, "up_proj.svh")),
++        .suh_d = try b.put(try get(m, blob, "down_proj.suh")),
++        .svh_d = try b.put(try get(m, blob, "down_proj.svh")),
++        .experts = E,
++        .dims = D,
++        .width = N,
++        .codebook = .mcg,
++        .uniform_k2 = 8,
++        .uniform_k2_gu = 8,
++        .uniform_k2_d = 8,
++        .limit = 0,
++        .act_mode = 0,
++    };
++    const xb = try get(m, blob, "x.bf16");
++    const pb = try get(m, blob, "picks");
++    const x = try c.a.alloc(u16, xb.len / 2); // the blob's arrays need not be aligned
++    const pk = try c.a.alloc(i32, pb.len / 4);
++    @memcpy(std.mem.sliceAsBytes(x), xb);
++    @memcpy(std.mem.sliceAsBytes(pk), pb);
++    try check.expect(x.len == m.rows * D and pk.len == m.rows * K, "real layer: x {d} and picks {d} values", .{ x.len, pk.len });
++    const tag = if (e4m3) "up1 (E4M3)" else "K4";
++
++    // up to four streams, each with rows at its own positions (window rows 1..8 a stream, 32 rows at most together)
++    const widths = [_][4]usize{
++        .{ 1, 1, 1, 1 }, .{ 3, 5, 2, 6 }, .{ 6, 6, 6, 6 }, .{ 8, 8, 8, 8 }, .{ 5, 4, 0, 0 }, .{ 8, 8, 0, 0 }, .{ 1, 8, 0, 0 }, .{ 7, 1, 7, 1 },
++    };
++    const starts = [4]usize{ 0, 1000, 2500, 3900 };
++    var want_cases: usize = 0;
++    var worst_diff_rows: usize = 0;
++    for (widths) |w| {
++        // each stream's rows alone (the lone stream's own verify), then all of them in one window, in two orders
++        var alone: [4][]u8 = undefined;
++        var idx_all: [32]usize = undefined;
++        var n_all: usize = 0;
++        var off: [4]usize = undefined;
++        for (w, 0..) |n, s| {
++            off[s] = n_all;
++            for (0..n) |i| {
++                idx_all[n_all] = starts[s] + i;
++                n_all += 1;
++            }
++            if (n == 0) continue;
++            var xs: []u16 = undefined;
++            var ps: []i32 = undefined;
++            try gather(&c, x, pk, idx_all[off[s]..][0..n], &xs, &ps);
++            alone[s] = try decode(&c, &exp, l, xs, ps, n);
++        }
++        var xs: []u16 = undefined;
++        var ps: []i32 = undefined;
++        try gather(&c, x, pk, idx_all[0..n_all], &xs, &ps);
++        const joint = try decode(&c, &exp, l, xs, ps, n_all);
++        // the same window with its streams in the reverse order
++        var idx_rev: [32]usize = undefined;
++        var at: usize = 0;
++        var roff: [4]usize = undefined;
++        var s: usize = 4;
++        while (s > 0) {
++            s -= 1;
++            roff[s] = at;
++            for (0..w[s]) |i| {
++                idx_rev[at] = starts[s] + i;
++                at += 1;
++            }
++        }
++        try gather(&c, x, pk, idx_rev[0..n_all], &xs, &ps);
++        const joint_rev = try decode(&c, &exp, l, xs, ps, n_all);
++        var bad: usize = 0;
++        const rowb = K * D * 4;
++        for (w, 0..) |n, st| {
++            for (0..n) |i| {
++                const a = alone[st][i * rowb ..][0..rowb];
++                if (!std.mem.eql(u8, a, joint[(off[st] + i) * rowb ..][0..rowb])) bad += 1;
++                if (!std.mem.eql(u8, a, joint_rev[(roff[st] + i) * rowb ..][0..rowb])) bad += 1;
++            }
++        }
++        worst_diff_rows += bad;
++        var nz: usize = 0; // the comparison must see non-trivial bytes
++        for (joint[0 .. @min(joint.len, rowb)]) |v| nz += @intFromBool(v != 0 and v != 0xff);
++        try check.expect(nz > rowb / 8, "{s} window {any}: the joint window's first row is mostly zero bytes ({d} of {d} non-trivial)", .{ tag, w, nz, rowb });
++        if (bad != 0) std.debug.print("FAIL {s} window {any} ({d} rows): {d} row comparisons differ from the stream's own window\n", .{ tag, w, n_all, bad });
++        try check.expect(bad == 0, "{s} window {any}: rows differ between a stream's own window and the shared window", .{ tag, w });
++        c.cases += 1;
++        want_cases += 1;
++        check.pass("{s} window {any} ({d} rows): every row's slot outputs byte-identical alone and in the shared window, both stream orders", .{ tag, w, n_all });
++    }
++
++    // controls (each must fail the way the comparison would see a wrong run)
++    {
++        var xs: []u16 = undefined;
++        var ps: []i32 = undefined;
++        const idx = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
++        try gather(&c, x, pk, &idx, &xs, &ps);
++        const base = try decode(&c, &exp, l, xs, ps, 12);
++        // the other codebook image must give other bytes (the arm is on the codebook it names)
++        const alt = try decode(&c, &other, l, xs, ps, 12);
++        try check.expect(!std.mem.eql(u8, base, alt), "{s}: the other codebook's image gave the same bytes (the arm proves nothing)", .{tag});
++        c.cases += 1;
++        want_cases += 1;
++        check.pass("control: the {s} image and the other codebook's image give other bytes on the same window", .{tag});
++        // a swapped route (row 0 takes row 1's picks) changes row 0's bytes: a wrong row mapping would be seen
++        const sw = try c.a.dupe(i32, ps);
++        @memcpy(sw[0..K], ps[K .. 2 * K]);
++        const swd = try decode(&c, &exp, l, xs, sw, 12);
++        try check.expect(!std.mem.eql(u8, base[0 .. K * D * 4], swd[0 .. K * D * 4]), "{s}: swapped picks left row 0's bytes unchanged", .{tag});
++        try check.expect(std.mem.eql(u8, base[K * D * 4 ..], swd[K * D * 4 ..]), "{s}: row 0's picks changed other rows' bytes (rows are not independent)", .{tag});
++        c.cases += 1;
++        want_cases += 1;
++        check.pass("control: row 0's picks changed, row 0's bytes change and no other row's do", .{});
++        // rows with the same picks and other activations must give other bytes (a kernel reading one activation for every row fails)
++        const same = try c.a.dupe(i32, ps);
++        @memcpy(same[K .. 2 * K], ps[0..K]);
++        const sd = try decode(&c, &exp, l, xs, same, 12);
++        try check.expect(!std.mem.eql(u8, sd[0 .. K * D * 4], sd[K * D * 4 .. 2 * K * D * 4]), "{s}: rows 0 and 1 with the same picks and other activations gave the same bytes", .{tag});
++        c.cases += 1;
++        want_cases += 1;
++        check.pass("control: two rows with the same picks and different activations give different bytes", .{});
++    }
++    try check.expect(c.cases == want_cases and want_cases == widths.len + 3, "glm-conc-rows: {d} cases ran, {d} expected", .{ c.cases, widths.len + 3 });
++    check.pass("glm-conc-rows{s}: {d}/{d} cases ({d} differing row comparisons)", .{ if (e4m3) "-e4m3" else "", c.cases, want_cases, worst_diff_rows });
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 96c1cd9b7..ab23a4bba 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -248,6 +248,8 @@ const usage =
+     \\  qwen-pages                qwen35.cu's attention cache through a page table: paged == contiguous, float64, red controls
+     \\  kernel-contract-limits DIR   each registered launch against sm_80/86/89/120/121 from the fatbins in DIR
+     \\  glm-exl3                  GLM's EXL3 routed experts, decode and prompt, against float64 (synthetic)
++    \\  glm-conc-rows [DIR]         TF_GLM_DSA_SHARED: a stream's decode rows alone and in a shared window of 2..32 rows, byte for byte (DIR: x9a layer.bin, K4)
++    \\  glm-conc-rows-e4m3 [DIR]    the same on the E4M3 image (EXLR8 values; DIR: an up1 layer.bin), with controls
+     \\  exl3-prompt-once-e4m3 [DIR] the same on the E4M3 image (EXLR8 values; DIR: an up1 layer.bin, codebook mcg_e4m3), with K4-image controls
+     \\  glm-exl3-fuse-e4m3        glm-exl3-fuse on the E4M3 image (EXLR8 values), with K4-image controls; TF_GLM_PF_DOWN_FUSE=1
+     \\  glm-exl3-fuse             TF_GLM_PF_DOWN_FUSE=1: the fused down + fold byte-equal to down + put_slot + combine
+@@ -417,6 +419,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "exlr8-bench")) return exlr8_tests.bench(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else "home", if (rest.len > 2) try std.fmt.parseInt(u16, rest[2], 10) else 40, if (rest.len > 3) try std.fmt.parseInt(usize, rest[3], 10) else 4);
+     if (std.mem.eql(u8, cmd, "exl3")) return exl3_tests.run(gpu, if (rest.len > 0) rest[0] else "none");
+     if (std.mem.eql(u8, cmd, "exl3-tiles")) return exl3_candidate_tests.run(gpu, if (rest.len > 0) rest[0] else null);
++    if (std.mem.eql(u8, cmd, "glm-conc-rows-e4m3")) return @import("glm_conc_rows_tests.zig").runE4m3(gpu, if (rest.len > 0) rest[0] else return error.NeedLayerDir);
++    if (std.mem.eql(u8, cmd, "glm-conc-rows")) return @import("glm_conc_rows_tests.zig").run(gpu, if (rest.len > 0) rest[0] else return error.NeedLayerDir);
+     if (std.mem.eql(u8, cmd, "exl3-prompt-once-e4m3")) return @import("exl3_prompt_once_tests.zig").runE4m3(gpu, if (rest.len > 0) rest[0] else null);
+     if (std.mem.eql(u8, cmd, "exl3-prompt-once")) return @import("exl3_prompt_once_tests.zig").run(gpu, if (rest.len > 0) rest[0] else null);
+     if (std.mem.eql(u8, cmd, "exl3-prompt-k6")) return @import("exl3_prompt_k6_tests.zig").run(gpu, if (rest.len > 0) rest[0] else "none", if (rest.len > 1) rest[1] else null);
+-- 
+2.43.0
+

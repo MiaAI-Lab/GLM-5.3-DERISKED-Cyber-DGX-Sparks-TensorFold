@@ -1,0 +1,235 @@
+From c79e9c328cc09878a96e085b12c1fab8491c66c7 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 14:08:37 +0200
+Subject: [PATCH 189/194] glm: TF_GLM_KV_SPLIT keeps prompt states: each rank
+ its own latent rows (both int8 scale planes) and index keys
+
+On top of 0186 (latent.scaleBytes): the snapshot plan keeps ceil(at / W) local rows of every split cache
+(cuda_state.latHeld / ikHeld), the same bytes on every rank, so the device and host tiers keep and restore a
+split state; the disk tier (LEARN) is refused. A prompt chunk's prefetch is reset at its first layer.
+Test: cuda_kv8_snapshot_test.zig, split ownership poison-restore at W 2/4/6 for every rank.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_disk_image.zig      |   1 +
+ .../families/glm/cuda_kv8_snapshot_test.zig   | 104 ++++++++++++++++++
+ zig/src/families/glm/cuda_kv_split.zig        |   3 +-
+ zig/src/families/glm/cuda_snapshot_layout.zig |  11 +-
+ zig/src/families/glm/cuda_snapshots.zig       |   2 -
+ zig/src/families/glm/cuda_state.zig           |  11 ++
+ 6 files changed, 126 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_disk_image.zig b/zig/src/families/glm/cuda_disk_image.zig
+index 65ba8069d..35bc31362 100644
+--- a/zig/src/families/glm/cuda_disk_image.zig
++++ b/zig/src/families/glm/cuda_disk_image.zig
+@@ -70,6 +70,7 @@ pub const Shape = struct {
+ 
+     pub fn of(st: *const State, c: *const Config, capacity: usize, head: bool) !Shape {
+         if (st.rings.len == 0) return error.SnapshotShape;
++        if (st_mod.lat_split > 1) return error.KvSplitDisk; // TF_GLM_KV_SPLIT: a rank's own rows only (device and host tiers keep them; disk not yet)
+         const base = st.arena.buf.ptr;
+         const first = if (st.table != 0) st.rings[0] else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
+         const end = if (st.table != 0) st.table else base + st.arena.buf.len;
+diff --git a/zig/src/families/glm/cuda_kv8_snapshot_test.zig b/zig/src/families/glm/cuda_kv8_snapshot_test.zig
+index 4d0d55c80..37e782b70 100644
+--- a/zig/src/families/glm/cuda_kv8_snapshot_test.zig
++++ b/zig/src/families/glm/cuda_kv8_snapshot_test.zig
+@@ -264,3 +264,107 @@ test "GLM FP8 KV: a dsa int8 state's disk image counts both scale planes of ever
+     // int8 rows keep 4 more scale bytes a row than E4M3 in each of the 3 DSA layers (codes as wide either way)
+     for ([_]u64{ 2048, 4096 }, 0..) |at, q| try t.expectEqual(3 * at * 4, bytes[1][q] - bytes[0][q]);
+ }
++
++// ---- TF_GLM_KV_SPLIT: each rank keeps and restores its own rows (position p on rank p mod W, local row p div W) ----
++
++/// One rank's split state of `world` (int8 codes): its own rows' codes, both scale planes and (split index keys) its
++/// index-key rows filled by position, a prefix of `at` kept through the real Plan and Pool, every row poisoned, the
++/// prefix restored; the bad own rows below `at` counted (codes, scales, keys), and the plan's bytes.
++fn runSplit(world: usize, rank: usize, at: usize, bad: *[3]usize) !usize {
++    const gpa = t.allocator;
++    _ = setenv("TF_GLM_KV8_INT8", "1", 1);
++    defer _ = unsetenv("TF_GLM_KV8_INT8");
++    state.lat_split = world;
++    state.ik_split = true;
++    defer {
++        state.lat_split = 1;
++        state.ik_split = false;
++    }
++    var d = Mem.driver();
++    var w: weights.Weights = undefined;
++    w.config = .{};
++    w.config.dsa = true;
++    w.config.rope = 64;
++    var layers: [3]weights.Layer = undefined;
++    for (&layers) |*l| l.mixer = .{ .mla = undefined };
++    w.layers = &layers;
++    w.share = try shard.Share.of(&w.config, 0, 2);
++    const c = &w.config;
++    const lw: usize = c.kv_lora + c.rope;
++    const sb: usize = 8;
++    const capacity: usize = 4096;
++    var st = try state.State.initHead(gpa, &d, &w, capacity, true, false);
++    defer st.deinit();
++    const local = state.latRows(capacity);
++    const ik_row = st.ring_row;
++    const Fill = struct {
++        fn all(s: *const state.State, cc: *const @TypeOf(w.config), n: usize, lw_: usize, sb_: usize, ikr: usize, W: usize, r_: usize, poison: bool) void {
++            for (s.caches, 0..) |x, j| for (0..n) |lr| {
++                const p = lr * W + r_; // the position this local row holds
++                const code: [*]u8 = @ptrFromInt(x.lc + lr * lw_);
++                for (0..lw_) |i| code[i] = if (poison) 0xA5 else codeByte(j, p, i);
++                const sc: [*]align(1) f32 = @ptrFromInt(x.ls + lr * sb_);
++                for (0..sb_ / 4) |q| sc[q] = if (poison) std.math.nan(f32) else scaleVal(j, p, q);
++                if (state.dsaIndexed(cc, j, s.caches.len)) {
++                    const k: [*]u8 = @ptrFromInt(s.rings[2 * j] + lr * ikr);
++                    for (0..ikr) |i| k[i] = if (poison) 0x5A else codeByte(j + 7, p, i);
++                }
++            };
++        }
++    };
++    Fill.all(&st, c, local, lw, sb, ik_row, world, rank, false);
++    var pool = try pages.Pool.initTiers(gpa, &d, pages.page, 64 * pages.page);
++    defer pool.deinit();
++    const plan = try layout.Plan.init(&st, c, at, null);
++    var lease = try pool.take(plan.len);
++    defer pool.give(&lease);
++    const stream: cuda.Stream = .{ .d = &d, .handle = null };
++    try pool.move(stream, &lease, &plan, true);
++    Fill.all(&st, c, local, lw, sb, ik_row, world, rank, true);
++    try pool.move(stream, &lease, &plan, false);
++    for (st.caches, 0..) |x, j| {
++        var lr: usize = 0;
++        while (lr * world + rank < at) : (lr += 1) {
++            const p = lr * world + rank;
++            const code: [*]const u8 = @ptrFromInt(x.lc + lr * lw);
++            for (0..lw) |i| if (code[i] != codeByte(j, p, i)) {
++                bad[0] += 1;
++                break;
++            };
++            const sc: [*]align(1) const f32 = @ptrFromInt(x.ls + lr * sb);
++            for (0..2) |q| if (@as(u32, @bitCast(sc[q])) != @as(u32, @bitCast(scaleVal(j, p, q)))) {
++                bad[1] += 1;
++                break;
++            };
++            if (state.dsaIndexed(c, j, st.caches.len)) {
++                const k: [*]const u8 = @ptrFromInt(st.rings[2 * j] + lr * ik_row);
++                for (0..ik_row) |i| if (k[i] != codeByte(j + 7, p, i)) {
++                    bad[2] += 1;
++                    break;
++                };
++            }
++        }
++    }
++    return plan.len;
++}
++
++test "GLM FP8 KV: split ownership snapshot poison-restore, every rank's own int8 rows (both scale planes) and index keys" {
++    for ([_]usize{ 2, 4, 6 }) |world| for ([_]usize{ 1536, 1537, 4095 }) |at| {
++        var len0: usize = 0;
++        for (0..world) |rank| {
++            var bad: [3]usize = .{ 0, 0, 0 };
++            const len = try runSplit(world, rank, at, &bad);
++            std.debug.print("GLM FP8 KV split snapshot W={d} rank {d} at {d}: plan {d} bytes; bad own rows: codes {d} scales {d} keys {d}\n", .{ world, rank, at, len, bad[0], bad[1], bad[2] });
++            try t.expectEqual([3]usize{ 0, 0, 0 }, bad);
++            if (rank == 0) len0 = len else try t.expectEqual(len0, len); // every rank keeps the same bytes
++        }
++     };
++}
++
++test "GLM FP8 KV: a split prefix keeps ceil(at / W) rows a cache, about a W-th of the unsplit prefix's latent bytes" {
++    state.lat_split = 4;
++    defer state.lat_split = 1;
++    try t.expectEqual(@as(usize, 384), state.latHeld(1536));
++    try t.expectEqual(@as(usize, 385), state.latHeld(1537));
++    try t.expectEqual(@as(usize, 1537), state.ikHeld(1537)); // index keys stay whole without TF_GLM_KV_SPLIT=2
++}
+diff --git a/zig/src/families/glm/cuda_kv_split.zig b/zig/src/families/glm/cuda_kv_split.zig
+index e3f148b1d..5519565e2 100644
+--- a/zig/src/families/glm/cuda_kv_split.zig
++++ b/zig/src/families/glm/cuda_kv_split.zig
+@@ -65,7 +65,7 @@ pub fn why(err: anyerror) ?[]const u8 {
+         error.KvSplitWithPages => "TF_GLM_KV_SPLIT=1 does not run on KV pages (KV_PAGES=off)",
+         error.KvSplitWithShard => "TF_GLM_KV_SPLIT=1 and TF_GLM_KV_SHARD=1 exclude each other",
+         error.KvSplitWithMtp => "TF_GLM_KV_SPLIT=1 does not run with the target MTP head (DRAFTER=dspark, dflash2 or none)",
+-        error.KvSplitPromptCache => "TF_GLM_KV_SPLIT=1 keeps no prompt states yet (PROMPT_CACHE_GIB=0)",
++        error.KvSplitDisk => "TF_GLM_KV_SPLIT keeps prompt states on device and host pages, not on disk yet (LEARN_GIB=0)",
+         else => null,
+     };
+ }
+@@ -404,6 +404,7 @@ pub const Ctx = struct {
+         // attention, 32 rows at a time), so a prompt_logprobs panel measures the decode path's numerics
+         if (x.diag_window and x.lse) return x.decodeLse(k, stream, l, c, s, xin, x_stride, rows, pos, host_pos, proj_done);
+         const pf = x.prefetch and x.side_comm != null;
++        if (di == 0) x.filled = .{ null, null }; // a chunk's prefetches are its own (a restored state may sit anywhere)
+         const b: usize = if (pf) di % 2 else 0;
+         const lat = if (b == 0) x.full else x.full2;
+         const lats = if (b == 0) x.fulls else x.fulls2;
+diff --git a/zig/src/families/glm/cuda_snapshot_layout.zig b/zig/src/families/glm/cuda_snapshot_layout.zig
+index ada015c3b..750f1335a 100644
+--- a/zig/src/families/glm/cuda_snapshot_layout.zig
++++ b/zig/src/families/glm/cuda_snapshot_layout.zig
+@@ -66,9 +66,14 @@ pub const Plan = struct {
+     fn rows(p: *Plan, st: *const State, c: *const Config, x: cache.Caches, j: usize, at: usize) !void {
+         // glm_moe_dsa's BF16 latent rows carry the rope plane (576 wide); its index keys only on indexer layers + head
+         const lw: usize = @as(usize, c.kv_lora) + c.rope; // E4M3 codes as wide as the BF16 rows (KV=fp8 on the dsa)
+-        const latent = try std.math.mul(usize, at, lw * @as(usize, if (x.ls == 0) 2 else 1));
++        // TF_GLM_KV_SPLIT: this rank's own rows of the prefix (local rows 0 .. ceil(at / W)), and its own index keys
++        // with TF_GLM_KV_SPLIT=2 (cuda_state.latHeld, ikHeld; the MTP head's cache is never split: no MTP with it)
++        const head_cache = j >= st.caches.len;
++        const lat_at = if (head_cache) at else @import("cuda_state.zig").latHeld(at);
++        const ik_at = if (head_cache) at else @import("cuda_state.zig").ikHeld(at);
++        const latent = try std.math.mul(usize, lat_at, lw * @as(usize, if (x.ls == 0) 2 else 1));
+         const indexed = @import("cuda_state.zig").dsaIndexed(c, j, st.caches.len);
+-        const ring = if (indexed) try std.math.mul(usize, @min(at, st.ring_rows), st.ring_row) else 0;
++        const ring = if (indexed) try std.math.mul(usize, @min(ik_at, st.ring_rows), st.ring_row) else 0;
+         const gate = if (c.dsa) 0 else ring; // glm_moe_dsa's ig rings are never written: its select reads ik only
+         const pooled = try std.math.mul(usize, @min(at / sparse.pool + 2, x.pk_rows), @as(usize, c.i_dim) * 2);
+         const latent_row = lw * @as(usize, if (x.ls == 0) 2 else 1);
+@@ -77,7 +82,7 @@ pub const Plan = struct {
+             // 8-bit scales: beside the codes in the arena, or on pages a part's 512 after its codes; one FP32 a row
+             // (E4M3), two on the dsa's int8 rows (TF_GLM_KV8_INT8=1), so a prefix keeps every row's scales
+             const sb = latent_mod.scaleBytes(lw);
+-            if (x.ls != 0) try p.addLatent(st, x, x.ls, try std.math.mul(usize, at, sb), page_rows * sb);
++            if (x.ls != 0) try p.addLatent(st, x, x.ls, try std.math.mul(usize, lat_at, sb), page_rows * sb);
+         }
+         if (ring > 0) try p.add(st, st.rings[2 * j], ring);
+         if (gate > 0) try p.add(st, st.rings[2 * j + 1], gate);
+diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
+index 1e01e91f2..6a71d3c47 100644
+--- a/zig/src/families/glm/cuda_snapshots.zig
++++ b/zig/src/families/glm/cuda_snapshots.zig
+@@ -25,8 +25,6 @@ pub fn prepare(e: anytype, budget: u64) !void {
+ /// `budget` bytes of device pages and `host` bytes of pinned host pages, made once.
+ pub fn prepareTiers(e: anytype, budget: u64, host: u64) !void {
+     if (e.snap_pages != null or e.snaps.count() != 0) return error.SnapshotCacheMade;
+-    // TF_GLM_KV_SPLIT: a kept state would copy a rank's split rows as if whole (cuda_kv_split refuses a cache for now)
+-    if (@hasField(@TypeOf(e.*), "kvs")) if (e.kvs != null and budget + host > 0) return error.KvSplitPromptCache;
+     const count = std.math.cast(u32, budget / pages.page + host / pages.page) orelse return error.SnapshotBudget;
+     try e.snaps.ensureTotalCapacity(e.gpa, count);
+     try e.dropped.ensureTotalCapacity(e.gpa, @as(usize, count) + 1);
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index eb5234369..8baa7fe62 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -57,6 +57,17 @@ pub var lat_split: usize = 1;
+ /// TF_GLM_KV_SPLIT=2: the index keys split as the latent rows (their rings hold latRows rows).
+ pub var ik_split: bool = false;
+ 
++/// Latent rows of positions 0 .. at a rank holds (TF_GLM_KV_SPLIT: its own, counted as the most any rank holds,
++/// ceil(at / W), so every rank's kept prefix is the same size); unsplit `at`.
++pub fn latHeld(at: usize) usize {
++    return if (lat_split <= 1) at else (at + lat_split - 1) / lat_split;
++}
++
++/// Index-key rows of positions 0 .. at a rank holds: latHeld with TF_GLM_KV_SPLIT=2, else `at`.
++pub fn ikHeld(at: usize) usize {
++    return if (ik_split) latHeld(at) else at;
++}
++
+ /// Latent rows a cache holds for `capacity` tokens.
+ pub fn latRows(capacity: usize) usize {
+     return if (lat_split <= 1) capacity else @import("cuda_kv_split.zig").localRows(capacity, lat_split);
+-- 
+2.43.0
+

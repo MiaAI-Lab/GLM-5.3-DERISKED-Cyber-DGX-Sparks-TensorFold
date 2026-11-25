@@ -1,0 +1,70 @@
+From ba6fa577eed57b2922d21a346712ebb4cb68776c Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:02:39 +0200
+Subject: [PATCH] glm_moe_dsa: msa2 reads its latent keys coalesced (two keys'
+ 256 contiguous bytes a load instruction)
+
+The lane-per-half-key loads touched ~32 lines an instruction and held tf_glm_msa_w576 at ~0.9 TB/s whatever the picks
+(identical lists for every row ran as fast as random ones). The same bytes reach the same key rows of each warp
+region, so the same bits: one GB10, 4,096 rows x 16 heads x 2,048 picks, 10.74 -> 6.68 ms (9K context), 14.5 -> 9.3 ms
+(37K); outputs byte-identical at 4,096 x 16, 1,000 rows with short lists, and 64 x 12 heads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/glm_glue_msa.cuh | 27 +++++++++++++++------------
+ 1 file changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_msa.cuh b/zig/kernels/cuda/glm_glue_msa.cuh
+index a889ac34..c245d409 100644
+--- a/zig/kernels/cuda/glm_glue_msa.cuh
++++ b/zig/kernels/cuda/glm_glue_msa.cuh
+@@ -66,30 +66,33 @@ __device__ __forceinline__ int tok_at(const int* __restrict__ toks, int i) {
+     else return __ldg(toks + i);
+ }
+ 
+-// a lane's raw bytes of one tile: key (lane >> 1), half h (lane & 1) of its warp's columns: 64 latent, 8 rope values
++// a lane's raw bytes of one tile: 8 pieces of 8 latent values (coalesced, see load_raw), 8 rope values of key (lane >> 1)
+ struct Raw {
+     uint4 c[8];
+     uint4 r;
+ };
+ 
++// The latent pieces coalesced: lane L loads 16-byte piece (L & 15) of key 2 i + (L >> 4) for i < 8, so a load
++// instruction reads two keys' 256 contiguous bytes (the lane-per-half-key loads touched ~32 lines an instruction and
++// held the kernel at ~0.9 TB/s); the rope piece stays the lane's own key's. `tok` is this lane's key (lane >> 1) as
++// before; every lane of the warp calls it (warp-uniform), and put() writes the same key rows, so the same bits.
+ __device__ __forceinline__ void load_raw(Raw& x, const __nv_bfloat16* __restrict__ cache, int tok, int w, int h) {
+-    if (tok < 0) {
++    const int lane = threadIdx.x & 31, seg = lane & 15, hi = lane >> 4;
+ #pragma unroll
+-        for (int i = 0; i < 8; ++i) x.c[i] = make_uint4(0u, 0u, 0u, 0u);
+-        x.r = make_uint4(0u, 0u, 0u, 0u);
+-        return;
++    for (int i = 0; i < 8; ++i) {
++        const int kt = __shfl_sync(0xffffffffu, tok, 2 * (2 * i + hi));   // key 2 i + hi's position
++        x.c[i] = kt < 0 ? make_uint4(0u, 0u, 0u, 0u) : __ldg(reinterpret_cast<const uint4*>(cache + (long long)kt * ROW + WC * w) + seg);
+     }
+-    const __nv_bfloat16* row = cache + (long long)tok * ROW;
+-    const uint4* src = reinterpret_cast<const uint4*>(row + WC * w + 64 * h);
+-#pragma unroll
+-    for (int i = 0; i < 8; ++i) x.c[i] = __ldg(src + i);
+-    x.r = __ldg(reinterpret_cast<const uint4*>(row + LW + WR * w + 8 * h));
++    x.r = tok < 0 ? make_uint4(0u, 0u, 0u, 0u) : __ldg(reinterpret_cast<const uint4*>(cache + (long long)tok * ROW + LW + WR * w + 8 * h));
+ }
+ 
+-// the lane's raw values into its key's row of the warp region
++// the lane's raw values into the warp region: its latent pieces into keys 2 i + (lane >> 4), its rope into its own key's
++// row `krow` (key lane >> 1)
+ __device__ __forceinline__ void put(const Raw& x, __nv_bfloat16* __restrict__ krow, int h) {
++    const int lane = threadIdx.x & 31, seg = lane & 15, hi = lane >> 4;
++    __nv_bfloat16* k0 = krow - (size_t)(lane >> 1) * KROW;   // the region's key 0
+ #pragma unroll
+-    for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(krow + 64 * h + 8 * i) = x.c[i];
++    for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(k0 + (size_t)(2 * i + hi) * KROW + 8 * seg) = x.c[i];
+     *reinterpret_cast<uint4*>(krow + WC + 8 * h) = x.r;
+ }
+ 
+-- 
+2.43.0
+

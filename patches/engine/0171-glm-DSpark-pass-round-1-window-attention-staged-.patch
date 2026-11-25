@@ -1,0 +1,226 @@
+From 02ffda01f64a0137167541a77ff85350d8f740b3 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 08:10:28 +0200
+Subject: [PATCH] glm: DSpark pass, round 1: window attention staged in shared
+ memory with coalesced loads (0.91 -> 0.34 ms a layer), fc and down at the
+ drafter's bits (TF_GLM_DSPARK_FC_BF16=1 keeps fc bf16), DSpark's phase timing
+ under TF_GLM_DFLASH2_PROF
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/glm_dspark.cu  | 79 +++++++++++++++++++--------------
+ zig/src/families/glm/dflash.zig |  5 +++
+ zig/src/families/glm/dspark.zig | 19 ++++----
+ 3 files changed, 61 insertions(+), 42 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_dspark.cu b/zig/kernels/cuda/glm_dspark.cu
+index 34d9f27..5ab8075 100644
+--- a/zig/kernels/cuda/glm_dspark.cu
++++ b/zig/kernels/cuda/glm_dspark.cu
+@@ -75,60 +75,71 @@ extern "C" __global__ void __launch_bounds__(32)
+   vb[(size_t)r * HW + h * HD + d + 32] = row[2 * HW + h * HD + d + 32];
+ }
+ 
+-// The block attention, split: stream s, head h, chunk c (grid (S, H, CH + 1), 128 threads, a thread a key). The block's
+-// 8 queries (q [S BLOCK][HW]) see the ring's window positions lo .. start - 1, lo = max(from, start - WIN) (chunk c: its
+-// keys lo + c CK ..), and chunk CH the block's own keys kb / vb, causal (query m: keys 0 .. m). Per chunk and query: the
+-// running max pm, sum pl and unnormalized output pacc [S BLOCK][H][CH + 1][HD] (fp32), merged by ds_attn_merge.
++// The block attention, split: stream s, head h, chunk c (grid (S, H, CH + 1), 128 threads). The block's 8 queries
++// (q [S BLOCK][HW]) see the ring's window positions lo .. start - 1, lo = max(from, start - WIN) (chunk c: its keys
++// lo + c CK ..), and chunk CH the block's own keys kb / vb, causal (query m: keys 0 .. m). The chunk's keys and values
++// are first staged in shared memory with 16-byte coalesced loads (a key row padded to 66 values: no bank conflicts),
++// then a thread scores one key for the 8 queries. Per chunk and query: the running max pm, sum pl and unnormalized
++// output pacc [S BLOCK][H][CH + 1][HD] (fp32), merged by ds_attn_merge.
+ extern "C" __global__ void __launch_bounds__(128)
+     ds_attn_part(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kb,
+                  const __nv_bfloat16* __restrict__ vb, const unsigned long long* __restrict__ rings,
+                  const long long* __restrict__ starts, const long long* __restrict__ froms, int layer, float scale,
+                  float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pacc) {
++  constexpr int KP = HD + 2;  // a staged key row (66 values: 33 words, odd)
+   const int s = blockIdx.x, h = blockIdx.y, c = blockIdx.z, t = threadIdx.x;
+   __shared__ float qs[BLOCK][HD];
+   __shared__ float ps[BLOCK][CK];
+-  __shared__ float vs[CK][HD + 1];
++  __shared__ __align__(16) __nv_bfloat16 ks[CK * KP];
++  __shared__ __align__(16) __nv_bfloat16 vs[CK * HD];
+   __shared__ float red[BLOCK][4];
+   for (int i = t; i < BLOCK * HD; i += 128) qs[i / HD][i % HD] = bf(q[((size_t)s * BLOCK + i / HD) * HW + h * HD + i % HD]);
+   const long long start = starts[s];
+   const long long lo = max(froms[s], start - (long long)WIN);
+   const bool own = c == CH;
+-  const long long key = own ? (long long)t : lo + (long long)c * CK + t;  // own: block slot t (< BLOCK)
+-  const bool live = own ? t < BLOCK : key < start;
+-  const __nv_bfloat16* krow = nullptr;
+-  const __nv_bfloat16* vrow = nullptr;
+-  if (live) {
+-    if (own) {
+-      krow = kb + ((size_t)s * BLOCK + t) * HW + h * HD;
+-      vrow = vb + ((size_t)s * BLOCK + t) * HW + h * HD;
+-    } else {
+-      __nv_bfloat16* ring = reinterpret_cast<__nv_bfloat16*>(rings[s]);
+-      const size_t slot = (size_t)(key % WIN) * HW + (size_t)h * HD;
+-      krow = ring_k(ring, layer) + slot;
+-      vrow = ring_v(ring, layer) + slot;
++  const long long key0 = own ? 0 : lo + (long long)c * CK;
++  const int nkeys = own ? BLOCK : (int)max(0LL, min((long long)CK, start - key0));
++  __nv_bfloat16* ring = reinterpret_cast<__nv_bfloat16*>(rings[s]);
++  // stage: 8 16-byte units a row, a thread one unit at a time
++  for (int i = t; i < CK * (HD / 8); i += 128) {
++    const int row = i / (HD / 8), u = i % (HD / 8);
++    uint4 kv = make_uint4(0u, 0u, 0u, 0u), vv = make_uint4(0u, 0u, 0u, 0u);
++    if (row < nkeys) {
++      const __nv_bfloat16 *kr, *vr;
++      if (own) {
++        kr = kb + ((size_t)s * BLOCK + row) * HW + h * HD;
++        vr = vb + ((size_t)s * BLOCK + row) * HW + h * HD;
++      } else {
++        const size_t slot = (size_t)((key0 + row) % WIN) * HW + (size_t)h * HD;
++        kr = ring_k(ring, layer) + slot;
++        vr = ring_v(ring, layer) + slot;
++      }
++      kv = __ldg(reinterpret_cast<const uint4*>(kr) + u);
++      vv = __ldg(reinterpret_cast<const uint4*>(vr) + u);
+     }
++    uint32_t* kd = reinterpret_cast<uint32_t*>(ks + row * KP + u * 8);
++    kd[0] = kv.x; kd[1] = kv.y; kd[2] = kv.z; kd[3] = kv.w;
++    *reinterpret_cast<uint4*>(vs + row * HD + u * 8) = vv;
+   }
+   __syncthreads();
++  const bool live = t < nkeys;
+   float sc[BLOCK];
+ #pragma unroll
+   for (int m = 0; m < BLOCK; ++m) sc[m] = -INFINITY;
+   if (live) {
+-    float kr[HD];
+-#pragma unroll
+-    for (int d = 0; d < HD; ++d) kr[d] = bf(krow[d]);
++    float acc[BLOCK];
+ #pragma unroll
+-    for (int m = 0; m < BLOCK; ++m) {
+-      if (own && t > m) continue;  // causal inside the block
+-      float acc = 0.f;
++    for (int m = 0; m < BLOCK; ++m) acc[m] = 0.f;
++    const __nv_bfloat162* kr = reinterpret_cast<const __nv_bfloat162*>(ks + t * KP);
++#pragma unroll 8
++    for (int d2 = 0; d2 < HD / 2; ++d2) {
++      const float2 k2 = __bfloat1622float2(kr[d2]);
+ #pragma unroll
+-      for (int d = 0; d < HD; ++d) acc = fmaf(qs[m][d], kr[d], acc);
+-      sc[m] = acc * scale;
++      for (int m = 0; m < BLOCK; ++m) acc[m] = fmaf(qs[m][2 * d2], k2.x, fmaf(qs[m][2 * d2 + 1], k2.y, acc[m]));
+     }
+ #pragma unroll
+-    for (int d = 0; d < HD; ++d) vs[t][d] = bf(vrow[d]);
+-  } else {
+-#pragma unroll
+-    for (int d = 0; d < HD; ++d) vs[t][d] = 0.f;
++    for (int m = 0; m < BLOCK; ++m)
++      if (!own || t <= m) sc[m] = acc[m] * scale;  // causal inside the block
+   }
+   // per query: the chunk's max over its 128 keys (warp, then the 4 warps)
+   const int lane = t & 31, w = t >> 5;
+@@ -163,10 +174,12 @@ extern "C" __global__ void __launch_bounds__(128)
+   // unnormalized output: thread t -> query t / 16, dims (t % 16) * 4 .. + 3
+   const int m = t / 16, d0 = (t % 16) * 4;
+   float o[4] = {0.f, 0.f, 0.f, 0.f};
+-  for (int k = 0; k < CK; ++k) {
++  const int kn = nkeys;
++  for (int k = 0; k < kn; ++k) {
+     const float p = ps[m][k];
+-#pragma unroll
+-    for (int j = 0; j < 4; ++j) o[j] = fmaf(p, vs[k][d0 + j], o[j]);
++    const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(vs + k * HD + d0));
++    const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(vs + k * HD + d0 + 2));
++    o[0] = fmaf(p, a.x, o[0]); o[1] = fmaf(p, a.y, o[1]); o[2] = fmaf(p, b.x, o[2]); o[3] = fmaf(p, b.y, o[3]);
+   }
+   float* out = pacc + ((base + ((size_t)m * H + h) * (CH + 1) + c) * HD) + d0;
+ #pragma unroll
+diff --git a/zig/src/families/glm/dflash.zig b/zig/src/families/glm/dflash.zig
+index ab9032b..22bd676 100644
+--- a/zig/src/families/glm/dflash.zig
++++ b/zig/src/families/glm/dflash.zig
+@@ -382,6 +382,11 @@ pub const Drafter = struct {
+             }
+             _ = try dr.mark(e, .{ tm, 3 });
+             dr.calls += 1;
++            if (dr.prof != null and dr.calls % 64 == 0) {
++                const k: f64 = 64;
++                std.log.info("dspark ms a round: ingest {d:.2} tables {d:.2} block {d:.2} select {d:.2}", .{ dr.phase_ms[0] / k, dr.phase_ms[1] / k, dr.phase_ms[2] / k, dr.phase_ms[3] / k });
++                dr.phase_ms = @splat(0);
++            }
+             return;
+         }
+         try block.pass(dr, e, S, rank0);
+diff --git a/zig/src/families/glm/dspark.zig b/zig/src/families/glm/dspark.zig
+index ae0554c..d7b1b24 100644
+--- a/zig/src/families/glm/dspark.zig
++++ b/zig/src/families/glm/dspark.zig
+@@ -67,7 +67,7 @@ pub const Kernels = struct {
+     }
+ };
+ 
+-pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, qkv: df.Lin, kv: df.Lin, o: df.Lin, gu: df.Lin, down: mm.Tiled };
++pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, qkv: df.Lin, kv: df.Lin, o: df.Lin, gu: df.Lin, down: df.Lin };
+ 
+ /// DSpark's own half of a Drafter: weights, kernels, the host chain's tables, its scratch.
+ pub const Spark = struct {
+@@ -205,7 +205,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     errdefer wbuf.free();
+     var tmp = try cuda.DeviceBuffer.alloc(d, AUX * D * D * 2); // the largest linear as stored (fc)
+     defer tmp.free();
+-    const nk: usize = 2 * FF * D; // the largest 4-bit linear ([gate | up])
++    const nk: usize = @max(2 * FF * D, AUX * D * D); // the largest 4-bit linear (fc)
+     var raw = try cuda.DeviceBuffer.alloc(d, if (bits == 4) nk / 2 + 2 * nk / 16 + 1024 else 256);
+     defer raw.free();
+     var module = try cuda.Module.load(d, cuda.kernels.glm_dspark);
+@@ -238,9 +238,11 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+         const gate = try layerName(&nb[1], i, "mlp.gate_proj.weight");
+         const up = try layerName(&nb[2], i, "mlp.up_proj.weight");
+         lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, null);
+-        lw.down = try l.linearB(&.{try layerName(&nb[3], i, "mlp.down_proj.weight")}, &.{D}, FF, null);
++        // down at the drafter's bits too (it is not split: no fp32 partials to gather, unlike DFlash2's)
++        lw.down = try l.linear(&.{try layerName(&nb[3], i, "mlp.down_proj.weight")}, &.{D}, FF, null);
+     }
+-    sp.fc = .{ .bf16 = try l.linearB(&.{"fc.weight"}, &.{D}, AUX * D, null) };
++    // fc at the drafter's bits (TF_GLM_DSPARK_FC_BF16=1 keeps it bf16, the reference engine's precision)
++    sp.fc = if (bits == 4 and std.c.getenv("TF_GLM_DSPARK_FC_BF16") == null) try l.linear(&.{"fc.weight"}, &.{D}, AUX * D, null) else .{ .bf16 = try l.linearB(&.{"fc.weight"}, &.{D}, AUX * D, null) };
+     sp.hnorm = try l.raw("hidden_norm.weight", D * 2);
+     sp.norm = try l.raw("norm.weight", D * 2);
+     if (l.at > total) return error.DrafterLayout;
+@@ -270,7 +272,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     dr.cand = try gpa.alloc(i32, @import("dflash_candidates.zig").Layout.init(world, df.MAX_M, CW).host);
+     if (std.c.getenv("TF_GLM_DFLASH2_LOG")) |v| dr.log = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
+     if (std.c.getenv("TF_GLM_DFLASH2_PROF") != null) dr.prof = io;
+-    std.log.info("dspark: drafter from {s} (RedHatAI/GLM-5.3-speculator.dspark), linears at {d} bits, fc bf16, {d:.2} GiB weights + {d:.2} GiB scratch on the device", .{ dir, if (bits == 0) 16 else bits, @as(f64, @floatFromInt(l.at)) / (1 << 30), @as(f64, @floatFromInt(sp.scratch.len + dr.scratch.len)) / (1 << 30) });
++    std.log.info("dspark: drafter from {s} (RedHatAI/GLM-5.3-speculator.dspark), linears at {d} bits, fc {s}, {d:.2} GiB weights + {d:.2} GiB scratch on the device", .{ dir, if (bits == 0) 16 else bits, if (sp.fc == .bf16) "bf16" else "4 bits", @as(f64, @floatFromInt(l.at)) / (1 << 30), @as(f64, @floatFromInt(sp.scratch.len + dr.scratch.len)) / (1 << 30) });
+     return dr;
+ }
+ 
+@@ -305,12 +307,11 @@ fn carveCommon(dr: *df.Drafter, d: *const cuda.Driver, head_n: usize) !void {
+     var part: u64 = 16;
+     const sp = dr.spark.?;
+     for (sp.layers) |l| {
+-        for ([_]df.Lin{ l.qkv, l.kv, l.o, l.gu }) |w| if (w == .bf16) {
++        for ([_]df.Lin{ l.qkv, l.kv, l.o, l.gu, l.down }) |w| if (w == .bf16) {
+             part = @max(part, mm.partBytes(64, w.bf16));
+         };
+-        part = @max(part, mm.partBytes(64, l.down));
+     }
+-    part = @max(part, mm.partBytes(64, sp.fc.bf16));
++    if (sp.fc == .bf16) part = @max(part, mm.partBytes(64, sp.fc.bf16));
+     const fields = .{
+         .{ "part", part },                   .{ "gs", C * (AUX * D / 64) * 4 }, .{ "cin", C * TAP_ROW },         .{ "taps_step", df.STEP_ROWS * TAP_ROW },
+         .{ "taps_prefill", C * TAP_ROW },    .{ "ids", M * 4 },                 .{ "bpos", M * 4 },              .{ "rings", df.MAX_S * 8 },
+@@ -429,7 +430,7 @@ pub fn pass(dr: *df.Drafter, e: anytype, S: usize) !void {
+             a.add(@as(i32, @intCast(FF)));
+             try go(dr.k.swiglu, .{ .x = @intCast(M), .y = @intCast((FF + 1023) / 1024) }, 256, e, &a);
+         }
+-        try lin(dr, e, sp.act, .{ .bf16 = l.down }, sp.a, M);
++        try lin(dr, e, sp.act, l.down, sp.a, M);
+         try add(sp, e, sp.x, sp.a, M, D);
+     }
+     // h = norm(x) through the verifier's 4-bit draft head (this rank's vocabulary), its 16 best a row, gathered
+-- 
+2.43.0
+

@@ -1,0 +1,80 @@
+From 39db7862c668b7326d9917b013b0f422d2ecd2be Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:03:11 +0200
+Subject: [PATCH] glm_moe_dsa: TF_GLM_DSA_DUMP probes a select call's last row
+
+Its count, top-8 scored positions, non-finite scores, picks over eight
+spans of the visible keys, out-of-order picks and picks inside
+TF_GLM_DSA_WATCH=lo:hi. Off unless the variable is set.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index 8568e82..fdebdc0 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -120,9 +120,62 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+         inline for (.{ s.scores, tokens + a * dsa_width * 4, @as(i64, @intCast(np)), at, @as(c_int, dsa_width), counts + a * 4 }) |v| ta.add(v);
+         try cuda.launch.launch(set.glue.dsa_topk, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 } }, stream, &ta);
+         stamp.end();
++        if (a + n == rows and std.c.getenv("TF_GLM_DSA_DUMP") != null) try dsaProbe(set, stream, s.scores, tokens + (a + n - 1) * dsa_width * 4, counts + (a + n - 1) * 4, n - 1, np, np);
+     }
+ }
+ 
++/// TF_GLM_DSA_DUMP diagnosis: a call's last row (row `sr` of its block's scores, `vis` keys visible): its count, the
++/// top-8 scored positions, non-finite scores, its picks over eight equal spans of the visible keys, out-of-order picks,
++/// and the picks inside TF_GLM_DSA_WATCH=lo:hi. Synchronous on the stream: a diagnosis build only.
++fn dsaProbe(set: glue.Set, stream: cuda.Stream, scores: u64, toks: u64, cnt: u64, sr: usize, np: usize, vis: usize) !void {
++    const drv = set.glue.dsa_scores.d;
++    const S = struct {
++        var sc: [1 << 20]f32 = undefined;
++        var tk: [dsa_width]i32 = undefined;
++    };
++    if (np > S.sc.len) return;
++    var c: [1]i32 = undefined;
++    try drv.check(drv.api.cuMemcpyDtoHAsync_v2(&c, cnt, 4, stream.handle), "cuMemcpyDtoH");
++    try drv.check(drv.api.cuMemcpyDtoHAsync_v2(&S.sc, scores + sr * np * 4, np * 4, stream.handle), "cuMemcpyDtoH");
++    try drv.check(drv.api.cuMemcpyDtoHAsync_v2(&S.tk, toks, dsa_width * 4, stream.handle), "cuMemcpyDtoH");
++    try stream.synchronize();
++    var bad: usize = 0;
++    var top: [8]usize = @splat(0);
++    var topv: [8]f32 = @splat(-std.math.inf(f32));
++    for (S.sc[0..@min(vis, np)], 0..) |v, p| {
++        if (!std.math.isFinite(v)) {
++            bad += 1;
++            continue;
++        }
++        if (v <= topv[7]) continue;
++        var i: usize = 7;
++        while (i > 0 and v > topv[i - 1]) : (i -= 1) {
++            topv[i] = topv[i - 1];
++            top[i] = top[i - 1];
++        }
++        topv[i] = v;
++        top[i] = p;
++    }
++    var lo: usize = 0;
++    var hi: usize = 0;
++    if (std.c.getenv("TF_GLM_DSA_WATCH")) |w| {
++        var it = std.mem.splitScalar(u8, std.mem.span(w), ':');
++        lo = std.fmt.parseInt(usize, it.next() orelse "0", 10) catch 0;
++        hi = std.fmt.parseInt(usize, it.next() orelse "0", 10) catch 0;
++    }
++    var span: [8]usize = @splat(0);
++    var watched: usize = 0;
++    var unsorted: usize = 0;
++    const count: usize = @intCast(@max(c[0], 0));
++    for (S.tk[0..@min(count, dsa_width)], 0..) |t, i| {
++        const p: usize = @intCast(@max(t, 0));
++        span[@min(7, p * 8 / @max(vis, 1))] += 1;
++        if (p >= lo and p < hi) watched += 1;
++        if (i > 0 and t <= S.tk[i - 1]) unsorted += 1;
++    }
++    std.log.info("dsa_probe vis={d} cnt={d} bad={d} unsorted={d} watch={d} spans={any} top={any} topv={any}", .{ vis, count, bad, unsorted, watched, span, top, topv });
++}
++
+ /// sparse.index_update: the window's LayerNormed index keys and gates into ik and ig at pos, completed pools into pk.
+ pub fn indexUpdate(set: glue.Set, stream: cuda.Stream, k_raw: u64, k_stride: usize, gate: u64, ln_w: u64, ln_b: u64, ape: u64, ik: u64, ig: u64, pk: u64, t: latent.Table, pos: u64, rows: usize) !void {
+     var a: cuda.Args = .{};

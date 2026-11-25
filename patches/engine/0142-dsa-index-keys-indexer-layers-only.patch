@@ -1,0 +1,238 @@
+From 2ef2acc2aad0805b584385b6de894611daffafb0 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:38:18 +0200
+Subject: [PATCH] glm_moe_dsa: index keys only on indexer layers; no gate ring
+ or pooled keys
+
+Every MLA layer allocated a full-context index-key ring, a gate ring and
+pooled keys. glm_moe_dsa reads index keys only on its full indexer layers
+and the MTP head (the shared layers reuse a full layer's picks) and never
+touches the gate ring or pooled keys (Flash's pooled indexer). About
+5 GiB a rank at 262,144 tokens comes back to the window budget. The
+snapshot layout and the disk image follow the same per-layer rule, and
+the snapshot latent row is 576 wide.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_disk_image.zig      | 63 ++++++++++++-------
+ zig/src/families/glm/cuda_snapshot_layout.zig | 11 ++--
+ zig/src/families/glm/cuda_state.zig           | 16 ++++-
+ 3 files changed, 62 insertions(+), 28 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_disk_image.zig b/zig/src/families/glm/cuda_disk_image.zig
+index 81ade99..525bd1c 100644
+--- a/zig/src/families/glm/cuda_disk_image.zig
++++ b/zig/src/families/glm/cuda_disk_image.zig
+@@ -64,6 +64,7 @@ pub const Shape = struct {
+     capacity: u32,
+     head: bool, // the MTP head's caches are kept (drafting)
+     dsa: bool, // glm_moe_dsa: the ig rings are dead (its select reads ik only); the image keeps no ig part
++    unindexed: u128 = 0, // glm_moe_dsa: bit j set where DSA layer j holds no index keys (it reuses a full layer's picks)
+ 
+     pub fn of(st: *const State, c: *const Config, capacity: usize, head: bool) !Shape {
+         if (st.rings.len == 0) return error.SnapshotShape;
+@@ -85,6 +86,13 @@ pub const Shape = struct {
+             .capacity = @intCast(capacity),
+             .head = head,
+             .dsa = c.dsa,
++            .unindexed = blk: {
++                var m: u128 = 0;
++                for (0..st.caches.len) |j| if (!@import("cuda_state.zig").dsaIndexed(c, j, st.caches.len)) {
++                    m |= @as(u128, 1) << @intCast(j);
++                };
++                break :blk m;
++            },
+         };
+     }
+ 
+@@ -95,29 +103,37 @@ pub const Shape = struct {
+ };
+ 
+ /// One cache's parts in the lease's order, for `n` rows: latent, scales, the two index rings, the pooled keys.
+-fn cache(sh: Shape, n: u64) [5]u64 {
++/// Cache `j` (a DSA layer; the head is never unindexed): glm_moe_dsa keeps index keys on its indexer layers only and
++/// no pooled keys.
++fn cacheOf(sh: Shape, j: usize, n: u64) [5]u64 {
++    const indexed = j >= 128 or sh.unindexed & (@as(u128, 1) << @intCast(j)) == 0;
+     return .{
+         n * sh.latent,
+         if (sh.scales) n * 4 else 0,
+-        @min(n, sh.ring_rows) * sh.ring_row,
++        if (indexed) @min(n, sh.ring_rows) * sh.ring_row else 0,
+         if (sh.dsa) 0 else @min(n, sh.ring_rows) * sh.ring_row,
+-        @min(n / sparse.pool + 2, sh.pk_rows) * sh.pooled_row,
++        if (sh.dsa) 0 else @min(n / sparse.pool + 2, sh.pk_rows) * sh.pooled_row,
+     };
+ }
+ 
++/// The head's cache (always indexed).
++fn cache(sh: Shape, n: u64) [5]u64 {
++    return cacheOf(sh, 128, n);
++}
++
+ /// The image at `at` (a chunk start): the words, the prefix, each DSA layer's rows, the head's caches, the tail.
+ pub fn parts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator) !void {
+     if (at == 0 or at % sparse.pool != 0 or at > sh.capacity) return error.SnapshotShape;
+     try out.appendSlice(a, &.{ .{ .bytes = Words.bytes }, .{ .bytes = sh.prefix } });
+-    const pooled: u64 = at / sparse.pool;
+-    for (0..sh.layers) |_| {
+-        const c = cache(sh, at);
++    const pooled: u64 = if (sh.dsa) 0 else at / sparse.pool;
++    for (0..sh.layers) |j| {
++        const c = cacheOf(sh, j, at);
+         try out.append(a, .{ .bytes = c[0], .row = sh.latent });
+         if (sh.scales) try out.append(a, .{ .bytes = c[1], .row = 4 });
+         try out.append(a, .{ .bytes = c[2] });
+         if (c[3] > 0) try out.append(a, .{ .bytes = c[3] });
+         // whole pools are rows by position; the pool past them and the spare row stay the state's own
+-        try out.appendSlice(a, &.{ .{ .bytes = pooled * sh.pooled_row, .row = sh.pooled_row, .per = sparse.pool }, .{ .bytes = c[4] - pooled * sh.pooled_row } });
++        if (c[4] > 0) try out.appendSlice(a, &.{ .{ .bytes = pooled * sh.pooled_row, .row = sh.pooled_row, .per = sparse.pool }, .{ .bytes = c[4] - pooled * sh.pooled_row } });
+     }
+     if (sh.head) for (cache(sh, sh.headRows(at))) |n| if (n > 0) try out.append(a, .{ .bytes = n });
+     try out.append(a, .{ .bytes = sh.tail });
+@@ -144,8 +160,8 @@ pub fn segmentsFor(sh: Shape, at: u32, mtp_len: u64, latent: bool, out: *std.Arr
+         if (sh.prefix > 0) try out.append(a, .{ .img = img, .len = sh.prefix, .from = .{ .lease = 0 } });
+         img += sh.prefix;
+         lease += sh.prefix;
+-        const c = cache(sh, at);
+-        for (0..sh.layers) |_| {
++        for (0..sh.layers) |j| {
++            const c = cacheOf(sh, j, at);
+             if (c[0] + c[1] > 0) try out.append(a, .{ .img = img, .len = c[0] + c[1], .from = .absent });
+             img += c[0] + c[1];
+             const rest = c[2] + c[3] + c[4];
+@@ -166,7 +182,7 @@ pub fn segmentsFor(sh: Shape, at: u32, mtp_len: u64, latent: bool, out: *std.Arr
+ /// The image bytes after the words that sit in the lease as in the image: the prefix and every DSA layer's parts.
+ pub fn front(sh: Shape, at: u32) u64 {
+     var n: u64 = sh.prefix;
+-    for (0..sh.layers) |_| for (cache(sh, at)) |x| {
++    for (0..sh.layers) |j| for (cacheOf(sh, j, at)) |x| {
+         n += x;
+     };
+     return n;
+@@ -175,7 +191,7 @@ pub fn front(sh: Shape, at: u32) u64 {
+ /// The lease bytes of a state at `at` whose head holds `mtp_len` rows (layout.Plan's length for it).
+ pub fn leaseBytes(sh: Shape, at: u32, mtp_len: u64) u64 {
+     var n: u64 = sh.prefix + sh.tail;
+-    for (0..sh.layers) |_| for (cache(sh, at)) |x| {
++    for (0..sh.layers) |j| for (cacheOf(sh, j, at)) |x| {
+         n += x;
+     };
+     if (sh.head) for (cache(sh, mtp_len)) |x| {
+@@ -242,14 +258,19 @@ pub fn route(sh: Shape, prefixes: []const u64, at: u32, off: u64, len: u64, home
+ /// of latent or other bytes ends.
+ fn latentRun(sh: Shape, at: u32, x: u64) struct { latent: bool, end: u64 } {
+     const first = Words.bytes + sh.prefix;
+-    const c = cache(sh, at);
+-    const layer = c[0] + c[1] + c[2] + c[3] + c[4];
+-    if (x < first or layer == 0 or x >= first + sh.layers * layer) return .{ .latent = false, .end = std.math.maxInt(u64) };
+-    const j = (x - first) / layer;
+-    const o = (x - first) % layer;
+-    const lat = c[0] + c[1];
+-    if (o < lat) return .{ .latent = true, .end = first + j * layer + lat };
+-    return .{ .latent = false, .end = first + (j + 1) * layer };
++    if (x < first) return .{ .latent = false, .end = std.math.maxInt(u64) };
++    var start = first; // layer j's first byte (layers may differ: glm_moe_dsa's unindexed ones keep no ring)
++    for (0..sh.layers) |j| {
++        const c = cacheOf(sh, j, at);
++        const layer = c[0] + c[1] + c[2] + c[3] + c[4];
++        if (x < start + layer) {
++            const lat = c[0] + c[1];
++            if (x - start < lat) return .{ .latent = true, .end = start + lat };
++            return .{ .latent = false, .end = start + layer };
++        }
++        start += layer;
++    }
++    return .{ .latent = false, .end = std.math.maxInt(u64) };
+ }
+ 
+ /// The bytes past a rank's prefix that every rank's image shares and a rank's copy holds, as (offset past its prefix,
+@@ -257,9 +278,9 @@ fn latentRun(sh: Shape, at: u32, x: u64) struct { latent: bool, end: u64 } {
+ pub fn heldShared(sh: Shape, at: u32, latent: bool, out: *std.ArrayList([2]u64), a: std.mem.Allocator) !void {
+     const end = imageBytes(sh, at) - Words.bytes - sh.prefix;
+     if (latent) return out.append(a, .{ 0, end });
+-    const c = cache(sh, at);
+     var x: u64 = 0;
+-    for (0..sh.layers) |_| {
++    for (0..sh.layers) |j| {
++        const c = cacheOf(sh, j, at);
+         x += c[0] + c[1];
+         const rest = c[2] + c[3] + c[4];
+         if (rest > 0) try out.append(a, .{ x, rest });
+diff --git a/zig/src/families/glm/cuda_snapshot_layout.zig b/zig/src/families/glm/cuda_snapshot_layout.zig
+index 5f66940..37d47a8 100644
+--- a/zig/src/families/glm/cuda_snapshot_layout.zig
++++ b/zig/src/families/glm/cuda_snapshot_layout.zig
+@@ -63,17 +63,20 @@ pub const Plan = struct {
+     }
+ 
+     fn rows(p: *Plan, st: *const State, c: *const Config, x: cache.Caches, j: usize, at: usize) !void {
+-        const latent = try std.math.mul(usize, at, @as(usize, c.kv_lora) * @as(usize, if (x.ls == 0) 2 else 1));
+-        const ring = try std.math.mul(usize, @min(at, st.ring_rows), st.ring_row);
++        // glm_moe_dsa's BF16 latent rows carry the rope plane (576 wide); its index keys only on indexer layers + head
++        const lw: usize = if (x.ls == 0) @as(usize, c.kv_lora) + c.rope else c.kv_lora;
++        const latent = try std.math.mul(usize, at, lw * @as(usize, if (x.ls == 0) 2 else 1));
++        const indexed = @import("cuda_state.zig").dsaIndexed(c, j, st.caches.len);
++        const ring = if (indexed) try std.math.mul(usize, @min(at, st.ring_rows), st.ring_row) else 0;
+         const gate = if (c.dsa) 0 else ring; // glm_moe_dsa's ig rings are never written: its select reads ik only
+         const pooled = try std.math.mul(usize, @min(at / sparse.pool + 2, x.pk_rows), @as(usize, c.i_dim) * 2);
+-        const latent_row = @as(usize, c.kv_lora) * @as(usize, if (x.ls == 0) 2 else 1);
++        const latent_row = lw * @as(usize, if (x.ls == 0) 2 else 1);
+         if (p.latent) {
+             try p.addLatent(st, x, x.lc, latent, page_rows * latent_row);
+             // E4M3 scales: beside the codes in the arena, or on pages a part's 512 after its codes
+             if (x.ls != 0) try p.addLatent(st, x, x.ls, try std.math.mul(usize, at, @sizeOf(f32)), page_rows * @sizeOf(f32));
+         }
+-        try p.add(st, st.rings[2 * j], ring);
++        if (ring > 0) try p.add(st, st.rings[2 * j], ring);
+         if (gate > 0) try p.add(st, st.rings[2 * j + 1], gate);
+         try p.addCache(st, x, x.pk, pooled, page_rows / sparse.pool * @as(usize, c.i_dim) * 2);
+     }
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index ef92710..97f522b 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -60,6 +60,12 @@ pub const page_rows = latent.chunk;
+ pub const Paged = struct { kv: u64, pages: usize, page_bytes: u64, lat: u64 = 0, lat_page: u64 = 0, shard: bool = false };
+ 
+ /// The DSA (MLA) layers among the loaded ones; the MTP layer's caches come after theirs.
++/// Whether MLA cache `j` of `nd` (the last, `nd`, the MTP head's) holds index keys: every one on Flash; on glm_moe_dsa
++/// its full indexer layers and the head (glm_moe_dsa's layers are all MLA, so cache j is layer j).
++pub fn dsaIndexed(c: *const @import("config.zig").Config, j: usize, nd: usize) bool {
++    return !c.dsa or j >= nd or c.ifull.isSet(j);
++}
++
+ pub fn mlaLayers(w: *const weights.Weights) usize {
+     var nd: usize = 0;
+     for (w.layers) |l| nd += @intFromBool(l.mixer == .mla);
+@@ -127,7 +133,11 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
+     const lc_bytes = try latent.cacheBytes(capacity, if (kv8) c.kv_lora else c.kv_lora + c.rope, kv8);
+     for (0..nd + 1) |j| {
+         const on: usize = @intFromBool(j < nd or head); // the last is the MTP layer's
+-        try sizes.appendSlice(gpa, &.{ on * rows * lc_bytes, on * ik_rows * c.i_dim * 2, on * ring_rows * c.i_dim * 2, on * rows * pk_rows * c.i_dim * 2 });
++        // glm_moe_dsa: index keys only where an indexer writes and reads them (its full layers and the MTP head; the
++        // shared layers reuse a full layer's picks), and no gate ring or pooled keys (Flash's pooled indexer only)
++        const ik_on = on * @intFromBool(dsaIndexed(c, j, nd));
++        const flash: usize = @intFromBool(!c.dsa);
++        try sizes.appendSlice(gpa, &.{ on * rows * lc_bytes, ik_on * ik_rows * c.i_dim * 2, flash * on * ring_rows * c.i_dim * 2, flash * on * rows * pk_rows * c.i_dim * 2 });
+     }
+     try sizes.appendSlice(gpa, &.{ 4, c.hidden * 2 }); // MTP position and sequence-owned first-draft row
+     if (table) |t| try sizes.append(gpa, t * 4);
+@@ -516,11 +526,11 @@ pub const State = struct {
+         @memset(cur, 0);
+         const caches = try gpa.alloc(dsa_block.Caches, nd);
+         errdefer gpa.free(caches);
+-        for (caches, 0..) |*x, j| x.* = .{ .lc = p[8 + 4 * j], .ls = if (kv8) p[8 + 4 * j] + capacity * c.kv_lora else 0, .ik = p[9 + 4 * j], .ig = p[10 + 4 * j], .pk = p[11 + 4 * j], .pk_rows = pk_rows };
++        for (caches, 0..) |*x, j| x.* = .{ .lc = p[8 + 4 * j], .ls = if (kv8) p[8 + 4 * j] + capacity * c.kv_lora else 0, .ik = p[9 + 4 * j], .ig = p[10 + 4 * j], .pk = p[11 + 4 * j], .pk_rows = if (c.dsa) 0 else pk_rows };
+         const rings = try gpa.alloc(u64, 2 * (nd + 1));
+         for (0..nd + 1) |j| rings[2 * j ..][0..2].* = .{ p[9 + 4 * j], p[10 + 4 * j] };
+         const ring_rows = if (c.dsa) capacity else @min(capacity, index_ring); // glm_moe_dsa's ik rings span the context; rebases never fire
+-        var st: State = .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + @intFromBool(head) * capacity * c.kv_lora else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw, .kv8 = kv8, .head = head };
++        var st: State = .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + @intFromBool(head) * capacity * c.kv_lora else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = if (c.dsa) 0 else pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw, .kv8 = kv8, .head = head };
+         if (paged) |q| {
+             st.table = p[14 + 4 * nd];
+             if (q.shard) st.ltable = p[15 + 4 * nd];
+-- 
+2.43.0
+

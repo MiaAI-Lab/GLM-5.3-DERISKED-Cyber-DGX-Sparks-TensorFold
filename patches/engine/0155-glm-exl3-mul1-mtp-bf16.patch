@@ -1,0 +1,148 @@
+From e0a00f1b467e28c88d442704c1d9134d80a085a9 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 12:18:30 +0200
+Subject: [PATCH] glm: EXL3 experts on the mul1 codebook; an EXL3 checkpoint's
+ BF16 MTP experts
+
+GLM-5.3 EXL3 builds quantize their routed experts on the mul1 codebook
+(0xSero/GLM-5.3-EXL3-3.0bpw) or on mcg in one layer and mul1 in the rest
+(drowzeys/keys-GLM-5.3-EXL3, a resumed encode). The loader read only mcg
+markers. It now reads each expert's marker (mcg or mul1, the marker's
+value checked), requires one codebook a layer, and hands the layer's to
+the common EXL3 experts, whose grouped kernels take either (the prompt
+fast path stays mcg; mul1 layers' prompt chunks run the grouped path).
+admit() accepts "codebook": "mcg" or "mul1".
+
+An EXL3 checkpoint whose MTP layer keeps BF16 routed experts (drowzeys)
+gets them quantized to NVFP4 at load, as NVIDIA's NVFP4 checkpoint ships
+its BF16 MTP experts and this loader already serves them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_exl3.zig    | 43 +++++++++++++++++++--------
+ zig/src/families/glm/cuda_weights.zig |  7 ++++-
+ 2 files changed, 37 insertions(+), 13 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index 5ecd32f..5993855 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -1,5 +1,5 @@
+-//! GLM-5.3-Flash's EXL3 routed experts on CUDA: mcg trellis experts (Mia-AiLab's 4-bit checkpoint, or 3- and 4-bit
+-//! projections mixed by layer), the rest bf16. Each trellis's shape gives its width; a table a projection holds them.
++//! GLM-5.3-Flash's and GLM-5.3's EXL3 routed experts on CUDA: mcg or mul1 trellis experts (Mia-AiLab's 4-bit
++//! checkpoint, 3- and 4-bit projections mixed by layer, or mul1 3-bit builds), one codebook a layer, the rest bf16. Each trellis's shape gives its width; a table a projection holds them.
+ 
+ const std = @import("std");
+ const core = @import("core");
+@@ -46,7 +46,8 @@ fn number(v: std.json.Value) ?f64 {
+     };
+ }
+ 
+-/// The EXL3 checkpoints the kernels read: routed experts on the "mcg" codebook at 1 to 8 bits (everything else bf16).
++/// The EXL3 checkpoints the kernels read: routed experts on the "mcg" or "mul1" codebook at 1 to 8 whole bits (each
++/// layer's experts on one; the markers say which), everything else bf16.
+ /// The loader takes each trellis's width from its shape, so "bits" may be absent (a mixed checkpoint gives "avg_bits");
+ /// a "bits" or "avg_bits" given must still lie in that range.
+ pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why) !void {
+@@ -61,20 +62,21 @@ pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why
+     if (q.get("bits")) |bits| {
+         const b = number(bits);
+         if (b == null or b.? != @floor(b.?) or !(b.? >= lo and b.? <= hi)) {
+-            why.set("EXL3 at {f} bits: the CUDA family reads mcg experts of 1 to 8 whole bits", .{std.json.fmt(bits, .{})});
++            why.set("EXL3 at {f} bits: the CUDA family reads mcg or mul1 experts of 1 to 8 whole bits", .{std.json.fmt(bits, .{})});
+             return error.UnsupportedQuant;
+         }
+     }
+     if (q.get("avg_bits")) |avg| {
+         const b = number(avg);
+         if (b == null or !(b.? >= lo and b.? <= hi)) {
+-            why.set("EXL3 averaging {f} bits: the CUDA family reads mcg experts of 1 to 8 bits", .{std.json.fmt(avg, .{})});
++            why.set("EXL3 averaging {f} bits: the CUDA family reads mcg or mul1 experts of 1 to 8 bits", .{std.json.fmt(avg, .{})});
+             return error.UnsupportedQuant;
+         }
+     }
++    // a checkpoint's "codebook" names its default; the per-expert markers decide (a resumed encode can mix them by layer)
+     const book = q.get("codebook") orelse std.json.Value{ .null = {} };
+-    if (book != .string or !std.mem.eql(u8, book.string, "mcg")) {
+-        why.set("EXL3 codebook {f}: the CUDA family reads \"mcg\"", .{std.json.fmt(book, .{})});
++    if (book != .string or !(std.mem.eql(u8, book.string, "mcg") or std.mem.eql(u8, book.string, "mul1"))) {
++        why.set("EXL3 codebook {f}: the CUDA family reads \"mcg\" or \"mul1\"", .{std.json.fmt(book, .{})});
+         return error.UnsupportedQuant;
+     }
+ }
+@@ -98,6 +100,7 @@ pub const Experts = struct {
+     uniform_gu: u32 = 8,
+     uniform_d: u32 = 8,
+     shx: bool, // every expert's gate and up share one input rotation: a prompt rotates a row once, not once a pick
++    codebook: core.exl3_load.Codebook = .mcg, // the layer's (every expert and projection of it on the same one)
+ 
+     /// The gate, up and down width tables.
+     pub fn tables(w: Experts) [3]u64 {
+@@ -149,15 +152,27 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+         for (0..count, mine) |e, *k2| {
+             const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".trellis", .{ i, e });
+             if (refusal(t, m.k, m.n)) |why| {
+-                std.log.err("{s}: {s} (shape {any}); GLM's CUDA experts read mcg trellises of 1 to 8 bits", .{ L.last, why, t.shape[0..t.rank] });
++                std.log.err("{s}: {s} (shape {any}); GLM's CUDA experts read mcg or mul1 trellises of 1 to 8 bits", .{ L.last, why, t.shape[0..t.rank] });
+                 return error.UnreadableExl3;
+             }
+             const h = halves(t.dim(2)).?;
+             const tile = tileBytes(h);
+-            const marker = L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".mcg", .{ i, e }) catch return error.UnreadableExl3;
+-            if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
+-                std.mem.readInt(u32, marker.bytes[0..4], .little) != core.exl3_load.markers[0].value)
++            // the codebook marker (an i32 holding the codebook's multiplier): the layer's first sets it, the rest agree
++            var seen: ?core.exl3_load.Codebook = null;
++            inline for (core.exl3_load.markers) |mk| {
++                const got = L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ "." ++ mk.name, .{ i, e }) catch null;
++                if (got) |marker| {
++                    if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
++                        std.mem.readInt(u32, marker.bytes[0..4], .little) != mk.value or seen != null)
++                        return error.UnreadableExl3;
++                    seen = mk.codebook;
++                }
++            }
++            const cb = seen orelse return error.UnreadableExl3;
++            if (pi == 0 and e == 0) out.codebook = cb else if (cb != out.codebook) {
++                std.log.err("layer {d}: experts on more than one EXL3 codebook; GLM's CUDA experts take one a layer", .{i});
+                 return error.UnreadableExl3;
++            }
+             if (m.by_cols) { // every tile row, the rank's tile columns
+                 const row = (m.n / 16) * tile;
+                 for (0..kt) |r| try L.host.appendSlice(L.gpa, t.bytes[r * row + (cut.lo / 16) * tile ..][0 .. nt * tile]);
+@@ -242,7 +257,11 @@ pub fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) co
+         .experts = count,
+         .dims = dims,
+         .width = width,
+-        .codebook = .mcg,
++        .codebook = switch (w.codebook) {
++            .inst3 => .inst3,
++            .mcg => .mcg,
++            .mul1 => .mul1,
++        },
+         .limit = limit,
+         .act_mode = 0,
+         .uniform_k2 = if (w.uniform_gu == w.uniform_d) w.uniform_gu else 0,
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 048bfa4..5c0f3af 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -551,7 +551,12 @@ const Loader = struct {
+         const count: usize = c.experts;
+         var routed: cuda.experts.Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .width = ni, .dims = d, .experts = count, .limit = c.swiglu_limit };
+         var x3: ?exl3.Experts = null;
+-        if (c.exl3) { // the MTP layer's experts too
++        // an EXL3 checkpoint's MTP layer may keep BF16 experts (drowzeys/keys-GLM-5.3-EXL3): quantized to NVFP4 at load,
++        // as NVIDIA's NVFP4 checkpoint ships and this loader serves its BF16 MTP experts
++        const mtp_bf16 = c.exl3 and i == c.layers and if (L.get("layers.{d}.mlp.experts.0.gate_proj.trellis", .{i})) |_| false else |_| true;
++        if (mtp_bf16) {
++            routed = try L.nvfp4Experts(i);
++        } else if (c.exl3) { // the MTP layer's experts too
+             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
+         } else if (c.fp8) {
+             routed = try L.fp8Experts(i);
+-- 
+2.43.0
+

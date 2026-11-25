@@ -1,0 +1,34 @@
+From 26e641025d5b3041da741f8ef20be7695f17624c Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:49:51 +0200
+Subject: [PATCH] 0307: glm_moe_dsa never takes pieced prompt exchanges
+
+want_pieces refused DSA outright (error.DsaPieces killed every rank on
+a prompt past one piece): piecing only splits the exchange for overlap,
+so the family's graph runs whole() at any chunk size instead.
+
+Co-Authored-By: Devin <devin@cognition.ai>
+---
+ zig/src/families/glm/cuda_forward.zig | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 5e396ce..be9c026 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -479,9 +479,9 @@ pub const Forward = struct {
+         if (f.prof) |p| p.mark(f.stream, .embed);
+         var cut: [max_pieces][2]usize = undefined;
+         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
+-        // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
+-        const want_pieces = pieces > 1 or (pieces == 1 and f.splits(R));
+-        if (want_pieces and c.dsa) return error.DsaPieces;
++        // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too.
++        // glm_moe_dsa stays unpieced: piecing only splits the exchanges for overlap, so skipping it is never wrong.
++        const want_pieces = !c.dsa and (pieces > 1 or (pieces == 1 and f.splits(R)));
+         if (want_pieces) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+         try f.finish(R);
+         if (f.prof) |p| p.mark(f.stream, .head);
+-- 
+2.43.0
+

@@ -1,0 +1,8 @@
+/.state/
+/logs/
+/.env
+/scripts/local.sh
+/HANDOFF.md
+/scripts/exlr8/hosts.env
+__pycache__/
+docs/

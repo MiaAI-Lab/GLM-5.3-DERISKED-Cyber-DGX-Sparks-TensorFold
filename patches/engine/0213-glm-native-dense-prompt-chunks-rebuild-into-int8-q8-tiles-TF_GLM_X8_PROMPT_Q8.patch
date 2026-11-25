@@ -1,0 +1,2405 @@
+From 78bd1e3048e371f2149fd9c016687fb07cd1c7ec Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Wed, 18 Nov 2026 12:14:25 +0200
+Subject: [PATCH] glm: EXLR8 native prompt chunks on int8 tiles built straight
+ from the trellis, once per layer per chunk (x18)
+
+Patch 0212 rebuilt every dense projection as bf16 rows and tiled them on every prompt call (614 rebuilds + 614 tile passes a 4,096-row
+chunk, then the slower bf16 GEMM): 810 tok/s against the interim lane's 1,022. With the interim lane's packing on (tiled,
+TF_GLM_DENSE_BITS=8), a prompt chunk now rebuilds the matrix with exlr8_recon.cu's tf_x8_recon_q8 directly into the int8 codes (+128) in
+glm_mm_tile8's order and the fp16 absmax/127 scales per 64 inputs that glm_mm8_128s2 reads: the bytes cuda_qpack.quantize + glm_mm_tile8
+make at load from X8's bf16 rows (tf_x8_recon's bf16 values, integer rounding; fp32 divide, halves to even, clamp 127). The tiles live in a
+ring (cuda_x8.zig Ring, one layer's four largest distinct shapes, ~89 MiB against the 151 MB of bf16 rows + tiles) keyed by the
+projection's device weights and the stream, so the two DSA halves of a chunk share them: one rebuild per projection per layer per chunk.
+Decode rows keep the E4M3 EXL3 linear. TF_GLM_X8_PROMPT_Q8=0 returns to the bf16 rebuild. Credit: EXLR8 is kindlingai's (Matt Mastracci)
+exlr8-v2 format; TensorFold (ashhart) supplies exlr8.cu and the EXL3 kernels.
+
+Codex review r2 fixes (same patch, default paths unchanged):
+- the first GEMM after a ring/tile rebuild is launched without PDL (cuda_mm.matmulFrom fresh): a programmatic launch could load the
+  rebuilt weights before the rebuild grid completed (q8 and tiled bf16 paths); cache hits keep PDL.
+- with q8 prompt mode on, native prompt chunks of 1-16 rows take the int8 tiles too (they took the decode linear), as the interim lane.
+- each shared expert chooses its stored format independently of q_b. TF_GLM_KV_SPLIT keeps glm_moe_dsa on solo verifies
+  even with TF_GLM_DSA_SHARED=1, and Engine.verifyShared refuses a split cache.
+
+Codex review r4 fixes:
+- EXLR8 checks a per-rank load lower bound for the uploaded weights and largest BF16 tiling buffer against raw MemAvailable.
+  Startup also checks the actual allocation bytes for uploads, tiling, X8, DFlash2 and paged KV. The floor uses
+  TF_GLM_START_FLOOR_MIB (default 2304, 0 disables it), and an unreadable MemAvailable refuses guarded allocations.
+- The resident estimate includes packed block-FP8 q_a/kv_a and the selected draft head. The ordinary reserve and
+  memory budget apply to further streams and caches.
+- EXLR8 ranks hash loaded formats and bit widths by layer and projection, including the effective TF_GLM_X8_PROMPT_Q8 switch.
+
+Tests cover the ring, cache walk, weight sizing, both boot receipts, floor refusal and equal-total rank mismatches
+in test-glm-x8-host. The existing glm-x8-q8 device gate checks tiles, scales and prompt rows against the interim path.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/exlr8_recon.cu              |  121 +++++++
+ zig/src/families/glm/cuda.zig                |    2 
+ zig/src/families/glm/cuda_engine.zig         |   41 ++
+ zig/src/families/glm/cuda_fp8pb.zig          |   12 +
+ zig/src/families/glm/cuda_lanes.zig          |    5 
+ zig/src/families/glm/cuda_lanes_test.zig     |   16 +
+ zig/src/families/glm/cuda_mm.zig             |   20 +
+ zig/src/families/glm/cuda_mtp_load.zig       |    2 
+ zig/src/families/glm/cuda_mxfp8.zig          |    1 
+ zig/src/families/glm/cuda_native.zig         |   24 +
+ zig/src/families/glm/cuda_pages.zig          |    7 
+ zig/src/families/glm/cuda_start_floor.zig    |   43 ++
+ zig/src/families/glm/cuda_state.zig          |   20 +
+ zig/src/families/glm/cuda_tile.zig           |    5 
+ zig/src/families/glm/cuda_weight_bytes.zig   |  457 ++++++++++++++++++++++++++
+ zig/src/families/glm/cuda_weight_formats.zig |  111 ++++++
+ zig/src/families/glm/cuda_weights.zig        |    9 -
+ zig/src/families/glm/cuda_x8.zig             |  406 ++++++++++++++++++++++-
+ zig/src/families/glm/dflash_load.zig         |    9 -
+ zig/src/native/cuda_family_memory.zig        |    5 
+ zig/tests/cuda/glm_x8_q8_tests.zig           |  456 ++++++++++++++++++++++++++
+ zig/tests/cuda/main.zig                      |    2 
+ 22 files changed, 1697 insertions(+), 77 deletions(-)
+ create mode 100644 zig/src/families/glm/cuda_start_floor.zig
+ create mode 100644 zig/src/families/glm/cuda_weight_bytes.zig
+ create mode 100644 zig/src/families/glm/cuda_weight_formats.zig
+ create mode 100644 zig/tests/cuda/glm_x8_q8_tests.zig
+
+diff --git a/zig/kernels/cuda/exlr8_recon.cu b/zig/kernels/cuda/exlr8_recon.cu
+index 696bc71a9..8b2f68217 100644
+--- a/zig/kernels/cuda/exlr8_recon.cu
++++ b/zig/kernels/cuda/exlr8_recon.cu
+@@ -93,3 +93,124 @@ extern "C" __global__ void __launch_bounds__(256) tf_x8_recon(const TfX8Recon a)
+ 
+ // Shared memory one block takes.
+ #define TF_X8_RECON_SMEM (128 * TF_X8_LD * 4)
++
++// ---- X17/X18: the same bf16 values without double arithmetic (tf_x8_recon_q8 below). GB10 runs FP64 at 1/64 of FP32, and tf_x8_bf16's value (v * suh * so, one nearest-even rounding)
++// took two DMULs, three conversions and a DSETP a weight. v (|v| < 2^33) * the two fp16 significands (11 bits each) is
++// an integer under 2^55: one 64-bit multiply, a clz and a nearest-even shift give the same bf16 bit for bit. Inputs
++// the integer path does not cover (a zero or non-finite scale, a result outside bf16's normal range) take the old
++// double expression, so the result is the old kernel's for every input.
++__device__ __forceinline__ unsigned short tf_x8_bf16_int(long long v, __half hs, __half hu) {
++  const unsigned bu = __half_as_ushort(hu), bs = __half_as_ushort(hs);
++  const unsigned eu = (bu >> 10) & 31, es = (bs >> 10) & 31;
++  if (eu == 0 || es == 0 || eu == 31 || es == 31 || v == 0) {  // subnormal / zero / inf / nan scales, v == 0: the old expression
++    return tf_x8_bf16((double)v * (double)__half2float(hu) * ((double)__half2float(hs) * 0x1p-16));
++  }
++  const unsigned long long mu = 1024u | (bu & 1023u), ms = 1024u | (bs & 1023u);  // value = m * 2^(e - 15 - 10)
++  const unsigned sign = ((v < 0) ? 1u : 0u) ^ (bu >> 15) ^ (bs >> 15);
++  const unsigned long long a = (unsigned long long)(v < 0 ? -v : v);
++  unsigned long long P = a * mu * ms;  // < 2^33 * 2^22
++  const int p = 63 - __clzll(P);       // leading bit
++  int e2 = (int)eu + (int)es - 30 - 20 - 16;  // value = P * 2^e2
++  unsigned long long q;
++  int shift = p - 7;
++  if (shift > 0) {
++    q = P >> shift;
++    const unsigned long long rem = P & ((1ull << shift) - 1), half = 1ull << (shift - 1);
++    if (rem > half || (rem == half && (q & 1))) ++q;
++    if (q == 256) { q = 128; ++shift; }
++  } else {
++    q = P << (-shift);
++    shift = 0 + shift;  // exact: shift <= 0 keeps every bit
++  }
++  // value = q * 2^(shift + e2), q in [128, 255]: bf16 exponent field = 127 + 7 + shift + e2
++  const int be = 127 + 7 + shift + e2;
++  if (be <= 0 || be >= 255) return tf_x8_bf16((double)v * (double)__half2float(hu) * ((double)__half2float(hs) * 0x1p-16));
++  return (unsigned short)((sign << 15) | ((unsigned)be << 7) | ((unsigned)q & 127u));
++}
++
++__device__ __forceinline__ unsigned short tf_x8_frag_k(int lane, int v) {
++  const int t = lane & 3, kt = v >> 2, j = v & 3;
++  return (unsigned short)(kt * 16 + 2 * t + (j & 1) + (j >> 1) * 8);
++}
++
++// ---- X18: prompt chunks' int8 tiles, straight from the trellis ---------------------------------------------------------
++// glm_mm8_128s2 (the interim lane's dense prompt kernel) reads a linear as int8 codes (value + 128) in glm_mm's tile order
++// with one fp16 scale per 64 inputs of an output row. The interim lane made them at load: X8's bf16 rows ->
++// cuda_qpack.quantize (fp16 absmax / 127 scale, fp32 divide, halves to even, clamp +-127) -> glm_mm_tile8. This kernel
++// writes the same bytes from the trellis in one pass: the block's 128 x 128 bf16 values are tf_x8_recon's (nearest even,
++// bit for bit), then each (output row, 64-input group) is quantised the way qpack does and stored in the tile order
++// (16 codes a lane's chunk = one 16-byte store). No bf16 rows, no second pass. The matrix may be one of a [gate | up]
++// stack: it writes rows row0.. of an n_total-row stack, row0 a multiple of 128.
++struct TfX8ReconQ { const uint8_t* t; const __half* suh; const __half* svh; uint8_t* q; __half* s; unsigned k, n, bits, row0, n_total, pad0; };
++
++#define TF_X8_Q_THREADS 512
++
++extern "C" __global__ void __launch_bounds__(TF_X8_Q_THREADS) tf_x8_recon_q8(const TfX8ReconQ a) {
++  extern __shared__ int tblk[];
++  __shared__ float scl[256];  // [group of the block][output]: the fp16 scale as fp32
++  const unsigned ob = blockIdx.x, ib = blockIdx.y, tid = threadIdx.x, warp = tid / 32, lane = tid % 32, NW = TF_X8_Q_THREADS / 32;
++  const unsigned tb = 32 * a.bits, tiles_n = a.n / 16;
++  for (unsigned t = warp; t < 64; t += NW) {
++    const unsigned tr = t / 8, tc = t % 8;
++    const uint32_t* tile = reinterpret_cast<const uint32_t*>(a.t + ((uint64_t)(8 * ib + tr) * tiles_n + 8 * ob + tc) * tb);
++    __half w[8];
++    switch (a.bits) {
++      case 2: tf_exlr8_decode<2>(tile, lane, w); break;
++      case 3: tf_exlr8_decode<3>(tile, lane, w); break;
++      default: tf_exlr8_decode<4>(tile, lane, w); break;
++    }
++    for (unsigned q = 0; q < 8; ++q) {
++      const unsigned row = 16 * tr + 2 * (lane % 4) + (q & 1) + 8 * ((q >> 1) & 1);
++      const unsigned col = 16 * tc + lane / 4 + 8 * (q >> 2);
++      tblk[row * TF_X8_LD + col] = (int)__fmul_rn(__half2float(w[q]), 512.0f);
++    }
++  }
++  __syncthreads();
++  for (unsigned r = warp; r < 128; r += NW) {
++    int v[4];
++    for (int q = 0; q < 4; ++q) v[q] = tblk[r * TF_X8_LD + lane + 32 * q];
++    tf_x8_fwht(v, lane);
++    for (int q = 0; q < 4; ++q) tblk[r * TF_X8_LD + lane + 32 * q] = v[q];
++  }
++  __syncthreads();
++  for (unsigned c = warp; c < 128; c += NW) {
++    long long v[4];
++    for (int q = 0; q < 4; ++q) v[q] = tblk[(lane + 32 * q) * TF_X8_LD + c];
++    tf_x8_fwht(v, lane);
++    const __half so = a.svh[128 * ob + c];
++    for (int q = 0; q < 4; ++q) {
++      const unsigned i = lane + 32 * q;
++      tblk[i * TF_X8_LD + c] = tf_x8_bf16_int(v[q], so, a.suh[128 * ib + i]);
++    }
++  }
++  __syncthreads();
++  const unsigned KG = a.k / 64;
++  // scales: absmax over each group of 64 inputs of an output row, fp16 of absmax / 127 (cuda_qpack.quantize)
++  for (unsigned e = tid; e < 256; e += TF_X8_Q_THREADS) {
++    const unsigned o = e & 127, gl = e >> 7;
++    float amax = 0.0f;
++    for (unsigned j = 0; j < 64; ++j) amax = fmaxf(amax, fabsf(__uint_as_float((unsigned)tblk[(gl * 64 + j) * TF_X8_LD + o] << 16)));
++    const __half s16 = __float2half_rn(__fdiv_rn(amax, 127.0f));
++    scl[e] = __half2float(s16);
++    const uint64_t row = (uint64_t)a.row0 + 128 * ob + o;
++    a.s[((row >> 3) * KG + (2 * ib + gl)) * 8 + (row & 7)] = s16;
++  }
++  __syncthreads();
++  // codes: glm_mm_tile8's chunks of this block: 16 row tiles of 8 x 2 groups of 64 x 32 lanes, 16 codes (+128) each
++  for (unsigned e = tid; e < 1024; e += TF_X8_Q_THREADS) {
++    const unsigned l = e & 31, tg = e >> 5, ttl = tg >> 1, gl = tg & 1;
++    const unsigned o = ttl * 8 + (l >> 2);
++    const float sc = scl[gl * 128 + o];
++    const uint64_t tt = (uint64_t)(a.row0 + 128 * ob) / 8 + ttl, g = 2 * ib + gl;
++    unsigned w[4] = {0, 0, 0, 0};
++#pragma unroll
++    for (int v = 0; v < 16; ++v) {
++      const float x = __uint_as_float((unsigned)tblk[(gl * 64 + tf_x8_frag_k(l, v)) * TF_X8_LD + o] << 16);
++      int c = 0;
++      if (sc != 0.0f) c = (int)fmaxf(-127.0f, fminf(127.0f, rintf(__fdiv_rn(x, sc))));
++      w[v >> 2] |= (unsigned)(c + 128) << (8 * (v & 3));
++    }
++    uint4 u; u.x = w[0]; u.y = w[1]; u.z = w[2]; u.w = w[3];
++    *reinterpret_cast<uint4*>(a.q + ((tt * KG + g) * 32 + l) * 16) = u;
++  }
++}
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index d9a4513da..e95cef1dc 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -4,6 +4,8 @@ pub const experts = @import("cuda_experts.zig");
+ pub const exl3 = @import("cuda_exl3.zig");
+ pub const vision = @import("cuda_vision.zig");
+ pub const mm = @import("cuda_mm.zig");
++pub const x8 = @import("cuda_x8.zig");
++pub const qpack = @import("cuda_qpack.zig");
+ pub const vision_config = @import("vision_config.zig");
+ pub const image_core = @import("image_core.zig");
+ /// An image's bytes to the tower's patches, as the Metal family prepares them (core's decoder).
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index a9188d965..923461457 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -89,6 +89,8 @@ test "GLM heads: no MTP layer and no drafter loads no head and decodes plain; DF
+     };
+ }
+ 
++const start_floor = @import("cuda_start_floor.zig");
++
+ pub const Engine = struct {
+     gpa: std.mem.Allocator,
+     io: std.Io,
+@@ -206,6 +208,24 @@ pub const Engine = struct {
+         const spans = try gpa.alloc(shard.Span, world);
+         errdefer gpa.free(spans);
+         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
++        // An EXLR8 rank-piece checkpoint holds the host at its floor: no first window or scratch is allocated past it
++        start_floor.bytes = if (c.exl3_e4m3) try start_floor.configured() else 0;
++        errdefer start_floor.bytes = 0;
++        if (o.settings.layers > c.layers) return error.BadLayers;
++        const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
++        for (layers, 0..) |*l, i| l.* = @intCast(i);
++        const sel = heads(o.drafts, o.drafter, c.mtp); // every rank alike: the same config and options (cuda_ranks)
++        if (c.exl3_e4m3 and c.dsa) {
++            const weight_bytes = @import("cuda_weight_bytes.zig");
++            if (weight_bytes.read(gpa, io, checkpoint, c, share, o.settings, sel.heads)) |estimate| {
++                if (rank == 0) std.log.info("glm: {d:.2} GiB of resident EXLR8 weights estimated; BF16 load peak at least {d:.2} GiB", .{
++                    @as(f64, @floatFromInt(estimate.resident)) / (1 << 30),
++                    @as(f64, @floatFromInt(estimate.loadPeak())) / (1 << 30),
++                });
++                try start_floor.check(estimate.loadPeak());
++            } else |err| std.log.warn("glm: EXLR8 weight estimate unavailable ({s}); checking each allocation", .{@errorName(err)});
++        }
++        if (o.drafts and !sel.drafts and rank == 0) std.log.warn("glm: the checkpoint has no MTP layer (num_nextn_predict_layers 0) and no --drafter is given: decoding without drafts", .{});
+         var m = try fw.Modules.load(d, ctx, c.exl3_e4m3);
+         errdefer m.deinit();
+         const pair = prompt_pair.wanted(o.settings.pair, world);
+@@ -213,11 +233,6 @@ pub const Engine = struct {
+         errdefer pieces.deinit();
+         var side = try sideStream(d);
+         errdefer if (side) |*x| freeSide(x);
+-        if (o.settings.layers > c.layers) return error.BadLayers;
+-        const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
+-        for (layers, 0..) |*l, i| l.* = @intCast(i);
+-        const sel = heads(o.drafts, o.drafter, c.mtp); // every rank alike: the same config and options (cuda_ranks)
+-        if (o.drafts and !sel.drafts and rank == 0) std.log.warn("glm: the checkpoint has no MTP layer (num_nextn_predict_layers 0) and no --drafter is given: decoding without drafts", .{});
+         e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = sel.drafts, .mtp = false };
+         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
+         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
+@@ -244,6 +259,16 @@ pub const Engine = struct {
+         e.mtp = e.w.mtp != null; // before the first sequence: its caches hold the head's rows only with the head
+         // 0205b: the E4M3 EXL3 linear and the rebuild load only for a checkpoint whose dense files carry trellis projections (the
+         // default X8 checkpoint, K4 and NVFP4 load nothing new); the engine's own copy of the modules owns them from here
++        const q8 = e.w.x8s.items.len > 0 and x8_mod.q8Wanted(o.settings.tiled, o.settings.dense_bits);
++        if (c.exl3_e4m3 and world > 1) {
++            const word = @import("cuda_weight_formats.zig").fingerprint(&e.w, &e.packs, q8);
++            const words = try a.alloc(u64, world);
++            try ranks.gather(u64, d, lib, comm, stream, rank, word, words);
++            if (!std.mem.allEqual(u64, words, word)) {
++                std.log.err("EXLR8 dense formats or TF_GLM_X8_PROMPT_Q8 differ across ranks (fingerprints {any})", .{words});
++                return error.X8Mismatch;
++            }
++        }
+         if (e.w.x8s.items.len > 0) e.m.x8 = try x8_mod.Run.load(d);
+         errdefer if (e.m.x8) |*x| x.deinit();
+         if (e.m.x8) |*x| { // the EXLR8 trellis projections' scratch, sized by the largest, before any window
+@@ -253,8 +278,9 @@ pub const Engine = struct {
+                 x8_mod.mostOf(&most, p.*);
+                 trellis += p.bytes();
+             }
++            x.q8 = q8;
+             try x.reserve(gpa, most);
+-            if (rank == 0 and e.w.x8s.items.len > 0) std.log.info("glm: {d} EXLR8 trellis projections as stored (patch 0205b): {d:.2} GiB of trellis, {d:.2} GiB of scratch", .{ e.w.x8s.items.len, @as(f64, @floatFromInt(trellis)) / (1 << 30), @as(f64, @floatFromInt(x8_mod.Run.reserveBytes(most))) / (1 << 30) });
++            if (rank == 0 and e.w.x8s.items.len > 0) std.log.info("glm: {d} EXLR8 trellis projections as stored (patch 0205b): {d:.2} GiB of trellis, {d:.2} GiB of scratch; prompt chunks on {s}", .{ e.w.x8s.items.len, @as(f64, @floatFromInt(trellis)) / (1 << 30), @as(f64, @floatFromInt(x8_mod.Run.reserveBytes(most, x.q8))) / (1 << 30), if (x.q8) "int8 tiles (X18, TF_GLM_X8_PROMPT_Q8=0: bf16 rebuild)" else "bf16 rebuilds" });
+         }
+         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
+         e.m.tiled = o.settings.tiled;
+@@ -297,6 +323,7 @@ pub const Engine = struct {
+         if (seq_grow.pool) |p| {
+             const r = e.seqs.items[0].?.st.grow orelse return error.SeqGrowRefused;
+             const n = r.need(o.capacity);
++            try start_floor.check(@as(u64, n) * p.granularity);
+             try p.grow(n);
+             if (rank == 0) std.log.info("seq grow: one pool of {d} granules of {d} MiB ({d:.2} GiB), a whole window's rows; every stream's rows map from it as they grow (TF_GLM_SEQ_GROW=1)", .{ n, p.granularity >> 20, @as(f64, @floatFromInt(n * p.granularity)) / (1 << 30) });
+         }
+@@ -352,6 +379,7 @@ pub const Engine = struct {
+     }
+ 
+     pub fn deinit(e: *Engine) void {
++        defer start_floor.bytes = 0;
+         e.stream.synchronize() catch {};
+         if (e.side) |x| x.s.synchronize() catch {}; // shared-expert work still in flight reads buffers and weights freed below
+         if (e.mesh) |m| m.deinit();
+@@ -799,6 +827,7 @@ pub const Engine = struct {
+     /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
+     pub fn verifyShared(e: *Engine, parts: []const Part) !void {
+         const b = if (e.bs) |*x| x else return error.NoSharedWindows;
++        if (e.kvs != null or @import("cuda_state.zig").lat_split > 1) return error.SharedOnSplitCache; // rows at global positions: a split cache holds each token's on one rank
+         if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
+         var segs: [max_shared]fw.Seg = undefined;
+         var ids: [shared_rows]u32 = undefined;
+diff --git a/zig/src/families/glm/cuda_fp8pb.zig b/zig/src/families/glm/cuda_fp8pb.zig
+index 982c02bdc..99236578a 100644
+--- a/zig/src/families/glm/cuda_fp8pb.zig
++++ b/zig/src/families/glm/cuda_fp8pb.zig
+@@ -44,10 +44,16 @@ pub fn sizes(parts: []const Share) error{BadFp8Share}!struct { n: usize, k: usiz
+         if (!inside or s.khi - s.klo != k or s.klo % fp8.group != 0 or k % fp8.group != 0 or (s.hi - s.lo) % 64 != 0) return error.BadFp8Share;
+         n = std.math.add(usize, n, s.hi - s.lo) catch return error.BadFp8Share;
+     }
+-    const npad = (std.math.add(usize, n, 127) catch return error.BadFp8Share) / 128 * 128;
+-    if (n > std.math.maxInt(c_int) or k > std.math.maxInt(c_int) or npad > std.math.maxInt(c_int)) return error.BadFp8Share;
++    const storage = try packedSizes(n, k);
++    return .{ .n = n, .k = k, .codes = storage.codes, .scales = storage.scales };
++}
++
++/// Storage for a stacked projection. Scales are expanded to lane groups as f32.
++pub fn packedSizes(n: usize, k: usize) error{BadFp8Share}!struct { codes: usize, scales: usize } {
++    const npad = (std.math.add(usize, n, fp8.block - 1) catch return error.BadFp8Share) / fp8.block * fp8.block;
++    if (npad > std.math.maxInt(c_int) or k > std.math.maxInt(c_int)) return error.BadFp8Share;
+     const codes = std.math.mul(usize, npad, k) catch return error.BadFp8Share;
+-    return .{ .n = n, .k = k, .codes = codes, .scales = codes / fp8.group };
++    return .{ .codes = codes, .scales = codes / fp8.group };
+ }
+ 
+ /// `parts` packed one after another in 64-row tiles as the lane's one weight (cuda.fp8's order); padding 0 and 1.
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 985052f12..56df748d5 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -619,7 +619,10 @@ pub const Lanes = struct {
+ 
+     /// The lanes' `alone` at startup (cuda_native.finishRank): TF_GLM_SHARED=0, or glm_moe_dsa without its shared window
+     /// built and asked for (TF_GLM_DSA_SHARED=1 and cuda_shared.dsa_built).
+-    pub fn aloneAtStart(dsa: bool, shared_off: bool, dsa_shared_env: bool) bool {
++    /// TF_GLM_KV_SPLIT (`kv_split`) keeps glm_moe_dsa on solo verifies whatever TF_GLM_DSA_SHARED says: the shared window's
++    /// attention reads and writes the latent rows at global positions, but a split cache holds each token's rows on one rank only.
++    pub fn aloneAtStart(dsa: bool, shared_off: bool, dsa_shared_env: bool, kv_split: bool) bool {
++        if (dsa and kv_split) return true;
+         return !sharesForward(shared_off, dsa, dsa_shared_env and @import("cuda_shared.zig").dsa_built);
+     }
+ 
+diff --git a/zig/src/families/glm/cuda_lanes_test.zig b/zig/src/families/glm/cuda_lanes_test.zig
+index 4c2c0fcc5..d06aa0c1d 100644
+--- a/zig/src/families/glm/cuda_lanes_test.zig
++++ b/zig/src/families/glm/cuda_lanes_test.zig
+@@ -74,24 +74,26 @@ test "GLM dsa shared: an alone lane set tells the core one stream a round, a sha
+     var e: engine.Engine = undefined;
+     e.drafts = true;
+     e.drafter = null;
+-    const alone: Lanes = .{ .x = .{ .e = &e, .link = undefined }, .alone = Lanes.aloneAtStart(true, false, false) }; // not asked
++    const alone: Lanes = .{ .x = .{ .e = &e, .link = undefined }, .alone = Lanes.aloneAtStart(true, false, false, false) }; // not asked
+     try std.testing.expect(alone.alone); // glm_moe_dsa without TF_GLM_DSA_SHARED=1 never asks the core for a shared forward
+     const fa = alone.facts();
+     try std.testing.expectEqual(@as(@TypeOf(fa.max_streams), 1), fa.max_streams);
+     try std.testing.expect(!fa.hidden_rows);
+     try std.testing.expectEqual(@as(@TypeOf(fa.batch_rows), 0), fa.batch_rows);
+-    const sharing: Lanes = .{ .x = .{ .e = &e, .link = undefined }, .alone = Lanes.aloneAtStart(false, false, false) };
++    const sharing: Lanes = .{ .x = .{ .e = &e, .link = undefined }, .alone = Lanes.aloneAtStart(false, false, false, false) };
+     const fs = sharing.facts();
+     try std.testing.expectEqual(@as(@TypeOf(fs.max_streams), engine.max_shared), fs.max_streams);
+     try std.testing.expect(fs.hidden_rows);
+ }
+ 
+ test "GLM dsa shared: the startup rule and prompt batching keep glm_moe_dsa's prompts off shared.mixer" {
+-    try std.testing.expect(Lanes.aloneAtStart(true, false, false)); // glm_moe_dsa, nothing asked
+-    try std.testing.expectEqual(@import("cuda_shared.zig").dsa_built, !Lanes.aloneAtStart(true, false, true)); // asked: shared (built)
+-    try std.testing.expect(Lanes.aloneAtStart(true, true, true)); // TF_GLM_SHARED=0 wins
+-    try std.testing.expect(!Lanes.aloneAtStart(false, false, false)); // Flash: shared as before
+-    try std.testing.expect(Lanes.aloneAtStart(false, true, false)); // TF_GLM_SHARED=0
++    try std.testing.expect(Lanes.aloneAtStart(true, false, false, false)); // glm_moe_dsa, nothing asked
++    try std.testing.expectEqual(@import("cuda_shared.zig").dsa_built, !Lanes.aloneAtStart(true, false, true, false)); // asked: shared (built)
++    try std.testing.expect(Lanes.aloneAtStart(true, true, true, false)); // TF_GLM_SHARED=0 wins
++    try std.testing.expect(Lanes.aloneAtStart(true, false, true, true)); // TF_GLM_KV_SPLIT: solo verifies even when DSA_SHARED is asked
++    try std.testing.expect(!Lanes.aloneAtStart(false, false, false, true)); // a model without DSA is not touched
++    try std.testing.expect(!Lanes.aloneAtStart(false, false, false, false)); // Flash: shared as before
++    try std.testing.expect(Lanes.aloneAtStart(false, true, false, false)); // TF_GLM_SHARED=0
+     try std.testing.expect(!Lanes.batchesPrompts(true));
+     try std.testing.expect(Lanes.batchesPrompts(false));
+ }
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index 747d788d5..ff4189d76 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -187,7 +187,7 @@ fn a8Shared(bn: usize, gs: usize) u32 {
+ }
+ 
+ /// A packed 8-bit prompt call on int8 rows (TF_GLM_W8A8): the rows quantized into the scratch, then the IMMA kernel.
+-fn matmulA8(k: *const Kernels, a: A8, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, out: u64, m: usize, wide: bool) !void {
++fn matmulA8(k: *const Kernels, a: A8, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, out: u64, m: usize, wide: bool, pdl: bool) !void {
+     const mp = std.mem.alignForward(usize, m, 4);
+     const groups = m * (w.k / 64);
+     var q: cuda.Args = .{};
+@@ -214,7 +214,7 @@ fn matmulA8(k: *const Kernels, a: A8, s: cuda.Stream, x: u64, ldx: usize, w: Til
+     g.add(@as(c_int, @intCast(w.n)));
+     g.add(@as(c_int, @intCast(w.k)));
+     // row blocks fastest
+-    try cuda.launch.launch(k.mm8a8[@intFromBool(a.gs == 32)][@intFromBool(wide_tile)], .{ .grid = .{ .x = @intCast((m + 127) / 128), .y = @intCast((w.n + bn - 1) / bn) }, .block = .{ .x = 256 }, .shared = a8Shared(bn, a.gs), .pdl = k.pdl }, s, &g);
++    try cuda.launch.launch(k.mm8a8[@intFromBool(a.gs == 32)][@intFromBool(wide_tile)], .{ .grid = .{ .x = @intCast((m + 127) / 128), .y = @intCast((w.n + bn - 1) / bn) }, .block = .{ .x = 256 }, .shared = a8Shared(bn, a.gs), .pdl = pdl }, s, &g);
+ }
+ 
+ const split_target = 192; // column tiles times K slices a launch aims at (the GB10's SMs, a few blocks each)
+@@ -288,6 +288,13 @@ pub fn partBytes(m: usize, w: Tiled) usize {
+ 
+ /// x [m][k] (`ldx` apart) by `w` -> out [m][n] (`wide`: fp32); `one`: prompt blocks at any rows, sums per row alike.
+ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, out: u64, part: u64, m: usize, wide: bool, one: bool) !void {
++    return matmulFrom(k, s, x, ldx, w, out, part, m, wide, one, false);
++}
++
++/// `matmul` with `fresh`: the launch before it wrote this call's weights (a rebuild or a tiling): the first GEMM is launched
++/// without PDL. A programmatic launch may start its loads before the grid ahead of it has finished, and only that grid's
++/// completion (not its implicit trigger) makes its writes visible; the GEMM reads the weights before any wait.
++pub fn matmulFrom(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, out: u64, part: u64, m: usize, wide: bool, one: bool, fresh: bool) !void {
+     if (w.k % 64 != 0 or w.n % 8 != 0 or x % 16 != 0 or ldx % 8 != 0) return error.BadShape;
+     var done: usize = 0;
+     const wi = try widthIndex(w.bits);
+@@ -295,12 +302,13 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
+         const big = if (one) !k.prompt_fixed_k else m - done >= 128;
+         const rows = if (big) m - done else @min(m - done, 64);
+         if (big and one and w.bits == 8) if (k.a8) |a| if (a.takes(rows, w.k)) {
+-            try matmulA8(k, a, s, x + done * ldx * 2, ldx, w, out + done * w.n * @as(usize, if (wide) 4 else 2), rows, wide);
++            try matmulA8(k, a, s, x + done * ldx * 2, ldx, w, out + done * w.n * @as(usize, if (wide) 4 else 2), rows, wide, k.pdl and !(fresh and done == 0));
+             done += rows;
+             continue;
+         };
+         const i: usize = if (big) 3 else if (rows <= 16) 0 else if (rows <= 32) 1 else 2;
+         const bm = bucket(i);
++        const pdl = k.pdl and !(fresh and done == 0);
+         const sk = if (big) 1 else splitK(w.n, w.k); // a prompt's blocks share each weight tile in L2: no slices
+         const o = out + done * w.n * @as(usize, if (wide) 4 else 2);
+         var a: cuda.Args = .{};
+@@ -318,15 +326,15 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
+         const cols: u32 = @intCast((w.n + 63) / 64);
+         const row_blocks: u32 = @intCast((rows + bm - 1) / bm);
+         if (big and wi == 0) {
+-            try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = k.pdl }, s, &a);
++            try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = pdl }, s, &a);
+         } else if (big) { // packed prompts: the 128-row blocks in two stages, two an SM (the 3-stage kernel's sums)
+-            try cuda.launch.launch(k.packed_prompt[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = 256 }, .shared = sharedBytesStages(w.bits, bm, 2), .pdl = k.pdl }, s, &a);
++            try cuda.launch.launch(k.packed_prompt[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = 256 }, .shared = sharedBytesStages(w.bits, bm, 2), .pdl = pdl }, s, &a);
+         } else {
+             // 16- and 32-row blocks: the decode kernels at the chosen pipeline depth (the same sums as the 3-stage ones)
+             const dec: ?*const Kernels.Decode = if (i <= 1) (if (k.decode) |*tbl| &tbl[k.si] else null) else null;
+             const f = if (dec) |tbl| tbl.rows[wi][i] else if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
+             const shared = if (dec != null) sharedBytesStages(w.bits, bm, k.stages()) else sharedBytes(w.bits, bm);
+-            try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = shared, .pdl = k.pdl }, s, &a);
++            try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = shared, .pdl = pdl }, s, &a);
+         }
+         if (sk > 1) {
+             const total = rows * w.n;
+diff --git a/zig/src/families/glm/cuda_mtp_load.zig b/zig/src/families/glm/cuda_mtp_load.zig
+index 64c98ace8..f1c787631 100644
+--- a/zig/src/families/glm/cuda_mtp_load.zig
++++ b/zig/src/families/glm/cuda_mtp_load.zig
+@@ -55,7 +55,7 @@ pub fn draft(L: anytype, head_ck: *core.Checkpoint) !q4.Q4 {
+     try quant.q4(qk, L.stream, rows, n, k, raw[0].ptr, raw[1].ptr, raw[2].ptr);
+     var tiled: [3]u64 = undefined;
+     for (&tiled, q4.bytes(n, k), [_][]const u8{ "words", "scales", "biases" }) |*p, size, what| {
+-        p.* = try @import("cuda_upload_owner.zig").keep(L, try cuda.DeviceBuffer.alloc(L.d, size), "draft_head.{s}", .{what});
++        p.* = try @import("cuda_upload_owner.zig").keep(L, try L.scratch(size), "draft_head.{s}", .{what});
+     }
+     const quantized: q4.Q4 = .{ .w = tiled[0], .s = tiled[1], .b = tiled[2], .n = n, .k = k, .npad = q4.npadOf(n) };
+     try q4.pack(tk, L.stream, raw[0].ptr, raw[1].ptr, raw[2].ptr, quantized);
+diff --git a/zig/src/families/glm/cuda_mxfp8.zig b/zig/src/families/glm/cuda_mxfp8.zig
+index 36091dbf9..e6cfee15a 100644
+--- a/zig/src/families/glm/cuda_mxfp8.zig
++++ b/zig/src/families/glm/cuda_mxfp8.zig
+@@ -120,6 +120,7 @@ pub fn wideRows(d: *const cuda.Driver, gpa: std.mem.Allocator, ck: *core.Checkpo
+         std.log.err("{s}: its MXFP8 rows hold a value no bf16 does ({t}); the draft head quantizes bf16 rows", .{ module, e });
+         return e;
+     };
++    try @import("cuda_start_floor.zig").check(std.mem.sliceAsBytes(out).len);
+     return cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(out));
+ }
+ 
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 8b00c6200..8ea78556d 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -109,14 +109,18 @@ fn checked(p: Place) !Place {
+     return p;
+ }
+ 
+-/// Bytes this rank's weights take at most, for the server's admission: the checkpoint times its largest axis share.
+-pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64) u64 {
++/// The largest TP axis share for the server budget. EXLR8 checks its required load against the raw floor.
++pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64) ?u64 {
+     const p = place() catch return total;
+     const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return total;
++    defer a.free(path);
+     const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 24)) catch return total;
++    defer a.free(text);
+     const c = config.parse(a, text) catch return total;
+-    const f = (shard.Share.of(&c, p.rank, p.world) catch return total).part(&c);
+-    return @intCast(@as(u128, total) * f[0] / f[1]);
++    const share = shard.Share.of(&c, p.rank, p.world) catch return total;
++    if (c.exl3_e4m3) return null;
++    const f = share.part(&c);
++    return @as(u64, @intCast(@as(u128, total) * f[0] / f[1]));
+ }
+ 
+ /// Slots for `context` plus a verify window, a multiple of 64 so the sparse pool keeps the AOT set.
+@@ -375,7 +379,7 @@ fn finishRank(a: OpenArgs) !Loaded {
+         }
+     }.get;
+     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
+-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = @import("cuda_lanes.zig").Lanes.aloneAtStart(own.e.c.dsa, off("TF_GLM_SHARED"), on("TF_GLM_DSA_SHARED")), .mtp_confidence = o.mtp_confidence, .policy = policyBoot(own.e) };
++    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = @import("cuda_lanes.zig").Lanes.aloneAtStart(own.e.c.dsa, off("TF_GLM_SHARED"), on("TF_GLM_DSA_SHARED"), own.e.kvs != null), .mtp_confidence = o.mtp_confidence, .policy = policyBoot(own.e) };
+     // TF_GLM_SLOT_RESUME (default on, 0 off): a later prompt resumes on its slot's own rows (slot_resume.zig); glm_moe_dsa
+     // on its own windows only (Engine.rewindable refuses the rest on every rank)
+     if (own.e.c.dsa) std.log.info("shared windows: {s}", .{if (own.lanes.alone) "off, glm_moe_dsa's streams take rounds one window at a time (TF_GLM_DSA_SHARED=1: shared)" else "on, glm_moe_dsa's streams share decode windows (TF_GLM_DSA_SHARED=1)"});
+@@ -555,6 +559,10 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+             .{ ranks.max_world, ranks.max_world },
+         ),
+         error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4, MIXED_PRECISION and EXL3 mcg checkpoints (the log names what config.json has)",
++        error.X8Mismatch => "the EXLR8 ranks selected different dense weight formats or prompt modes",
++        error.BadStartFloor => "TF_GLM_START_FLOOR_MIB expects a nonnegative number of MiB (0 disables the check)",
++        error.MemoryFloor => "the GLM allocation would breach the raw MemAvailable floor (TF_GLM_START_FLOOR_MIB)",
++        error.MemoryFloorUnreadable => "cannot read MemAvailable from /proc/meminfo for the GLM startup floor",
+         error.UnreadableExl3 => "an EXL3 routed expert is not an mcg trellis of 1 to 8 bits with its marker and fp16 scales (the log names the tensor)",
+         error.UnreadableFormat => "a projection is stored in a format GLM-5.3-Flash on CUDA does not read (the log names its module, recipe and tensors)",
+         else => @import("cuda_kv_shard.zig").why(err) orelse @import("cuda_kv_split.zig").why(err),
+@@ -627,3 +635,9 @@ pub fn linkCapacity(cap: usize, media: ?images_mod.Limits) !usize {
+ test "a small text context still sizes the link for every offered media span" {
+     try std.testing.expectEqual(@as(usize, 792), try linkCapacity(64, .{ .image_tokens = 2048, .max_images = 8, .video_tokens = 4096, .max_videos = 2, .max_frames = 256 }));
+ }
++
++test {
++    _ = @import("cuda_weight_bytes.zig");
++    _ = @import("cuda_weight_formats.zig");
++    _ = @import("cuda_start_floor.zig");
++}
+diff --git a/zig/src/families/glm/cuda_pages.zig b/zig/src/families/glm/cuda_pages.zig
+index dfcbe9353..5f9592a08 100644
+--- a/zig/src/families/glm/cuda_pages.zig
++++ b/zig/src/families/glm/cuda_pages.zig
+@@ -1,6 +1,7 @@
+ //! GLM-5.3-Flash's KV pages on CUDA: the core pool's pages in one device arena, and the paged sequences that map them.
+ const std = @import("std");
+ const cuda = @import("cuda");
++const start_floor = @import("cuda_start_floor.zig");
+ const kv = @import("core").kv_pool;
+ const fw = @import("cuda_forward.zig");
+ const state = @import("cuda_state.zig");
+@@ -114,7 +115,7 @@ pub const Pages = struct {
+         const sharded = e.settings.kv_shard.on;
+         p.* = .{ .gpa = gpa, .e = e, .layout = l, .pool = try kv.Pool.init(gpa, if (sharded) 0 else pages, page), .arena = null, .leases = &.{}, .used = &.{}, .leader = leader, .poison = poisoned() };
+         errdefer p.pool.deinit();
+-        if (pages > 0 and !sharded) p.arena = try cuda.DeviceBuffer.alloc(e.d, pages * page);
++        if (pages > 0 and !sharded) p.arena = try start_floor.alloc(e.d, pages * page);
+         errdefer if (p.arena) |*a| a.free();
+         if (sharded) p.shard = try initShard(gpa, e, streams, pages, leader);
+         errdefer if (p.shard) |x| freeShard(gpa, x);
+@@ -174,9 +175,9 @@ pub const Pages = struct {
+         x.lids = try gpa.alloc(std.ArrayList(u32), streams);
+         @memset(x.lids, .empty);
+         errdefer gpa.free(x.lids);
+-        x.keys = try cuda.DeviceBuffer.alloc(e.d, 2 * h * g.keyPage());
++        x.keys = try start_floor.alloc(e.d, 2 * h * g.keyPage());
+         errdefer x.keys.?.free();
+-        x.lat = try cuda.DeviceBuffer.alloc(e.d, (h + 1) * g.latPage()); // the trash page last
++        x.lat = try start_floor.alloc(e.d, (h + 1) * g.latPage()); // the trash page last
+         return x;
+     }
+ 
+diff --git a/zig/src/families/glm/cuda_start_floor.zig b/zig/src/families/glm/cuda_start_floor.zig
+new file mode 100644
+index 000000000..c6ba6f7b7
+--- /dev/null
++++ b/zig/src/families/glm/cuda_start_floor.zig
+@@ -0,0 +1,43 @@
++//! The raw host memory floor for EXLR8 startup allocations.
++const std = @import("std");
++const cuda = @import("cuda");
++const memAvailable = @import("cuda_seq_grow.zig").memAvailable;
++
++pub var bytes: u64 = 0;
++
++pub fn configured() !u64 {
++    const v = std.c.getenv("TF_GLM_START_FLOOR_MIB") orelse return 2304 << 20;
++    const n = std.fmt.parseInt(u64, std.mem.span(v), 10) catch return error.BadStartFloor;
++    return std.math.mul(u64, n, 1 << 20) catch return error.BadStartFloor;
++}
++
++pub fn availableFor(floor: u64, wanted: u64, available: ?u64) !void {
++    const free = available orelse return error.MemoryFloorUnreadable;
++    if (free < floor or wanted > free - floor) return error.MemoryFloor;
++}
++
++fn gib(n: u64) f64 {
++    return @as(f64, @floatFromInt(n)) / (1 << 30);
++}
++
++pub fn check(wanted: u64) !void {
++    if (bytes == 0 or wanted == 0) return;
++    const free = memAvailable();
++    availableFor(bytes, wanted, free) catch |err| {
++        if (free) |av| std.log.err("memory floor: {d:.2} GiB wanted, MemAvailable {d:.2} GiB, floor {d:.2} GiB", .{ gib(wanted), gib(av), gib(bytes) });
++        return err;
++    };
++}
++
++pub fn alloc(d: *const cuda.Driver, size: usize) !cuda.DeviceBuffer {
++    try check(size);
++    return cuda.DeviceBuffer.alloc(d, size);
++}
++
++test "GLM X8: raw floor counts the whole allocation and refuses a missing reading" {
++    try availableFor(2304, 4096, 6400);
++    try std.testing.expectError(error.MemoryFloor, availableFor(2304, 4096, 6399));
++    try std.testing.expectError(error.MemoryFloor, availableFor(2304, std.math.maxInt(u64), std.math.maxInt(u64)));
++    try std.testing.expectError(error.MemoryFloorUnreadable, availableFor(2304, 4096, null));
++    try check(1 << 60); // Off for other checkpoints.
++}
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 323c6f118..d2855df13 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -45,7 +45,8 @@ const Arena = struct {
+ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
+     var total: usize = 0;
+     for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
+-    var a: Arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, @max(total, 256)) };
++    const bytes = @max(total, 256);
++    var a: Arena = .{ .buf = try @import("cuda_start_floor.zig").alloc(d, bytes) };
+     errdefer a.buf.free();
+     try a.buf.fill8(0, null);
+     for (sizes, out) |n, *p| p.* = a.take(n);
+@@ -176,10 +177,10 @@ fn b16Shapes(w: *const weights.Weights) [12][2]usize {
+     const n = s.kda.len() * c.kda_dim;
+     const kw = 3 * n + 2 * c.kda_dim + s.kda.len();
+     return .{
+-        .{ kw, c.hidden },                   .{ n, c.kda_dim },                    .{ c.hidden, n },
++        .{ kw, c.hidden },                            .{ n, c.kda_dim },                              .{ c.hidden, n },
+         // glm_moe_dsa's [q_a | kv_a] ends in a rope plane (its rows are kv_lora + rope wide), and its q_b's heads nope + rope
+         .{ c.q_lora + c.kv_lora + c.rope, c.hidden }, .{ s.mla.len() * (c.nope + c.rope), c.q_lora }, .{ c.i_dim + c.i_heads, c.hidden },
+-        .{ c.i_heads * c.i_dim, c.q_lora },  .{ c.hidden, s.mla.len() * c.v_dim }, .{ 2 * s.shared.len(), c.hidden },
++        .{ c.i_heads * c.i_dim, c.q_lora },           .{ c.hidden, s.mla.len() * c.v_dim },           .{ 2 * s.shared.len(), c.hidden },
+         .{ c.hidden, 2 * c.hidden }, // the MTP head's eh_proj
+         if (c.exl3) .{ 2 * s.dense.len(), c.hidden } else .{ c.hidden, 2 * c.hidden }, // bf16 dense layers: [gate | up]
+         if (c.exl3) .{ c.hidden, s.dense.len() } else .{ c.hidden, 2 * c.hidden }, // and down
+@@ -337,12 +338,12 @@ pub const Buffers = struct {
+             rows * S * 4, rows * S * S * 4, glue.hcPartBytes(rows), s.world * rows * D * 4,
+             if (prefill or shared) rows * kw * 2 else 4, rows * n * 2, rows * n * 2, // kproj, ka, kg (a lone window's: the state's)
+             rows * n * 2, rows * n * 4, rows * n * 2, rows * n * 4, // saves out, k, v, g
+-            rows * LL * 4,                    rows * n * 4,               rows * n * 2, // saves b, wide q, y
+-            rows * (c.q_lora + lw + c.rope) * 2, rows * c.q_lora * 2,        rows * (c.q_lora / 64) * 4, // glm_moe_dsa's [q_a | kv_a] is rope wider
+-            rows * (lw + c.rope) * 2,         rows * (lw / 64) * 4,       rows * HL * (c.nope + c.rope) * 2, // lat and q end in the rope plane
+-            rows * (c.i_dim + c.i_heads) * 2, rows * c.i_dim * 4,         glue.router_ks * rows * @max(count, c.i_dim) * 4,
+-            rows * HL * (lw + c.rope) * 2,    rows * HL * lw * 2,         rows * HL * c.v_dim * 2, // qa (rowW) and ol (lw)
+-            rows * c.i_heads * c.i_dim * 2,   partial_rows * HL * lw * 4, partial_rows * HL * 4,
++            rows * LL * 4, rows * n * 4, rows * n * 2, // saves b, wide q, y
++            rows * (c.q_lora + lw + c.rope) * 2, rows * c.q_lora * 2, rows * (c.q_lora / 64) * 4, // glm_moe_dsa's [q_a | kv_a] is rope wider
++            rows * (lw + c.rope) * 2,         rows * (lw / 64) * 4, rows * HL * (c.nope + c.rope) * 2, // lat and q end in the rope plane
++            rows * (c.i_dim + c.i_heads) * 2, rows * c.i_dim * 4,   glue.router_ks * rows * @max(count, c.i_dim) * 4,
++            rows * HL * (lw + c.rope) * 2,  rows * HL * lw * 2,         rows * HL * c.v_dim * 2, // qa (rowW) and ol (lw)
++            rows * c.i_heads * c.i_dim * 2, partial_rows * HL * lw * 4, partial_rows * HL * 4,
+             partial_rows * HL * 4,
+             4, // dummy
+             @min(seg, sparse.select_rows) * np_max * 4,
+@@ -448,7 +449,6 @@ pub const Buffers = struct {
+     }
+ };
+ 
+-
+ /// TF_GLM_SEQ_GROW: a Region for `sizes`' row fields (each cache's latent rows, codes then scales, and its index keys).
+ /// Their entries in `sizes` become 0, so the arena makes only the fixed fields, and `p` gets their region addresses.
+ fn growRegion(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, kv8: bool, sizes: []usize, p: []u64) !*seq_grow.Region {
+diff --git a/zig/src/families/glm/cuda_tile.zig b/zig/src/families/glm/cuda_tile.zig
+index f02d8bd3d..ea19dd5e3 100644
+--- a/zig/src/families/glm/cuda_tile.zig
++++ b/zig/src/families/glm/cuda_tile.zig
+@@ -1,6 +1,7 @@
+ //! GLM's linears tiled at load for glm_mm: bf16, or packed to 4, 6 or 8 bits in place (TF_GLM_DENSE_BITS, _HEAD_BITS).
+ const std = @import("std");
+ const cuda = @import("cuda");
++const start_floor = @import("cuda_start_floor.zig");
+ const weights = @import("cuda_weights.zig");
+ const mm_mod = @import("cuda_mm.zig");
+ const qpack = @import("cuda_qpack.zig");
+@@ -79,7 +80,7 @@ fn compact(w: *Weights, d: *const cuda.Driver, s: cuda.Stream, field: *u64, byte
+         if (b.ptr == old) break i;
+     } else return 0;
+     const was = w.buffers.items[at].len;
+-    var nb = try cuda.DeviceBuffer.alloc(d, bytes);
++    var nb = try start_floor.alloc(d, bytes);
+     errdefer nb.free(); // the weights own it only once it replaces the old buffer
+     try d.check(d.api.cuMemcpyDtoDAsync_v2(nb.ptr, old, bytes, s.handle), "cuMemcpyDtoDAsync");
+     try s.synchronize();
+@@ -100,7 +101,7 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
+     try linears(w, &list);
+     var most: usize = 0;
+     for (list.items) |e| most = @max(most, e.n * e.k * 2);
+-    var tmp = try cuda.DeviceBuffer.alloc(d, most);
++    var tmp = try start_floor.alloc(d, most);
+     defer tmp.free();
+     errdefer @import("cuda_load_owner.zig").drain(s, d);
+     var host: std.ArrayList(u16) = .empty; // a packed linear's bf16 rows, then its codes and scales, on the host
+diff --git a/zig/src/families/glm/cuda_weight_bytes.zig b/zig/src/families/glm/cuda_weight_bytes.zig
+new file mode 100644
+index 000000000..3b4cf7ebc
+--- /dev/null
++++ b/zig/src/families/glm/cuda_weight_bytes.zig
+@@ -0,0 +1,457 @@
++//! EXLR8 CUDA backbone and selected output heads sized from the same tensor headers the loader sees.
++const std = @import("std");
++const core = @import("core");
++const cuda = @import("cuda");
++const Config = @import("config.zig").Config;
++const Share = @import("cuda_shard.zig").Share;
++const ranks = @import("cuda_ranks.zig");
++const Settings = ranks.Settings;
++const weights = @import("cuda_weights.zig");
++const mm = @import("cuda_mm.zig");
++const q4 = @import("cuda_q4.zig");
++const fp8pb = @import("cuda_fp8pb.zig");
++const Entry = core.safetensors.Entry;
++
++pub const Estimate = struct {
++    resident: u64 = 0,
++    uploaded: u64 = 0, // weights present before tiling and compaction
++    tile: u64 = 0, // the tiler's largest BF16 staging buffer, allocated before freeing any uploads
++
++    pub fn loadPeak(e: Estimate) u64 {
++        return e.uploaded + e.tile;
++    }
++
++    fn add(e: *Estimate, b: Estimate) void {
++        e.resident += b.resident;
++        e.uploaded += b.uploaded;
++        e.tile = @max(e.tile, b.tile);
++    }
++
++    fn fixed(e: *Estimate, bytes: u64) void {
++        e.add(.{ .resident = bytes, .uploaded = bytes });
++    }
++};
++
++pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: Config, s: Share, settings: Settings, heads: weights.Heads) !Estimate {
++    var ck = try core.Checkpoint.openModelPrefixes(gpa, io, dir, &.{ "model.language_model.", "model.", "lm_head." });
++    defer ck.close();
++    const prefix = try weights.modelPrefix(&ck);
++    const split = ranks.environment("TF_GLM_DSA_SPLIT_QKVA");
++    var plan: Plan = .init(c, s, settings, weights.embedShard(c, s.world) orelse c.hidden, !eq(split orelse "", "0"), heads);
++    var seen: std.StringHashMapUnmanaged(void) = .empty;
++    defer seen.deinit(gpa);
++    for (ck.files.items) |*file| {
++        for (file.names.keys(), file.names.values()) |name, t| {
++            // Checkpoint.get resolves a duplicate name to its first shard.
++            if ((try seen.getOrPut(gpa, name)).found_existing) continue;
++            if (eq(name, "lm_head.weight")) {
++                if (t.rank == 2) plan.head = Matrix.of(t);
++            } else if (strip(name, prefix)) |key| {
++                plan.add(key, t);
++            }
++        }
++    }
++    return plan.estimate();
++}
++
++fn eq(a: []const u8, b: []const u8) bool {
++    return std.mem.eql(u8, a, b);
++}
++
++fn strip(s: []const u8, prefix: []const u8) ?[]const u8 {
++    return if (std.mem.startsWith(u8, s, prefix)) s[prefix.len..] else null;
++}
++
++const Matrix = struct {
++    n: usize = 0,
++    k: usize = 0,
++    dtype: core.safetensors.DType = .bf16,
++
++    fn of(t: Entry) Matrix {
++        return .{ .n = t.dim(0), .k = t.dim(1), .dtype = if (t.dtype == .f16) .bf16 else t.dtype };
++    }
++
++    fn stack(a: Matrix, b: Matrix) !Matrix {
++        if (a.n == 0) return b;
++        if (b.n == 0) return a;
++        if (a.k != b.k or a.dtype != b.dtype) return error.MixedProjection;
++        return .{ .n = a.n + b.n, .k = a.k, .dtype = a.dtype };
++    }
++
++    fn size(m: Matrix, bits: u8, tiled: bool) !Estimate {
++        if (m.dtype == .f8_e4m3) {
++            const z = try fp8pb.packedSizes(m.n, m.k);
++            const bytes = z.codes + z.scales * @sizeOf(f32);
++            return .{ .resident = bytes, .uploaded = bytes };
++        }
++        const uploaded = m.n * m.k * @sizeOf(u16);
++        const sizes = mm.packedBytes(m.n, m.k, bits);
++        return .{
++            .resident = if (bits == 16) uploaded else sizes[0] + sizes[1],
++            .uploaded = uploaded,
++            .tile = if (tiled) uploaded else 0,
++        };
++    }
++};
++
++const Projection = struct {
++    dense: [3]Matrix = @splat(.{}), // primary or gate, optional up, optional down
++    native: u64 = 0,
++    marker: bool = false,
++
++    fn size(p: Projection, native: bool, bits: u8, tiled: bool) !Estimate {
++        var out: Estimate = .{};
++        if (native) {
++            out.fixed(p.native);
++        } else {
++            out.add(try (try p.dense[0].stack(p.dense[1])).size(bits, tiled));
++            out.add(try p.dense[2].size(bits, tiled));
++        }
++        return out;
++    }
++
++    fn hasDense(p: Projection) bool {
++        return p.dense[0].n != 0 or p.dense[1].n != 0 or p.dense[2].n != 0;
++    }
++};
++
++const Kind = enum { qb, o, gate, up, down, sh_gate, sh_up, sh_down };
++const kinds = std.StaticStringMap(Kind).initComptime(.{
++    .{ "self_attn.q_b_proj", .qb },
++    .{ "self_attn.o_proj", .o },
++    .{ "mlp.gate_proj", .gate },
++    .{ "mlp.up_proj", .up },
++    .{ "mlp.down_proj", .down },
++    .{ "mlp.shared_experts.gate_proj", .sh_gate },
++    .{ "mlp.shared_experts.up_proj", .sh_up },
++    .{ "mlp.shared_experts.down_proj", .sh_down },
++});
++
++const Layer = struct {
++    qb: Projection = .{},
++    o: Projection = .{},
++    mlp: Projection = .{},
++    shared: Projection = .{},
++    qkva: [2]Matrix = @splat(.{}),
++    wk: Matrix = .{},
++    iw: Matrix = .{},
++    iqb: Matrix = .{},
++    routed: [2]u64 = @splat(0), // whole and pre-sliced forms
++    routed_whole: bool = false,
++    fixed: u64 = 0,
++};
++
++const Plan = struct {
++    c: Config,
++    s: Share,
++    tiled: bool,
++    dense_bits: u8,
++    head_bits: u8,
++    heads: weights.Heads,
++    head: Matrix = .{},
++    embed_cols: usize,
++    dec: ?weights.QkvaSlice,
++    layers: [@import("config.zig").max_layers]Layer = @splat(.{}),
++    count: usize,
++    other: u64 = 0,
++
++    fn init(c: Config, s: Share, set: Settings, embed_cols: usize, split: bool, heads: weights.Heads) Plan {
++        return .{
++            .c = c,
++            .s = s,
++            .tiled = set.tiled,
++            .dense_bits = if (set.tiled) set.dense_bits else 16,
++            .head_bits = if (set.tiled) set.head_bits else 16,
++            .heads = heads,
++            .embed_cols = embed_cols,
++            .dec = if (split) weights.qkvaSlice(c.q_lora, c.q_lora + c.kv_lora + c.rope, s.world, s.rank) else null,
++            .count = if (set.layers == 0) c.layers else @min(set.layers, c.layers),
++        };
++    }
++
++    fn add(p: *Plan, key: []const u8, t: Entry) void {
++        if (eq(key, "embed_tokens.weight")) {
++            p.other += t.dim(0) * p.embed_cols * 2;
++            return;
++        }
++        if (eq(key, "norm.weight")) {
++            p.other += t.dim(0) * if (t.dtype == .f32) @as(usize, 4) else 2;
++            return;
++        }
++        const path = strip(key, "layers.") orelse return;
++        const dot = std.mem.indexOfScalar(u8, path, '.') orelse return;
++        const i = std.fmt.parseInt(u32, path[0..dot], 10) catch return;
++        if (i >= p.count) return; // An optional MTP layer only increases the load peak.
++        const name = path[dot + 1 ..];
++        const end = std.mem.lastIndexOfScalar(u8, name, '.') orelse return;
++        const field = name[end + 1 ..];
++        var module = name[0..end];
++        var pieced = false;
++        if (std.mem.lastIndexOfScalar(u8, module, '.')) |stem| {
++            if (strip(module[stem + 1 ..], "rank")) |r| {
++                const rank = std.fmt.parseInt(usize, r, 10) catch return;
++                if (rank != p.s.rank) return;
++                module = module[0..stem];
++                pieced = true;
++            }
++        }
++        const layer = &p.layers[i];
++        if (eq(name, "mlp.shared_experts.pieces")) {
++            layer.shared.marker = true;
++        } else if (strip(module, "mlp.experts.") != null) {
++            p.routed(layer, module, field, pieced, t);
++        } else if (kinds.get(module)) |kind| {
++            p.projection(layer, kind, field, pieced, t);
++        } else if (eq(name, "self_attn.kv_b_proj.weight") and t.rank == 2) {
++            // Absorb keeps both halves in BF16, including when the file holds block FP8.
++            layer.fixed += p.s.mla.len() * (p.c.nope + p.c.v_dim) * t.dim(1) * 2;
++        } else if (eq(name, "mlp.gate.weight") and p.c.isMoe(i)) {
++            layer.fixed += t.dim(0) * t.dim(1) * 2;
++        } else if (t.rank == 2 and eq(field, "weight")) {
++            if (eq(module, "self_attn.q_a_proj")) {
++                layer.qkva[0] = .of(t);
++            } else if (eq(module, "self_attn.kv_a_proj_with_mqa")) {
++                layer.qkva[1] = .of(t);
++            } else if (p.c.ifull.isSet(i)) {
++                if (eq(module, "self_attn.indexer.wk")) layer.wk = .of(t);
++                if (eq(module, "self_attn.indexer.weights_proj")) layer.iw = .of(t);
++                if (eq(module, "self_attn.indexer.wq_b")) layer.iqb = .of(t);
++            }
++        } else if (eq(name, "input_layernorm.weight") or eq(name, "post_attention_layernorm.weight")) {
++            layer.fixed += t.dim(0) * if (t.dtype == .f32) @as(usize, 4) else 2;
++        } else if (eq(name, "self_attn.q_a_layernorm.weight") or eq(name, "self_attn.kv_a_layernorm.weight") or
++            (p.c.ifull.isSet(i) and eq(module, "self_attn.indexer.k_norm")))
++        {
++            layer.fixed += t.dim(0) * 2;
++        } else if (eq(name, "mlp.gate.e_score_correction_bias") and p.c.isMoe(i)) {
++            layer.fixed += t.dim(0) * 4;
++        }
++    }
++
++    fn routed(p: *const Plan, l: *Layer, module: []const u8, field: []const u8, pieced: bool, t: Entry) void {
++        const expert = module["mlp.experts.".len..];
++        const dot = std.mem.indexOfScalar(u8, expert, '.') orelse return;
++        const id = std.fmt.parseInt(usize, expert[0..dot], 10) catch return;
++        if (id >= p.c.experts) return;
++        const proj = expert[dot + 1 ..];
++        const down = eq(proj, "down_proj");
++        if (!down and !eq(proj, "gate_proj") and !eq(proj, "up_proj")) return;
++        if (!pieced and id == 0 and eq(proj, "gate_proj") and eq(field, "trellis")) l.routed_whole = true;
++        if (eq(field, "trellis") or eq(field, "suh") or eq(field, "svh")) {
++            const sliced = eq(field, "trellis") or (if (down) eq(field, "suh") else eq(field, "svh"));
++            const bytes = t.end - t.begin;
++            l.routed[@intFromBool(pieced)] += if (pieced or !sliced) bytes else bytes * p.s.moe.len() / p.c.moe_inter;
++        }
++    }
++
++    fn projection(p: *const Plan, layer: *Layer, kind: Kind, field: []const u8, pieced: bool, t: Entry) void {
++        const f, const axis, const part, const whole = switch (kind) {
++            .qb => .{ &layer.qb, @as(usize, 0), p.s.mla.len(), p.c.mla_heads },
++            .o => .{ &layer.o, @as(usize, 1), p.s.mla.len(), p.c.mla_heads },
++            .gate, .up => .{ &layer.mlp, @as(usize, 0), p.s.dense.len(), p.c.dense_inter },
++            .down => .{ &layer.mlp, @as(usize, 1), p.s.dense.len(), p.c.dense_inter },
++            .sh_gate, .sh_up => .{ &layer.shared, @as(usize, 0), p.s.shared.len(), p.c.shared_inter },
++            .sh_down => .{ &layer.shared, @as(usize, 1), p.s.shared.len(), p.c.shared_inter },
++        };
++        if (whole == 0) return;
++        if (eq(field, "weight") and t.rank == 2 and !pieced) {
++            const at: usize = switch (kind) {
++                .up, .sh_up => 1,
++                .down, .sh_down => 2,
++                else => 0,
++            };
++            var m: Matrix = .of(t);
++            if (axis == 0) m.n = m.n * part / whole else m.k = m.k * part / whole;
++            f.dense[at] = m;
++        } else if (eq(field, "mcg_e4m3")) {
++            if (!pieced and (kind == .qb or kind == .o or kind == .gate)) f.marker = true;
++        } else if (eq(field, "trellis") or eq(field, "suh") or eq(field, "svh")) {
++            const shared = kind == .sh_gate or kind == .sh_up or kind == .sh_down;
++            if (shared != pieced) return;
++            const sliced = eq(field, "trellis") or (if (axis == 0) eq(field, "svh") else eq(field, "suh"));
++            const bytes = t.end - t.begin;
++            f.native += if (pieced or !sliced) bytes else bytes * part / whole;
++        }
++    }
++
++    fn estimate(p: *const Plan) !Estimate {
++        var e: Estimate = .{};
++        e.fixed(p.other);
++        const head = p.head;
++        if (head.n != 0) {
++            const n = p.s.vocab.len();
++            if (head.dtype == .f8_e4m3) {
++                const codes = cuda.mxfp8.padded(n) * head.k;
++                e.fixed(codes + codes / cuda.mxfp8.group);
++            } else {
++                e.add(try (Matrix{ .n = n, .k = head.k }).size(p.head_bits, p.tiled));
++            }
++            if (p.heads != .none) {
++                const draft = q4.bytes(n, head.k);
++                e.fixed(draft[0] + draft[1] + draft[2]);
++            }
++        }
++        for (p.layers[0..p.count], 0..) |l, i| {
++            e.fixed(l.fixed);
++            e.add(try l.qb.size(l.qb.marker, p.dense_bits, p.tiled));
++            e.add(try l.o.size(l.o.marker, p.dense_bits, p.tiled));
++            if (p.c.isMoe(@intCast(i))) {
++                e.fixed(l.routed[@intFromBool(!l.routed_whole)]);
++                e.add(try l.shared.size(l.shared.marker and !l.shared.hasDense(), p.dense_bits, p.tiled));
++            } else {
++                e.add(try l.mlp.size(l.mlp.marker, p.dense_bits, p.tiled));
++            }
++            e.add(try (try l.qkva[0].stack(l.qkva[1])).size(p.dense_bits, p.tiled));
++            if (p.dec) |dec| {
++                var m: Matrix = .{};
++                for (dec.parts[0..dec.n]) |part| {
++                    var cut = l.qkva[@intFromBool(part.kv)];
++                    cut.n = if (cut.n == 0) 0 else part.hi - part.lo;
++                    m = try m.stack(cut);
++                }
++                e.add(try m.size(p.dense_bits, p.tiled));
++            }
++            var wk = l.wk;
++            if (wk.dtype == .f8_e4m3) wk.dtype = .bf16; // the loader widens wk before stacking it with weights_proj
++            var iw = l.iw;
++            if (l.wk.dtype == .f8_e4m3) iw.dtype = .bf16;
++            e.add(try (try wk.stack(iw)).size(p.dense_bits, p.tiled));
++            e.add(try l.iqb.size(p.dense_bits, p.tiled));
++        }
++        return e;
++    }
++};
++
++fn entry(dtype: core.safetensors.DType, n: usize, k: usize, size: usize) Entry {
++    return .{ .dtype = dtype, .rank = 2, .shape = .{ n, k, 0, 0, 0 }, .begin = 0, .end = size };
++}
++
++fn fixtureProjection(plan: *Plan, layer: usize, module: []const u8, n: usize, k: usize, native: bool) !void {
++    var buf: [160]u8 = undefined;
++    const name = try std.fmt.bufPrint(&buf, "layers.{d}.{s}.", .{ layer, module });
++    if (!native) {
++        const key = try std.fmt.bufPrint(buf[name.len..], "weight", .{});
++        plan.add(buf[0 .. name.len + key.len], entry(.bf16, n, k, n * k * 2));
++        return;
++    }
++    for ([_][]const u8{ "mcg_e4m3", "trellis", "suh", "svh" }, [_]usize{ 4, n * k / 2, k * 2, n * 2 }) |part, size| {
++        @memcpy(buf[name.len..][0..part.len], part);
++        plan.add(buf[0 .. name.len + part.len], entry(.i16, n, k, size));
++    }
++}
++
++test "GLM X8: BF16 loading lower bounds fit both recorded boots and refuse a short rank" {
++    const floor = @import("cuda_start_floor.zig");
++    var c = @import("config.zig").dsaWant();
++    c.exl3 = true;
++    c.head_unit = 128;
++    const s = try Share.of(&c, 0, 4);
++    const gib = 1 << 30;
++    const raw_floor = 2304 << 20;
++    const cases = [_]struct {
++        native: bool,
++        resident: u64,
++        peak: u64,
++        startup_gib: f64,
++    }{
++        .{ .native = false, .resident = 98_481_968_640, .peak = 104_310_775_296, .startup_gib = 109.06 },
++        .{ .native = true, .resident = 96_679_952_896, .peak = 99_212_462_592, .startup_gib = 108.33 },
++    };
++    for (cases) |case| {
++        var plan: Plan = .init(c, s, .{ .dense_bits = 8, .head_bits = 8 }, 1536, true, .draft);
++        const head: Matrix = .{ .n = s.vocab.len(), .k = c.hidden };
++        const qkv = try (Matrix{ .n = 2624, .k = 6144 }).size(8, true);
++        const dec = try (Matrix{ .n = 704, .k = 6144 }).size(8, true);
++        const kw = try (Matrix{ .n = 160, .k = 6144 }).size(8, true);
++        const iqb = try (Matrix{ .n = 4096, .k = 2048 }).size(8, true);
++        plan.other = 94_743_811_584 - c.layers * (qkv.resident + dec.resident) -
++            21 * (kw.resident + iqb.resident) - (try head.size(8, true)).resident;
++        plan.head = head;
++        for (0..c.layers) |i| {
++            plan.layers[i].qkva = .{ .{ .n = 2048, .k = 6144 }, .{ .n = 576, .k = 6144 } };
++            if (i < 21) {
++                plan.layers[i].wk = .{ .n = 128, .k = 6144 };
++                plan.layers[i].iw = .{ .n = 32, .k = 6144 };
++                plan.layers[i].iqb = .{ .n = 4096, .k = 2048 };
++            }
++            try fixtureProjection(&plan, i, "self_attn.q_b_proj", 16384, 2048, case.native and i != 0 and i != 2);
++            try fixtureProjection(&plan, i, "self_attn.o_proj", 6144, 16384, case.native and i != 0 and i != 2 and i != 3);
++            if (i < c.dense_layers) {
++                try fixtureProjection(&plan, i, "mlp.gate_proj", 12288, 6144, case.native);
++                try fixtureProjection(&plan, i, "mlp.up_proj", 12288, 6144, case.native);
++                try fixtureProjection(&plan, i, "mlp.down_proj", 6144, 12288, case.native);
++            } else {
++                var buf: [120]u8 = undefined;
++                const marker = try std.fmt.bufPrint(&buf, "layers.{d}.mlp.shared_experts.pieces", .{i});
++                plan.add(marker, entry(.i32, 1, 2, 8));
++                try fixtureProjection(&plan, i, "mlp.shared_experts.gate_proj.rank0", 512, 6144, true);
++                try fixtureProjection(&plan, i, "mlp.shared_experts.up_proj.rank0", 512, 6144, true);
++                try fixtureProjection(&plan, i, "mlp.shared_experts.down_proj.rank0", 6144, 512, true);
++                if (!case.native) {
++                    try fixtureProjection(&plan, i, "mlp.shared_experts.gate_proj", 2048, 6144, false);
++                    try fixtureProjection(&plan, i, "mlp.shared_experts.up_proj", 2048, 6144, false);
++                    try fixtureProjection(&plan, i, "mlp.shared_experts.down_proj", 6144, 2048, false);
++                }
++            }
++        }
++        const estimate = try plan.estimate();
++        try std.testing.expectEqual(case.resident, estimate.resident);
++        try std.testing.expectEqual(case.peak, estimate.loadPeak());
++        // Allow for 0.2 GiB parked pages in the native boot's 115.8 GiB preflight reading.
++        const raw: u64 = @intFromFloat(115.6 * gib);
++        try floor.availableFor(raw_floor, estimate.loadPeak(), raw);
++        try floor.availableFor(raw_floor, @intFromFloat(case.startup_gib * gib), raw);
++        if (!case.native) {
++            try std.testing.expect(estimate.resident > raw - (26 * gib)); // the old reserve cutoff rejected it
++            try std.testing.expectError(error.MemoryFloor, floor.availableFor(raw_floor, estimate.loadPeak(), 96 * gib));
++        }
++    }
++}
++
++test "GLM X8: rank retains its routed piece and bf16 linears stay wide when tiling is off" {
++    var c = @import("config.zig").dsaWant();
++    c.exl3 = true;
++    const s = try Share.of(&c, 1, 4);
++    var plan: Plan = .init(c, s, .{ .tiled = false }, 1536, false, .none);
++    const piece = entry(.i16, 1, 1, 1_572_864);
++    plan.add("layers.3.mlp.experts.0.gate_proj.rank0.trellis", piece);
++    plan.add("layers.3.mlp.experts.0.gate_proj.rank1.trellis", piece);
++    plan.add("layers.3.mlp.experts.0.gate_proj.rank1.mcg_e4m3", entry(.i32, 1, 1, 4));
++    try fixtureProjection(&plan, 3, "self_attn.q_b_proj", 16384, 2048, false);
++    try std.testing.expectEqual(@as(u64, 1_572_864 + 4096 * 2048 * 2), (try plan.estimate()).resident);
++}
++
++test "GLM X8: block FP8 q_a and kv_a use packed stack sizes for prompt and decode" {
++    var c = @import("config.zig").dsaWant();
++    c.exl3 = true;
++    const k: usize = c.hidden;
++    for ([_]usize{ 0, 2, 3 }) |rank| {
++        const share = try Share.of(&c, rank, 4);
++        var plan: Plan = .init(c, share, .{ .dense_bits = 8, .layers = 1 }, 1536, true, .none);
++        plan.add("layers.0.self_attn.q_a_proj.weight", entry(.f8_e4m3, 2048, k, 2048 * k));
++        plan.add("layers.0.self_attn.kv_a_proj_with_mqa.weight", entry(.f8_e4m3, 576, k, 576 * k));
++        const e = try plan.estimate();
++        const prompt_rows = 2688;
++        const decode_rows: usize = if (rank == 3) 512 else 768;
++        const want = (prompt_rows + decode_rows) * k * 17 / 16;
++        try std.testing.expectEqual(want, e.resident);
++        try std.testing.expectEqual(want, e.loadPeak());
++        try std.testing.expectEqual(0, e.tile);
++        plan.dec = null;
++        try std.testing.expectEqual(prompt_rows * k * 17 / 16, (try plan.estimate()).resident);
++    }
++}
++
++test "GLM X8: the borrowed draft head is included only when selected" {
++    const c = @import("config.zig").dsaWant();
++    const share = try Share.of(&c, 0, 4);
++    var plan: Plan = .init(c, share, .{ .head_bits = 8 }, 1536, false, .none);
++    plan.head = .{ .n = c.vocab, .k = c.hidden };
++    const plain = try plan.estimate();
++    plan.heads = .draft;
++    const drafted = try plan.estimate();
++    const padded = (share.vocab.len() + 127) / 128 * 128;
++    const draft_bytes = padded * c.hidden * 9 / 16;
++    try std.testing.expectEqual(draft_bytes, drafted.resident - plain.resident);
++    try std.testing.expectEqual(draft_bytes, drafted.loadPeak() - plain.loadPeak());
++}
+diff --git a/zig/src/families/glm/cuda_weight_formats.zig b/zig/src/families/glm/cuda_weight_formats.zig
+new file mode 100644
+index 000000000..5053b89a9
+--- /dev/null
++++ b/zig/src/families/glm/cuda_weight_formats.zig
+@@ -0,0 +1,111 @@
++//! Rank agreement on the effective dense weight formats of a loaded EXLR8 model.
++const std = @import("std");
++const mm = @import("cuda_mm.zig");
++const weights = @import("cuda_weights.zig");
++const Proj = @import("cuda_proj.zig").Proj;
++const X8 = @import("cuda_x8.zig").Proj;
++
++const Key = struct {
++    hash: std.hash.Wyhash,
++    packs: *const mm.Packed,
++
++    fn bf16(k: *Key, ptr: u64) void {
++        k.hash.update(&.{if (ptr == 0) 0 else k.packs.tiled(ptr, 0, 0).bits});
++    }
++
++    fn trellis(k: *Key, p: *const X8) void {
++        k.hash.update(&.{ @intCast(p.a.bits), if (p.b) |b| @intCast(b.bits) else 0 });
++    }
++
++    fn proj(k: *Key, p: Proj) void {
++        k.hash.update(&.{@backingInt(std.meta.activeTag(p))});
++        switch (p) {
++            .bf16 => |ptr| k.bf16(ptr),
++            .x8 => |x| k.trellis(x),
++            .fp8g, .mxfp8 => {}, // their format fixes the bit width
++        }
++    }
++
++    fn layer(k: *Key, l: *const weights.Layer) void {
++        k.hash.update(std.mem.asBytes(&l.index));
++        k.hash.update(&.{@backingInt(std.meta.activeTag(l.mixer))});
++        switch (l.mixer) {
++            .mla => |m| for ([_]Proj{ m.proj, m.proj_dec, m.q_b, m.o, m.index.kw, m.index.qb }) |p| k.proj(p),
++            .kda => |m| {
++                k.hash.update(&.{@backingInt(std.meta.activeTag(m.proj))});
++                k.proj(m.o);
++            },
++        }
++        k.hash.update(&.{@backingInt(std.meta.activeTag(l.ffn))});
++        switch (l.ffn) {
++            .dense => |f| {
++                k.hash.update(&.{@backingInt(std.meta.activeTag(f.w))});
++                switch (f.w) {
++                    .bf16 => |p| {
++                        k.bf16(p.gu);
++                        k.bf16(p.down);
++                    },
++                    .x8 => |p| {
++                        k.trellis(p.gu);
++                        k.trellis(p.down);
++                    },
++                    .nvfp4, .mxfp8, .fp8g => {},
++                }
++            },
++            .moe => |f| {
++                k.proj(f.shared_gu);
++                k.proj(f.shared_down);
++            },
++        }
++    }
++};
++
++/// Use layer and projection order, keeping the gate/up widths in order and ignoring rank-local addresses and sizes.
++pub fn fingerprint(w: *const weights.Weights, packs: *const mm.Packed, q8: bool) u64 {
++    var key: Key = .{ .hash = .init(0), .packs = packs };
++    key.hash.update(&.{ @intFromBool(q8), @intFromBool(w.mtp != null), @intFromBool(w.draft_head != null) });
++    key.proj(w.head);
++    for (w.layers) |*layer| key.layer(layer);
++    if (w.mtp) |*mtp| key.layer(&mtp.layer);
++    return key.hash.final();
++}
++
++fn testLayer(index: u32, shared: Proj) weights.Layer {
++    var l: weights.Layer = undefined;
++    l.index = index;
++    l.mixer = .{ .mla = undefined };
++    const m = &l.mixer.mla;
++    m.proj = .{ .bf16 = 1 };
++    m.proj_dec = .{ .bf16 = 0 };
++    m.q_b = .{ .bf16 = 1 };
++    m.o = .{ .bf16 = 1 };
++    m.index.kw = .{ .bf16 = 0 };
++    m.index.qb = .{ .bf16 = 0 };
++    l.ffn = .{ .moe = undefined };
++    l.ffn.moe.shared_gu = shared;
++    l.ffn.moe.shared_down = .{ .bf16 = 1 };
++    return l;
++}
++
++test "GLM X8: rank agreement distinguishes equal-sized formats swapped between layers or projections" {
++    const mat = @import("cuda_x8.zig").Mat;
++    const a: mat = .{ .t = 2, .suh = 3, .svh = 4, .n = 128, .k = 128, .bits = 2 };
++    var b = a;
++    b.bits = 4;
++    const x: X8 = .{ .a = a, .b = b };
++    const swapped: X8 = .{ .a = b, .b = a };
++    try std.testing.expectEqual(x.bytes(), swapped.bytes());
++
++    const dense: Proj = .{ .bf16 = 1 };
++    var layers = [_]weights.Layer{ testLayer(40, .{ .x8 = &x }), testLayer(77, dense) };
++    const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = undefined, .share = undefined, .layers = &layers };
++    const p8: mm.Packed = .{ .ptrs = &.{1}, .bits = &.{8} };
++    const word = fingerprint(&w, &p8, true);
++    try std.testing.expect(word != fingerprint(&w, &p8, false));
++    try std.testing.expect(word != fingerprint(&w, &.{ .ptrs = &.{1}, .bits = &.{6} }, true));
++    layers[0].ffn.moe.shared_gu = .{ .x8 = &swapped };
++    try std.testing.expect(word != fingerprint(&w, &p8, true));
++    layers[0].ffn.moe.shared_gu = dense;
++    layers[1].ffn.moe.shared_gu = .{ .x8 = &x };
++    try std.testing.expect(word != fingerprint(&w, &p8, true));
++}
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 658c57131..127712533 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -2,6 +2,7 @@
+ 
+ const std = @import("std");
+ const cuda = @import("cuda");
++const start_floor = @import("cuda_start_floor.zig");
+ const core = @import("core");
+ const cfg = @import("config.zig");
+ const shard = @import("cuda_shard.zig");
+@@ -187,6 +188,7 @@ const Loader = struct {
+ 
+     /// The host bytes gathered so far uploaded as one tensor named `fmt`.
+     pub fn put(L: *Loader, comptime fmt: []const u8, args: anytype) !u64 {
++        try start_floor.check(L.host.items.len);
+         const ptr = try @import("cuda_upload_owner.zig").keep(L, try cuda.DeviceBuffer.fromHost(L.d, L.host.items), fmt, args);
+         L.host.clearRetainingCapacity();
+         return ptr;
+@@ -446,13 +448,14 @@ const Loader = struct {
+         const n = hi - lo;
+         const k = khi - klo;
+         for (0..n) |r| try L.host.appendSlice(L.gpa, l.codes[(lo + r) * l.k / 2 + klo / 2 ..][0 .. k / 2]);
++        try start_floor.check(L.host.items.len);
+         var src = try cuda.DeviceBuffer.fromHost(L.d, L.host.items);
+         defer src.free();
+         L.host.clearRetainingCapacity();
+         const npad = cuda.nvfp4.padded(n);
+         const kg = k / 64;
+         const total: u64 = @as(u64, npad / 64) * kg * 512;
+-        const words = try cuda.DeviceBuffer.alloc(L.d, total * 4);
++        const words = try start_floor.alloc(L.d, total * 4);
+         try L.w.buffers.append(L.gpa, words);
+         try L.w.named.append(L.gpa, .{ .name = try std.fmt.allocPrint(L.gpa, fmt ++ ".words", .{i}), .ptr = words.ptr, .len = words.len });
+         var args: cuda.Args = .{};
+@@ -572,7 +575,7 @@ const Loader = struct {
+ 
+     /// One device allocation the loader frees itself (staging for the GPU's quantizers).
+     pub fn scratch(L: *Loader, n: usize) !cuda.DeviceBuffer {
+-        return cuda.DeviceBuffer.alloc(L.d, n);
++        return start_floor.alloc(L.d, n);
+     }
+ 
+     /// moe_nvfp4 of the MTP layer: BF16 experts cut to the rank, GPU-quantized 8 at a time, scale as weight_scale_2.
+@@ -875,7 +878,7 @@ fn recipeTable(r: *const core.modelopt.Recipes) ?*const core.modelopt.Recipes {
+ }
+ 
+ /// The checkpoint's LM prefix: the one its embed_tokens sits under.
+-fn modelPrefix(ck: *core.Checkpoint) ![]const u8 {
++pub fn modelPrefix(ck: *core.Checkpoint) ![]const u8 {
+     for (prefixes) |p| {
+         var buf: [96]u8 = undefined;
+         if (ck.has(try std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{p}))) return p;
+diff --git a/zig/src/families/glm/cuda_x8.zig b/zig/src/families/glm/cuda_x8.zig
+index 1df8df7c8..a11266321 100644
+--- a/zig/src/families/glm/cuda_x8.zig
++++ b/zig/src/families/glm/cuda_x8.zig
+@@ -5,6 +5,12 @@
+ //! Decode windows run TensorFold's EXL3 linear (kernels/cuda/exl3_linear.cu) on its E4M3 image (exl3_linear_e4m3);
+ //! prompt chunks rebuild the matrix as bf16 rows (kernels/cuda/exlr8_recon.cu, exact before one rounding: the bf16 X8's
+ //! converter wrote) for the tiled bf16 GEMM. Only a checkpoint whose config says codebook "mcg_e4m3" probes for these.
++//!
++//! X18 (patch x18): with the interim lane's dense packing on (TF_GLM_DENSE_BITS=8, tiled), a prompt chunk instead rebuilds the
++//! matrix straight into the int8 tiles + fp16 scales glm_mm8_128s2 reads (kernels/cuda/exlr8_recon.cu's tf_x8_recon_q8: the same
++//! bytes cuda_qpack.quantize + glm_mm_tile8 make from X8's bf16 rows at load), once per layer per chunk: the tiles live in a
++//! ring (`Ring`) keyed by the projection's weights, so the two halves of a chunk (TF_GLM_DSA_HALVES) share them.
++//! TF_GLM_X8_PROMPT_Q8=0 returns to the bf16 rebuild above.
+ 
+ const std = @import("std");
+ const cuda = @import("cuda");
+@@ -65,10 +71,41 @@ pub const recon_rows = 16;
+ /// The scratch of one stream's calls (main, and the shared expert's second stream).
+ const Lane = struct { xc: u64 = 0, xh: u64 = 0, z: u64 = 0, counters: u64 = 0, ya: u64 = 0, yb: u64 = 0 };
+ 
+-/// What the largest projection needs, gathered at load (reserve).
+-pub const Most = struct { k: usize = 0, n: usize = 0, nk: usize = 0, z: usize = 0, counters: usize = 0 };
++/// What the largest projection needs, gathered at load (reserve). `shapes`: the distinct (n, k) of the projections, the
++/// largest `max_shapes` (the int8 ring holds one layer's four).
++pub const Most = struct {
++    k: usize = 0,
++    n: usize = 0,
++    nk: usize = 0,
++    z: usize = 0,
++    counters: usize = 0,
++    shapes: [max_shapes][2]usize = @splat(.{ 0, 0 }),
++
++    /// The ring a layer's projections need: the `layer_slots` largest distinct shapes' entries (a layer has at most four
++    /// projections of distinct shapes: q_b, o_proj, [gate | up], down).
++    pub fn ringBytes(most: Most) usize {
++        var sizes: [max_shapes]usize = undefined;
++        for (most.shapes, 0..) |sh, i| sizes[i] = if (sh[0] == 0) 0 else entryBytes(sh[0], sh[1]);
++        std.mem.sort(usize, &sizes, {}, std.sort.desc(usize));
++        var sum: usize = 0;
++        for (sizes[0..layer_slots]) |b| sum += b;
++        return sum;
++    }
++};
++
++const max_shapes = 8;
++/// Projections of one layer that prompt chunks run (q_b, o_proj, [gate | up], down: the shared expert's or a dense MLP's).
++pub const layer_slots = 4;
+ 
+ pub fn mostOf(most: *Most, p: Proj) void {
++    const sh: [2]usize = .{ p.n(), p.k() };
++    var listed = false;
++    var smallest: usize = 0;
++    for (most.shapes, 0..) |e, i| {
++        if (e[0] == sh[0] and e[1] == sh[1]) listed = true;
++        if (e[0] * e[1] < most.shapes[smallest][0] * most.shapes[smallest][1]) smallest = i;
++    }
++    if (!listed and sh[0] * sh[1] > most.shapes[smallest][0] * most.shapes[smallest][1]) most.shapes[smallest] = sh;
+     for ([_]?Mat{ p.a, p.b }) |om| if (om) |m| {
+         most.k = @max(most.k, m.k);
+         most.n = @max(most.n, m.n);
+@@ -85,6 +122,7 @@ pub const Run = struct {
+     lin: Linear,
+     mod: cuda.Module,
+     recon: cuda.Function,
++    recon_q8: cuda.Function, // tf_x8_recon_q8 (X18)
+     bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
+     lanes: [2]Lane = .{ .{}, .{} },
+     w: u64 = 0, // a rebuilt matrix's bf16 rows [n][k]
+@@ -93,16 +131,29 @@ pub const Run = struct {
+     /// The projection whose rows `w` / `wt` hold (one stream writes them: prompt chunks never fork).
+     cached: ?*const Proj = null,
+     cached_tiled: bool = false,
++    /// X18: prompt chunks run on int8 tiles (set before `reserve`: `q8Wanted`); `ring` is their scratch, `rebuilds` counts the
++    /// int8 rebuilds launched (a statistic: one per projection per layer per chunk when the halves share).
++    q8: bool = false,
++    ring: Ring = .{ .cap = 0 },
++    ring_ptr: u64 = 0,
++    rebuilds: u64 = 0,
+ 
+     pub fn load(d: *const cuda.Driver) !Run {
++        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
++        return loadWith(d, cuda.kernels.exlr8_recon);
++    }
++
++    /// `load` with another image of exlr8_recon.cu's kernels (the GPU tests' mutated builds).
++    pub fn loadWith(d: *const cuda.Driver, image: []const u8) !Run {
+         var lin = try Linear.loadE4m3(d);
+         errdefer lin.unload();
+-        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+-        var mod = try cuda.Module.load(d, cuda.kernels.exlr8_recon);
++        var mod = try cuda.Module.load(d, image);
+         errdefer mod.unload();
+         const f = try mod.function("tf_x8_recon");
+         try f.allowDynamicShared(recon_smem);
+-        return .{ .d = d, .lin = lin, .mod = mod, .recon = f };
++        const fq = try mod.function("tf_x8_recon_q8");
++        try fq.allowDynamicShared(recon_smem);
++        return .{ .d = d, .lin = lin, .mod = mod, .recon = f, .recon_q8 = fq };
+     }
+ 
+     pub fn deinit(r: *Run) void {
+@@ -113,7 +164,7 @@ pub const Run = struct {
+     }
+ 
+     fn buf(r: *Run, bytes: usize) !u64 {
+-        var b = try cuda.DeviceBuffer.alloc(r.d, @max(bytes, 256));
++        var b = try @import("cuda_start_floor.zig").alloc(r.d, @max(bytes, 256));
+         errdefer b.free();
+         try r.bufs.append(r.gpa, b);
+         return b.ptr;
+@@ -133,14 +184,19 @@ pub const Run = struct {
+             l.ya = try r.buf(call_rows * most.n * 4);
+             l.yb = try r.buf(call_rows * most.n * 4);
+         }
+-        r.w = try r.buf(most.nk * 2);
+-        r.wt = try r.buf(most.nk * 2);
++        if (r.q8) {
++            r.ring = .{ .cap = most.ringBytes() };
++            r.ring_ptr = try r.buf(r.ring.cap);
++        } else {
++            r.w = try r.buf(most.nk * 2);
++            r.wt = try r.buf(most.nk * 2);
++        }
+     }
+ 
+-    /// Device bytes reserve takes for `most`.
+-    pub fn reserveBytes(most: Most) usize {
++    /// Device bytes reserve takes for `most` (bf16 rebuild rows and tiles; `q8`: the int8 ring instead).
++    pub fn reserveBytes(most: Most, q8: bool) usize {
+         if (most.nk == 0) return 0;
+-        return 2 * (2 * call_rows * most.k * 2 + most.z + most.counters + 2 * call_rows * most.n * 4) + 2 * most.nk * 2;
++        return 2 * (2 * call_rows * most.k * 2 + most.z + most.counters + 2 * call_rows * most.n * 4) + if (q8) most.ringBytes() else 2 * most.nk * 2;
+     }
+ };
+ 
+@@ -185,7 +241,9 @@ pub fn matmul(set: glue.Set, s: cuda.Stream, p: *const Proj, x: u64, x_stride: u
+     if (p.b) |b| if (b.k != p.a.k) return error.ShapeMismatch;
+     const r = set.x8 orelse return error.FormatNotLoaded;
+     if (m == 0) return;
+-    if (set.prompt and m > recon_rows) return prompt(set, r, s, p, x, x_stride, out, part, m, wide);
++    // A prompt chunk of any size takes the int8 tiles when q8 prompt mode is on (the interim lane's packed int8 GEMM runs a
++    // 1-16 row tail too); with the kill switch it keeps the decode linear for 1-16 rows.
++    if (set.prompt and (m > recon_rows or (r.q8 and set.mm != null))) return prompt(set, r, s, p, x, x_stride, out, part, m, wide);
+     const l = r.lanes[@intFromBool(p.side)];
+     const eb: usize = if (wide) 4 else 2;
+     var at: usize = 0;
+@@ -221,9 +279,13 @@ fn prompt(set: glue.Set, r: *const Run, s: cuda.Stream, p: *const Proj, x: u64,
+     const n = p.n();
+     const k = p.k();
+     if (n * k > r.most.nk) return error.X8Scratch;
++    if (r.q8) if (set.mm) |mk| return promptQ8(mk, r, s, p, x, x_stride, out, part, m, wide);
++    if (r.w == 0) return error.X8Scratch; // reserved for int8 tiles only: an untiled call has no bf16 scratch
+     const tiled = set.mm != null;
+     const rw: *Run = @constCast(r); // the cache is host state of the one stream that runs prompt chunks
++    var fresh = false; // this call rebuilt the tiles: its first GEMM must not overlap the tiling (no PDL)
+     if (rw.cached != p or rw.cached_tiled != tiled) {
++        fresh = true;
+         rw.cached = null;
+         try rebuild(r, s, p.a, r.w, k, 0);
+         if (p.b) |b| try rebuild(r, s, b, r.w, k, p.a.n);
+@@ -231,7 +293,7 @@ fn prompt(set: glue.Set, r: *const Run, s: cuda.Stream, p: *const Proj, x: u64,
+         rw.cached = p;
+         rw.cached_tiled = tiled;
+     }
+-    if (set.mm) |mk| return mm_mod.matmul(mk, s, x, x_stride, .{ .w = r.wt, .n = n, .k = k }, out, part, m, wide, set.prompt);
++    if (set.mm) |mk| return mm_mod.matmulFrom(mk, s, x, x_stride, .{ .w = r.wt, .n = n, .k = k }, out, part, m, wide, set.prompt, fresh);
+     var plain = set;
+     plain.mm = null;
+     return b16.matmul(plain, s, x, x_stride, r.w, out, part, m, n, k, wide);
+@@ -240,6 +302,116 @@ fn prompt(set: glue.Set, r: *const Run, s: cuda.Stream, p: *const Proj, x: u64,
+ /// Forget the cached rebuild (the scratch is about to be reused or freed).
+ pub fn forget(r: *Run) void {
+     r.cached = null;
++    r.ring.clear();
++}
++
++// ---- X18: int8 prompt tiles ---------------------------------------------------------------------------------------------
++
++/// Whether prompt chunks take int8 tiles: the interim lane's dense packing (tiled GEMMs, TF_GLM_DENSE_BITS=8) is on and
++/// TF_GLM_X8_PROMPT_Q8 is not "0" (the kill switch: the bf16 rebuild).
++pub fn q8Wanted(tiled: bool, dense_bits: u8) bool {
++    if (!tiled or dense_bits != 8) return false;
++    const v = std.c.getenv("TF_GLM_X8_PROMPT_Q8") orelse return true;
++    return !std.mem.eql(u8, std.mem.span(v), "0");
++}
++
++/// Bytes one projection's int8 tiles take in the ring: codes, then the fp16 scales (glm_mm.packedBytes' layout), 256-aligned.
++pub fn entryBytes(n: usize, k: usize) usize {
++    const pb = mm_mod.packedBytes(n, k, 8);
++    return std.mem.alignForward(usize, pb[0] + pb[1], 256);
++}
++
++/// What the tiles in a ring entry were made from: the device weights (every matrix's trellis and scales) and the shape.
++pub const Key = struct { a: [3]u64, b: [3]u64, n: usize, k: usize };
++
++pub fn keyOf(p: *const Proj) Key {
++    return .{
++        .a = .{ p.a.t, p.a.suh, p.a.svh },
++        .b = if (p.b) |b| .{ b.t, b.suh, b.svh } else .{ 0, 0, 0 },
++        .n = p.n(),
++        .k = p.k(),
++    };
++}
++
++/// The int8 tiles' scratch: a ring of byte ranges, filled in order. A miss takes the next range (the start again when it
++/// would pass the end) and drops every entry it overlaps; an entry is found again only for the same key and stream. With
++/// the ring as large as one layer's projections (Most.ringBytes) a layer's entries never overlap each other, so each
++/// projection is rebuilt once per layer per chunk however many halves run it.
++pub const Ring = struct {
++    cap: usize,
++    head: usize = 0,
++    live: [max_live]?Entry = @splat(null),
++
++    pub const max_live = 32;
++    pub const Entry = struct { key: Key, stream: usize, off: usize, len: usize };
++
++    /// The offset of the entry made for `key` on `stream`, if it is still intact.
++    pub fn find(r: *const Ring, key: Key, stream: usize) ?usize {
++        for (r.live) |e| if (e) |x| if (x.stream == stream and std.meta.eql(x.key, key)) return x.off;
++        return null;
++    }
++
++    /// Room for `len` bytes: the offset the next entry takes, the entries it overlaps dropped.
++    pub fn place(r: *Ring, len: usize) !usize {
++        if (len > r.cap) return error.X8Scratch;
++        const off = if (r.head + len > r.cap) 0 else r.head;
++        for (&r.live) |*slot| if (slot.*) |x| if (x.off < off + len and off < x.off + x.len) {
++            slot.* = null;
++        };
++        return off;
++    }
++
++    /// The entry at `off` (from `place`) is written: later calls for `key` on `stream` find it.
++    pub fn commit(r: *Ring, key: Key, stream: usize, off: usize, len: usize) void {
++        for (&r.live) |*slot| if (slot.* == null) {
++            slot.* = .{ .key = key, .stream = stream, .off = off, .len = len };
++            r.head = off + len;
++            return;
++        };
++        r.clear(); // more live entries than slots (never with a layer's four): start over
++        r.live[0] = .{ .key = key, .stream = stream, .off = off, .len = len };
++        r.head = off + len;
++    }
++
++    pub fn clear(r: *Ring) void {
++        r.live = @splat(null);
++        r.head = 0;
++    }
++};
++
++/// exlr8_recon.cu's TfX8ReconQ, passed by value.
++pub const ReconQArgs = extern struct { t: u64, suh: u64, svh: u64, q: u64, s: u64, k: u32, n: u32, bits: u32, row0: u32, n_total: u32, pad0: u32 = 0 };
++
++/// Matrix `m` as rows [row0, row0 + n) of the n_total-row stack whose int8 tiles start at `base`: codes, then the scales.
++fn rebuildQ8(r: *const Run, s: cuda.Stream, m: Mat, base: u64, n_total: usize, row0: usize) !void {
++    if (m.k % 128 != 0 or m.n % 128 != 0 or row0 % 128 != 0 or m.bits < 2 or m.bits > 4) return error.X8Shape;
++    var a: cuda.Args = .{};
++    a.add(ReconQArgs{ .t = m.t, .suh = m.suh, .svh = m.svh, .q = base, .s = base + mm_mod.packedBytes(n_total, m.k, 8)[0], .k = @intCast(m.k), .n = @intCast(m.n), .bits = m.bits, .row0 = @intCast(row0), .n_total = @intCast(n_total) });
++    try cuda.launch.launch(r.recon_q8, .{ .grid = .{ .x = @intCast(m.n / 128), .y = @intCast(m.k / 128) }, .block = .{ .x = 512 }, .shared = recon_smem }, s, &a);
++}
++
++/// A prompt chunk on int8 tiles: `p` rebuilt into the ring unless an entry of these weights is there already (the other
++/// half of the chunk made it), then glm_mm8_128s2 as on the interim lane's packs.
++fn promptQ8(mk: *const mm_mod.Kernels, r: *const Run, s: cuda.Stream, p: *const Proj, x: u64, x_stride: usize, out: u64, part: u64, m: usize, wide: bool) !void {
++    const n = p.n();
++    const k = p.k();
++    const rw: *Run = @constCast(r); // the ring is host state of the one stream that runs prompt chunks
++    const key = keyOf(p);
++    const sid: usize = @intFromPtr(s.handle);
++    var fresh = false; // this call rebuilt the tiles: its first GEMM must not overlap the rebuild (no PDL)
++    const off = rw.ring.find(key, sid) orelse blk: {
++        fresh = true;
++        const len = entryBytes(n, k);
++        const o = try rw.ring.place(len);
++        const base = r.ring_ptr + o;
++        try rebuildQ8(r, s, p.a, base, n, 0);
++        if (p.b) |b| try rebuildQ8(r, s, b, base, n, p.a.n);
++        rw.ring.commit(key, sid, o, len);
++        rw.rebuilds += 1;
++        break :blk o;
++    };
++    const base = r.ring_ptr + off;
++    return mm_mod.matmulFrom(mk, s, x, x_stride, .{ .w = base, .n = n, .k = k, .s = base + mm_mod.packedBytes(n, k, 8)[0], .bits = 8 }, out, part, m, wide, true, fresh);
+ }
+ 
+ // ---- loading ------------------------------------------------------------------------------------------------------
+@@ -248,11 +420,17 @@ pub fn forget(r: *Run) void {
+ /// gate / up's rows), or inputs [lo, hi) (o_proj's and down's columns). Bounds in whole 128-blocks.
+ pub const Cut = union(enum) { whole, outs: [2]usize, ins: [2]usize };
+ 
+-/// Whether layer `i`'s shared expert is served from its rank pieces as stored: the pieces are declared AND the layer's q_b is
+-/// trellis as stored. The checkpoint the recipe serves by default (X8's ~/exlr8-up1) carries the pieces too (its shared expert is
+-/// bf16 in the dense file, as before 0205b) and must stay on that path: its q_b has no marker.
++/// Whether layer `i`'s shared expert is served from its rank pieces as stored: the pieces are declared AND the checkpoint
++/// carries no dense bf16 / block FP8 copy of it. The format is the shared expert's own, independent of q_b: X8's interim checkpoint
++/// (~/exlr8-up1) declares the pieces too but keeps its shared expert in the dense file (as before 0205b) and stays on that path
++/// whatever the layer's q_b is; the native one drops the dense copy, so its pieces are the only weights (a missing or
++/// malformed piece then fails in `mat` / sharedX8 by name, never falls back to another format).
+ pub fn sharedAsStored(L: anytype, i: u32) !bool {
+-    return try L.has("layers.{d}.mlp.shared_experts.pieces", .{i}) and try present(L, "layers.{d}.self_attn.q_b_proj", .{i});
++    if (!try L.has("layers.{d}.mlp.shared_experts.pieces", .{i})) return false;
++    inline for (.{ "gate_proj", "up_proj", "down_proj" }) |m| {
++        if (try L.has("layers.{d}.mlp.shared_experts." ++ m ++ ".weight", .{i})) return false;
++    }
++    return true;
+ }
+ 
+ /// Whether `module` (under the loader's prefix and the layer) is an EXLR8 matrix: its mcg_e4m3 marker is present.
+@@ -463,18 +641,19 @@ test "GLM X8: the scratch a projection needs covers both halves of a [gate | up]
+     try std.testing.expectEqual(@as(usize, 2 * (6144 * 512 / 2)), (Proj{ .a = g, .b = g }).bytes()); // 4 bits: half a byte a weight
+ }
+ 
+-test "GLM X8: the shared expert is taken from its pieces only beside a trellis q_b: the default (X8) checkpoint carries pieces without one" {
++test "GLM X8: the shared expert is served as stored when its pieces are declared and the dense copy is gone, whatever q_b is" {
+     const a = std.testing.allocator;
+     const mk = std.mem.toBytes(@as(u32, marker_value));
+     const decl: [8]u8 = @splat(0);
+     const marker = tensor(.i32, &.{}, &mk);
+     const pieces = tensor(.i32, &.{2}, &decl);
+-    {
++    const w = tensor(.bf16, &.{2}, &decl);
++    { // native: pieces, no dense copy (with a trellis q_b or without one)
+         const names = [_][]const u8{ "layers.3.mlp.shared_experts.pieces", "layers.3.self_attn.q_b_proj.mcg_e4m3" };
+         const ts = [_]core.checkpoint.Tensor{ pieces, marker };
+         var f: Fake = .{ .gpa = a, .names = &names, .tensors = &ts };
+         defer f.deinit();
+-        try std.testing.expect(try sharedAsStored(&f, 3)); // native dense: pieces and a trellis q_b
++        try std.testing.expect(try sharedAsStored(&f, 3));
+         try std.testing.expect(!try sharedAsStored(&f, 4)); // another layer's tensors are not this layer's
+     }
+     {
+@@ -482,13 +661,192 @@ test "GLM X8: the shared expert is taken from its pieces only beside a trellis q
+         const ts = [_]core.checkpoint.Tensor{pieces};
+         var f: Fake = .{ .gpa = a, .names = &names, .tensors = &ts };
+         defer f.deinit();
+-        try std.testing.expect(!try sharedAsStored(&f, 3)); // X8's checkpoint: pieces, bf16 shared expert in the dense file, no marker
++        try std.testing.expect(try sharedAsStored(&f, 3)); // a bf16 q_b beside native shared pieces: still as stored
++    }
++    { // interim: pieces and the dense bf16 shared expert, whatever q_b says
++        const names = [_][]const u8{ "layers.3.mlp.shared_experts.pieces", "layers.3.mlp.shared_experts.gate_proj.weight", "layers.3.self_attn.q_b_proj.mcg_e4m3" };
++        const ts = [_]core.checkpoint.Tensor{ pieces, w, marker };
++        var f: Fake = .{ .gpa = a, .names = &names, .tensors = &ts };
++        defer f.deinit();
++        try std.testing.expect(!try sharedAsStored(&f, 3)); // a trellis q_b in an otherwise interim layer does not switch its shared expert
+     }
+     {
+-        const names = [_][]const u8{"layers.3.self_attn.q_b_proj.mcg_e4m3"};
+-        const ts = [_]core.checkpoint.Tensor{marker};
++        const names = [_][]const u8{"layers.3.mlp.shared_experts.up_proj.weight"};
++        const ts = [_]core.checkpoint.Tensor{w};
+         var f: Fake = .{ .gpa = a, .names = &names, .tensors = &ts };
+         defer f.deinit();
+-        try std.testing.expect(!try sharedAsStored(&f, 3)); // a marker without pieces: nothing to serve as stored
++        try std.testing.expect(!try sharedAsStored(&f, 3)); // no pieces: the dense copy
++    }
++}
++
++// ---- X18 host tests: the int8 ring ------------------------------------------------------------------------------------
++
++fn fakeProj(id: u64, n: usize, k: usize, stack: bool) Proj {
++    const h: usize = if (stack) n / 2 else n;
++    const a: Mat = .{ .t = 0x1000 * id + 1, .suh = 0x1000 * id + 2, .svh = 0x1000 * id + 3, .k = k, .n = h, .bits = 4 };
++    const b: Mat = .{ .t = 0x1000 * id + 5, .suh = 0x1000 * id + 6, .svh = 0x1000 * id + 7, .k = k, .n = h, .bits = 4 };
++    return if (stack) .{ .a = a, .b = b } else .{ .a = a };
++}
++
++test "GLM X8: the ring holds one layer's four projections: the largest distinct shapes of the rank (TP4 rank 0)" {
++    var most: Most = .{};
++    // layers 0-2 (q_b, o_proj, [gate | up], down), then MoE layers (q_b, o_proj, shared [gate | up], shared down)
++    for ([_][3]usize{ .{ 4096, 2048, 0 }, .{ 6144, 4096, 0 }, .{ 6144, 6144, 1 }, .{ 6144, 3072, 0 }, .{ 1024, 6144, 1 }, .{ 6144, 512, 0 }, .{ 4096, 2048, 0 } }, 0..) |s, i| mostOf(&most, fakeProj(i + 1, s[0], s[1], s[2] == 1));
++    var want: usize = 0;
++    for ([_][2]usize{ .{ 4096, 2048 }, .{ 6144, 4096 }, .{ 6144, 6144 }, .{ 6144, 3072 } }) |s| want += entryBytes(s[0], s[1]);
++    try std.testing.expectEqual(want, most.ringBytes());
++    // about 93 MB (89 MiB) for the dense layers; one MoE layer's four are 44 MB
++    try std.testing.expect(most.ringBytes() > 85 << 20 and most.ringBytes() < 95 << 20);
++    var moe: usize = 0;
++    for ([_][2]usize{ .{ 4096, 2048 }, .{ 6144, 4096 }, .{ 1024, 6144 }, .{ 6144, 512 } }) |s| moe += entryBytes(s[0], s[1]);
++    try std.testing.expect(moe < 45 << 20 and moe <= most.ringBytes());
++    // the bf16 rebuild's two matrices of the largest projection took 151 MB: the ring is smaller than that
++    try std.testing.expect(most.ringBytes() < 2 * most.nk * 2);
++    // a shape seen twice is listed once; more than eight shapes keep the largest eight
++    var m2: Most = .{};
++    for (0..20) |i| mostOf(&m2, fakeProj(i + 1, 128 * (i + 1), 128, false));
++    for (m2.shapes) |sh| try std.testing.expect(sh[0] >= 128 * 13);
++    mostOf(&m2, fakeProj(99, 128 * 20, 128, false));
++    var seen: usize = 0;
++    for (m2.shapes) |sh| seen += @intFromBool(sh[0] == 128 * 20);
++    try std.testing.expectEqual(@as(usize, 1), seen);
++}
++
++/// Walks `layers` layers' calls through the ring with a model of the device bytes (one u32 owner a 4 KiB unit): every call must find
++/// its tiles intact; returns the rebuilds. `weights_differ`: each layer has its own weights (keys), else the layers share them.
++fn walk(a: std.mem.Allocator, layers: usize, same_weights: bool, misses_per_layer: *[2]usize) !usize {
++    const unit = 4096;
++    var most: Most = .{};
++    const dense = [4][3]usize{ .{ 4096, 2048, 0 }, .{ 6144, 4096, 0 }, .{ 6144, 6144, 1 }, .{ 6144, 3072, 0 } };
++    const moe = [4][3]usize{ .{ 4096, 2048, 0 }, .{ 6144, 4096, 0 }, .{ 1024, 6144, 1 }, .{ 6144, 512, 0 } };
++    for (dense) |s| mostOf(&most, fakeProj(1, s[0], s[1], s[2] == 1));
++    for (moe) |s| mostOf(&most, fakeProj(1, s[0], s[1], s[2] == 1));
++    var ring: Ring = .{ .cap = most.ringBytes() };
++    const owner = try a.alloc(u64, ring.cap / unit + 2);
++    defer a.free(owner);
++    @memset(owner, 0);
++    var rebuilds: usize = 0;
++    for (0..layers) |l| {
++        const shapes = if (l < 3) dense else moe;
++        const before = rebuilds;
++        // q_b(h0) o(h0) q_b(h1) o(h1), shared gate|up(h0) down(h0) gate|up(h1) down(h1)
++        for ([_]usize{ 0, 1, 0, 1, 2, 3, 2, 3 }) |pi| {
++            const s = shapes[pi];
++            const id: u64 = (if (same_weights) 0 else 100 * @as(u64, l)) + pi + 1;
++            const p = fakeProj(id, s[0], s[1], s[2] == 1);
++            const key = keyOf(&p);
++            const len = entryBytes(s[0], s[1]);
++            const tag = id * 1_000_003 + p.n();
++            const off = ring.find(key, 7) orelse blk: {
++                const o = try ring.place(len);
++                for (owner[o / unit ..][0 .. len / unit]) |*u| u.* = tag; // "the rebuild writes the tiles"
++                ring.commit(key, 7, o, len);
++                rebuilds += 1;
++                break :blk o;
++            };
++            try std.testing.expect(off + len <= ring.cap);
++            for (owner[off / unit ..][0 .. len / unit]) |u| try std.testing.expectEqual(tag, u); // the tiles the GEMM reads are this projection's
++        }
++        if (l == 0) misses_per_layer[0] = rebuilds - before;
++        if (l == 5) misses_per_layer[1] = rebuilds - before;
++    }
++    return rebuilds;
++}
++
++test "GLM X8: each projection is rebuilt once per layer per chunk, both halves reading the same tiles (four rebuilds a layer, dense and MoE)" {
++    const a = std.testing.allocator;
++    var per: [2]usize = undefined;
++    const total = try walk(a, 78, false, &per);
++    try std.testing.expectEqual(@as(usize, 4), per[0]);
++    try std.testing.expectEqual(@as(usize, 4), per[1]);
++    try std.testing.expectEqual(@as(usize, 4 * 78), total);
++}
++
++test "GLM X8: a layer's tiles are never taken for another layer's of the same shapes (the key names the weights), and the ring stays intact" {
++    const a = std.testing.allocator;
++    var per: [2]usize = undefined;
++    // layers with other weights rebuild every layer (the intact check inside `walk` fails for a stale hit)
++    try std.testing.expectEqual(@as(usize, 4 * 40), try walk(a, 40, false, &per));
++    // layers sharing one set of weights keep hitting what is in the ring: fewer rebuilds, still intact
++    var per2: [2]usize = undefined;
++    try std.testing.expect(try walk(a, 40, true, &per2) < 4 * 40);
++    // the key tells projections apart by every weight pointer and by the shape
++    const base = fakeProj(3, 2048, 1024, true);
++    const kb = keyOf(&base);
++    inline for (.{ "t", "suh", "svh" }) |f| {
++        var pa = base;
++        @field(pa.a, f) += 16;
++        try std.testing.expect(!std.meta.eql(kb, keyOf(&pa)));
++        var pb = base;
++        @field(pb.b.?, f) += 16;
++        try std.testing.expect(!std.meta.eql(kb, keyOf(&pb)));
++    }
++    var pk = base;
++    pk.a.k += 128;
++    pk.b.?.k += 128;
++    try std.testing.expect(!std.meta.eql(kb, keyOf(&pk)));
++    var pn = base;
++    pn.b = null; // the same first matrix alone: another projection
++    try std.testing.expect(!std.meta.eql(kb, keyOf(&pn)));
++    // and a ring finds a key only for its own stream
++    var ring: Ring = .{ .cap = 1 << 20 };
++    const off = try ring.place(1 << 16);
++    ring.commit(kb, 5, off, 1 << 16);
++    try std.testing.expectEqual(@as(?usize, off), ring.find(kb, 5));
++    try std.testing.expectEqual(@as(?usize, null), ring.find(kb, 6));
++    var pz = base;
++    pz.a.svh += 2;
++    try std.testing.expectEqual(@as(?usize, null), ring.find(keyOf(&pz), 5));
++}
++
++test "GLM X8: the ring drops what a new entry overlaps, wraps at the end, forgets on request, and refuses an entry larger than itself" {
++    var ring: Ring = .{ .cap = 1000 };
++    const k1 = keyOf(&fakeProj(1, 256, 128, false));
++    const k2 = keyOf(&fakeProj(2, 256, 128, false));
++    const k3 = keyOf(&fakeProj(3, 256, 128, false));
++    try std.testing.expectEqual(@as(usize, 0), try ring.place(600));
++    ring.commit(k1, 1, 0, 600);
++    // 600 + 500 passes the end: the entry goes to 0 and drops the first
++    try std.testing.expectEqual(@as(usize, 0), try ring.place(500));
++    try std.testing.expectEqual(@as(?usize, null), ring.find(k1, 1));
++    ring.commit(k2, 1, 0, 500);
++    try std.testing.expectEqual(@as(usize, 500), try ring.place(500)); // fits exactly at the end
++    ring.commit(k3, 1, 500, 500);
++    try std.testing.expectEqual(@as(?usize, 0), ring.find(k2, 1));
++    try std.testing.expectEqual(@as(?usize, 500), ring.find(k3, 1));
++    try std.testing.expectError(error.X8Scratch, ring.place(1001));
++    ring.clear(); // forget: nothing stays
++    try std.testing.expectEqual(@as(?usize, null), ring.find(k2, 1));
++    try std.testing.expectEqual(@as(?usize, null), ring.find(k3, 1));
++    try std.testing.expectEqual(@as(usize, 0), try ring.place(10));
++}
++
++test "GLM X8: int8 prompt tiles only with the interim lane's packing: tiled GEMMs and 8-bit dense codes" {
++    try std.testing.expect(!q8Wanted(false, 8));
++    try std.testing.expect(!q8Wanted(true, 16));
++    try std.testing.expect(!q8Wanted(true, 4));
++    // (TF_GLM_X8_PROMPT_Q8=0 turns it off: read from the environment, not set in a test)
++    if (std.c.getenv("TF_GLM_X8_PROMPT_Q8") == null) try std.testing.expect(q8Wanted(true, 8));
++}
++
++test "GLM X8: a ring entry's bytes are the packed linear's codes and scales, 256-aligned" {
++    // glm_mm.packedBytes: codes n * k, scales n * k / 64 fp16
++    try std.testing.expectEqual(@as(usize, 6144 * 6144 + 6144 * 96 * 2), entryBytes(6144, 6144));
++    try std.testing.expectEqual(@as(usize, 0), entryBytes(6144, 6144) % 256);
++    try std.testing.expectEqual(@as(usize, 0), entryBytes(1024, 512) % 256);
++    try std.testing.expect(entryBytes(128, 64) >= 128 * 64 + 128 * 2);
++}
++
++test "GLM X8: more live entries than slots starts the ring over with the newest entry first (never a stale find)" {
++    var ring: Ring = .{ .cap = 1 << 20 };
++    var keys: [Ring.max_live + 1]Key = undefined;
++    for (&keys, 0..) |*k, i| {
++        k.* = keyOf(&fakeProj(i + 1, 128, 128, false));
++        const off = try ring.place(64);
++        ring.commit(k.*, 1, off, 64);
++        try std.testing.expectEqual(i * 64, off);
+     }
++    try std.testing.expectEqual(@as(?usize, Ring.max_live * 64), ring.find(keys[Ring.max_live], 1)); // the newest kept, at its own offset
++    for (keys[0..Ring.max_live]) |k| try std.testing.expectEqual(@as(?usize, null), ring.find(k, 1));
++    try std.testing.expectEqual((Ring.max_live + 1) * 64, try ring.place(64)); // and the next entry goes after it
+ }
+diff --git a/zig/src/families/glm/dflash_load.zig b/zig/src/families/glm/dflash_load.zig
+index 111965cb4..9c8553c45 100644
+--- a/zig/src/families/glm/dflash_load.zig
++++ b/zig/src/families/glm/dflash_load.zig
+@@ -1,6 +1,7 @@
+ //! DFlash2's checkpoint onto the device: the config checked, linears tiled for glm_mm, scratch carved from one buffer.
+ const std = @import("std");
+ const cuda = @import("cuda");
++const start_floor = @import("cuda_start_floor.zig");
+ const mm = @import("cuda_mm.zig");
+ const q4 = @import("cuda_q4.zig");
+ const quant = @import("cuda_quant.zig");
+@@ -174,11 +175,11 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     const q32 = q32env();
+     const gextra: u64 = if (q32) lin_elems / 16 else 0; // the 32 groups' second half of scales and biases
+     const total: u64 = shape.layers * (lin_elems * per / 2 + lin_elems / 16 + gextra + D * ff * 2 + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
+-    var wbuf = try cuda.DeviceBuffer.alloc(d, total);
++    var wbuf = try start_floor.alloc(d, total);
+     errdefer wbuf.free();
+-    var tmp = try cuda.DeviceBuffer.alloc(d, @max(@max(2 * FF * D, NT * D * D), shape.qkv() * D) * 2); // the largest linear as stored
++    var tmp = try start_floor.alloc(d, @max(@max(2 * FF * D, NT * D * D), shape.qkv() * D) * 2); // the largest linear as stored
+     defer tmp.free();
+-    var raw = try cuda.DeviceBuffer.alloc(d, df.rawBytesFor(shape, bits, world));
++    var raw = try start_floor.alloc(d, df.rawBytesFor(shape, bits, world));
+     defer raw.free();
+     var module = try cuda.Module.load(d, cuda.kernels.glm_dflash);
+     errdefer module.unload();
+@@ -286,7 +287,7 @@ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
+         @field(dr, f[0]) = at;
+         at += std.mem.alignForward(u64, f[1], 256);
+     }
+-    dr.scratch = try cuda.DeviceBuffer.alloc(d, at);
++    dr.scratch = try start_floor.alloc(d, at);
+     errdefer dr.scratch.free();
+     inline for (fields) |f| @field(dr, f[0]) += dr.scratch.ptr;
+     try d.check(d.api.cuMemsetD8_v2(dr.scratch.ptr, 0, at), "cuMemsetD8");
+diff --git a/zig/src/native/cuda_family_memory.zig b/zig/src/native/cuda_family_memory.zig
+index 6cf103622..196defcef 100644
+--- a/zig/src/native/cuda_family_memory.zig
++++ b/zig/src/native/cuda_family_memory.zig
+@@ -51,8 +51,9 @@ pub fn weights(comptime F: type, a: Allocator, io: std.Io, o: api.Open, problem:
+         problem.* = try std.fmt.allocPrint(a, "cannot estimate checkpoint weight files ({s}); refusing CUDA admission", .{@errorName(err)});
+         return null;
+     };
+-    const text = if (@hasDecl(F, "placementWeightBytes")) try F.placementWeightBytes(a, io, o.dir, o.tp, o.rank, o.drafts) else if (@hasDecl(F, "weightShare")) F.weightShare(a, io, o.dir, whole) else whole;
+-    return text + try @import("cuda_vision_offer.zig").weightBytes(F, a, io, o);
++    const text: ?u64 = if (@hasDecl(F, "placementWeightBytes")) try F.placementWeightBytes(a, io, o.dir, o.tp, o.rank, o.drafts) else if (@hasDecl(F, "weightShare")) F.weightShare(a, io, o.dir, whole) else whole;
++    // GLM EXLR8 checks its own startup allocations. The reserve still applies to later stream and cache admission.
++    return if (text) |bytes| bytes + try @import("cuda_vision_offer.zig").weightBytes(F, a, io, o) else 0;
+ }
+ 
+ /// Logs, from 0.25 GiB, the free pages on the per-CPU lists that a pool's reading counted.
+diff --git a/zig/tests/cuda/glm_x8_q8_tests.zig b/zig/tests/cuda/glm_x8_q8_tests.zig
+new file mode 100644
+index 000000000..524e65a60
+--- /dev/null
++++ b/zig/tests/cuda/glm_x8_q8_tests.zig
+@@ -0,0 +1,456 @@
++//! X18: prompt chunks' int8 tiles built straight from the EXLR8 trellis (cuda_x8.zig promptQ8, exlr8_recon.cu tf_x8_recon_q8)
++//! against what the interim lane loads: X8's bf16 rows through cuda_qpack.quantize(8) and glm_mm_tile8, byte for byte (codes and
++//! fp16 scales), and the prompt GEMM's rows (glm_mm8_128s2) on both, byte for byte. `glm-x8-q8 DIR`: DIR from night/gr8x/x18/gpu_cases_q8.py
++//! (real rank-0 projections of layers 0, 2, 3, 40, 77). X18_RECON_CUBIN=path loads another build of exlr8_recon.cu (the mutation runs; with X18_MUTANT=1 the run also fails if every check passed).
++const std = @import("std");
++const cuda = @import("cuda");
++const glm = @import("glm_cuda");
++const check = @import("check.zig");
++const x8 = glm.x8;
++const qpack = glm.qpack;
++const mm = glm.mm;
++
++const row_counts = [_]usize{ 1, 16, 17, 557, 63, 65, 2048, 4096 }; // 1 and 16: tails the decode linear took before (finding r2-4)
++const max_rows = 4096;
++
++const Rig = struct {
++    gpu: check.Gpu,
++    s: cuda.Stream,
++    mk: *const mm.Kernels,
++    run: *x8.Run,
++    set: glm.glue.Set,
++    bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
++    xbuf: u64 = 0,
++    x_rows: usize = 0,
++    x_k: usize = 0,
++    out: u64 = 0,
++    out2: u64 = 0,
++    part: u64 = 0,
++    compared: usize = 0, // bytes compared, all checks
++    checks: usize = 0,
++    controls: usize = 0,
++    sid: usize = 0,
++
++    fn put(r: *Rig, bytes: []const u8) !u64 {
++        const b = try cuda.DeviceBuffer.fromHost(r.gpu.d, bytes);
++        try r.bufs.append(r.gpu.gpa, b);
++        return b.ptr;
++    }
++    fn alloc(r: *Rig, len: usize) !u64 {
++        const b = try cuda.DeviceBuffer.alloc(r.gpu.d, @max(len, 256));
++        try r.bufs.append(r.gpu.gpa, b);
++        return b.ptr;
++    }
++    fn get(r: *Rig, ptr: u64, len: usize) ![]u8 {
++        try r.s.synchronize();
++        const out = try r.gpu.gpa.alloc(u8, len);
++        errdefer r.gpu.gpa.free(out);
++        const b: cuda.DeviceBuffer = .{ .d = r.gpu.d, .ptr = ptr, .len = len };
++        try b.download(0, out);
++        return out;
++    }
++    fn deinit(r: *Rig) void {
++        for (r.bufs.items) |*b| b.free();
++        r.bufs.deinit(r.gpu.gpa);
++    }
++};
++
++const Case = struct {
++    name: []const u8,
++    proj: x8.Proj,
++    ref: []u16, // X8's bf16 rows [n][k] (empty for the synthetic cases)
++    n: usize,
++    k: usize,
++};
++
++fn mat(r: *Rig, t: []const u8, suh: []const u8, svh: []const u8, k: usize, n: usize) !x8.Mat {
++    const bits = t.len / (k / 16 * (n / 16) * 32);
++    return .{ .t = try r.put(t), .suh = try r.put(suh), .svh = try r.put(svh), .k = k, .n = n, .bits = @intCast(bits) };
++}
++
++fn readAll(io: std.Io, d: std.Io.Dir, a: std.mem.Allocator, name: []const u8) ![]u8 {
++    return d.readFileAlloc(io, name, a, .limited(2 << 30));
++}
++
++/// The interim lane's tiles of `ref` ([n][k] bf16): qpack.quantize(8) on the host, glm_mm_tile8 on the device. Returns the bytes (codes, scales).
++fn interim(r: *Rig, ref: []const u16, n: usize, k: usize) ![]u8 {
++    const a = r.gpu.gpa;
++    const words = try a.alloc(u32, n * k / 4);
++    defer a.free(words);
++    const scales = try a.alloc(u16, n * (k / 64));
++    defer a.free(scales);
++    qpack.quantize(8, ref, n, k, words, scales);
++    const pb = mm.packedBytes(n, k, 8);
++    const src = try r.alloc(n * k);
++    const ss = try r.alloc(n * (k / 64) * 2);
++    const dst = try r.alloc(x8.entryBytes(n, k));
++    try (cuda.DeviceBuffer{ .d = r.gpu.d, .ptr = src, .len = n * k }).upload(0, std.mem.sliceAsBytes(words));
++    try (cuda.DeviceBuffer{ .d = r.gpu.d, .ptr = ss, .len = scales.len * 2 }).upload(0, std.mem.sliceAsBytes(scales));
++    try mm.tilePacked(r.mk, r.s, 8, src, ss, dst, dst + pb[0], n, k);
++    const got = try r.get(dst, pb[0] + pb[1]);
++    return got;
++}
++
++/// x's first `rows` rows through proj by the native path (promptQ8 inside x8.matmul), into r.out.
++fn native(r: *Rig, p: *const x8.Proj, rows: usize, at: usize, wide: bool) !void {
++    try x8.matmul(r.set, r.s, p, r.xbuf + at * r.x_k * 2, r.x_k, r.out, r.part, rows, p.n(), p.k(), wide);
++}
++
++fn fillX(r: *Rig, k: usize, rows: usize, seed: u64) !void {
++    const a = r.gpu.gpa;
++    if (r.x_rows >= rows and r.x_k == k) return;
++    const h = try a.alloc(u16, rows * k);
++    defer a.free(h);
++    var prng = std.Random.DefaultPrng.init(seed);
++    for (h) |*v| v.* = @truncate(@as(u32, @bitCast(prng.random().floatNorm(f32))) >> 16);
++    if (r.xbuf == 0 or r.x_rows * r.x_k < rows * k) r.xbuf = try r.alloc(rows * k * 2);
++    try (cuda.DeviceBuffer{ .d = r.gpu.d, .ptr = r.xbuf, .len = rows * k * 2 }).upload(0, std.mem.sliceAsBytes(h));
++    r.x_rows = rows;
++    r.x_k = k;
++}
++
++/// The ring's entry for `p` (the tiles the last native call read), as bytes (codes, scales).
++fn ringBytes(r: *Rig, p: *const x8.Proj) ![]u8 {
++    const off = r.run.ring.find(x8.keyOf(p), r.sid) orelse {
++        try check.expect(false, "glm-x8-q8: no ring entry after a prompt call ({d} x {d})", .{ p.n(), p.k() });
++        unreachable;
++    };
++    const pb = mm.packedBytes(p.n(), p.k(), 8);
++    return r.get(r.run.ring_ptr + off, pb[0] + pb[1]);
++}
++
++fn sameBytes(r: *Rig, what: []const u8, name: []const u8, got: []const u8, want: []const u8) !void {
++    var buf: [200]u8 = undefined;
++    try check.sameBytes(try std.fmt.bufPrint(&buf, "glm-x8-q8 {s}: {s}", .{ name, what }), got, want);
++    r.compared += got.len;
++    r.checks += 1;
++}
++
++/// One projection: its tiles against the interim lane's, rows through both lanes.
++fn oneCase(r: *Rig, c: Case, ref_tiles: []const u8) !void {
++    const a = r.gpu.gpa;
++    const pb = mm.packedBytes(c.n, c.k, 8);
++    try fillX(r, c.k, max_rows, 18);
++    x8.forget(r.run);
++    try native(r, &c.proj, 2048, 0, false);
++    const got = try ringBytes(r, &c.proj);
++    defer a.free(got);
++    try sameBytes(r, "codes (int8 + 128, glm_mm tile order)", c.name, got[0..pb[0]], ref_tiles[0..pb[0]]);
++    try sameBytes(r, "fp16 scales", c.name, got[pb[0]..], ref_tiles[pb[0]..]);
++    // the interim lane's tiles as a Tiled linear: the same GEMM on both
++    const ref_dev = try r.alloc(x8.entryBytes(c.n, c.k));
++    try (cuda.DeviceBuffer{ .d = r.gpu.d, .ptr = ref_dev, .len = ref_tiles.len }).upload(0, ref_tiles);
++    const tiled: mm.Tiled = .{ .w = ref_dev, .n = c.n, .k = c.k, .s = ref_dev + pb[0], .bits = 8 };
++    for (row_counts) |rows| for ([_]bool{ false, true }) |wide| {
++        if (wide and rows != 2048 and rows != 65 and rows != 16) continue;
++        const sz: usize = if (wide) 4 else 2;
++        try native(r, &c.proj, rows, 0, wide);
++        const n_out = try r.get(r.out, rows * c.n * sz);
++        defer a.free(n_out);
++        try mm.matmul(r.mk, r.s, r.xbuf, c.k, tiled, r.out2, r.part, rows, wide, true);
++        const i_out = try r.get(r.out2, rows * c.n * sz);
++        defer a.free(i_out);
++        var buf: [64]u8 = undefined;
++        try sameBytes(r, try std.fmt.bufPrint(&buf, "{d} prompt rows, {s} out, native == interim lane", .{ rows, if (wide) "fp32" else "bf16" }), c.name, n_out, i_out);
++    };
++}
++
++fn load(r: *Rig, io: std.Io, d: std.Io.Dir, name: []const u8, k: usize, n_total: usize, nm: usize) !Case {
++    const a = r.gpu.gpa;
++    var mats: [2]x8.Mat = undefined;
++    for (0..nm) |i| {
++        var nb: [96]u8 = undefined;
++        const t = try readAll(io, d, a, try std.fmt.bufPrint(&nb, "{s}.m{d}.t.bin", .{ name, i }));
++        defer a.free(t);
++        const suh = try readAll(io, d, a, try std.fmt.bufPrint(&nb, "{s}.m{d}.suh.bin", .{ name, i }));
++        defer a.free(suh);
++        const svh = try readAll(io, d, a, try std.fmt.bufPrint(&nb, "{s}.m{d}.svh.bin", .{ name, i }));
++        defer a.free(svh);
++        mats[i] = try mat(r, t, suh, svh, k, n_total / nm);
++    }
++    var nb: [96]u8 = undefined;
++    const raw = try readAll(io, d, a, try std.fmt.bufPrint(&nb, "{s}.ref.bin", .{name}));
++    defer a.free(raw);
++    try check.expect(raw.len == n_total * k * 2, "glm-x8-q8 {s}: reference rows are {d} bytes, expected {d}", .{ name, raw.len, n_total * k * 2 });
++    const ref = try a.alloc(u16, n_total * k);
++    @memcpy(std.mem.sliceAsBytes(ref), raw);
++    return .{ .name = try a.dupe(u8, name), .proj = .{ .a = mats[0], .b = if (nm == 2) mats[1] else null }, .ref = ref, .n = n_total, .k = k };
++}
++
++/// A copy of `p` whose first matrix's trellis has one byte changed (the control: its tiles must differ from the reference's).
++fn mutated(r: *Rig, io: std.Io, d: std.Io.Dir, c: Case) !x8.Proj {
++    const a = r.gpu.gpa;
++    var nb: [96]u8 = undefined;
++    const t = try readAll(io, d, a, try std.fmt.bufPrint(&nb, "{s}.m0.t.bin", .{c.name}));
++    defer a.free(t);
++    t[t.len / 2 + 3] ^= 0x10;
++    var p = c.proj;
++    p.a.t = try r.put(t);
++    return p;
++}
++
++fn synthetic(r: *Rig, name: []const u8, n: usize, k: usize, stack: bool, special: bool, seed: u64) !Case {
++    const a = r.gpu.gpa;
++    var prng = std.Random.DefaultPrng.init(seed);
++    const rnd = prng.random();
++    var mats: [2]x8.Mat = undefined;
++    const nm: usize = if (stack) 2 else 1;
++    for (0..nm) |i| {
++        const nn = n / nm;
++        const t = try a.alloc(u8, k / 16 * (nn / 16) * 128);
++        defer a.free(t);
++        rnd.bytes(t);
++        const suh = try a.alloc(u16, k);
++        defer a.free(suh);
++        const svh = try a.alloc(u16, nn);
++        defer a.free(svh);
++        for (suh) |*v| v.* = @as(u16, 0x2C00) + rnd.uintLessThan(u16, 0x1400) + (if (rnd.boolean()) @as(u16, 0x8000) else 0);
++        for (svh) |*v| v.* = @as(u16, 0x2800) + rnd.uintLessThan(u16, 0x1800) + (if (rnd.boolean()) @as(u16, 0x8000) else 0);
++        if (special) { // zero (either sign), subnormal, smallest and largest normal scales: tf_x8_bf16_int's fallbacks and the scale's overflow
++            const odd = [_]u16{ 0x0000, 0x8000, 0x0001, 0x03FF, 0x8200, 0x0400, 0x7BFF, 0xFBFF };
++            for (suh) |*v| if (rnd.uintLessThan(u8, 6) == 0) {
++                v.* = odd[rnd.uintLessThan(usize, odd.len)];
++            };
++            for (svh) |*v| if (rnd.uintLessThan(u8, 6) == 0) {
++                v.* = odd[rnd.uintLessThan(usize, odd.len)];
++            };
++        }
++        mats[i] = try mat(r, t, std.mem.sliceAsBytes(suh), std.mem.sliceAsBytes(svh), k, nn);
++    }
++    return .{ .name = name, .proj = .{ .a = mats[0], .b = if (stack) mats[1] else null }, .ref = &.{}, .n = n, .k = k };
++}
++
++/// The reference of a synthetic projection: the bf16 rebuild the native lane ran before X18 (exact, rounded once), through qpack and glm_mm_tile8.
++fn rebuiltBf16(r: *Rig, c: Case) ![]u16 {
++    const w = try r.alloc(c.n * c.k * 2);
++    try x8.rebuild(r.run, r.s, c.proj.a, w, c.k, 0);
++    if (c.proj.b) |b| try x8.rebuild(r.run, r.s, b, w, c.k, c.proj.a.n);
++    const bytes = try r.get(w, c.n * c.k * 2);
++    defer r.gpu.gpa.free(bytes);
++    const out = try r.gpu.gpa.alloc(u16, c.n * c.k);
++    @memcpy(std.mem.sliceAsBytes(out), bytes);
++    return out;
++}
++
++
++/// X18_TIME=1: the native lane's prompt linears of one layer, run in the order a 4,096-row chunk of two 2,048-row halves runs them
++/// (q_b, o_proj, q_b, o_proj | shared [gate | up], down, [gate | up], down), three ways back to back in this one process: the bf16 rebuild
++/// (TF_GLM_X8_PROMPT_Q8=0: a second Run), the int8 ring (this patch), and the interim lane's GEMM alone (glm_mm8_128s2 on the same bytes).
++/// Reports ms per layer pattern and the chunk's estimate (76 MoE-shaped layers + 3 dense MLPs).
++fn timing(r: *Rig, run_old: *x8.Run, projs: []const Case) !void {
++    const io = r.gpu.io;
++    const order = [_]usize{ 0, 1, 0, 1, 2, 3, 2, 3 };
++    var set_old = r.set;
++    set_old.x8 = run_old;
++    try fillX(r, 6144, max_rows, 18);
++    var res: [2][3]f64 = undefined; // [moe pattern, dense pattern][old, new, interim]
++    for ([2][]const usize{ &.{ 0, 1, 2, 3 }, &.{ 4, 5 } }, 0..) |idx, pat| {
++        const calls: []const usize = if (pat == 0) &order else &.{ 0, 1, 0, 1 };
++        var tiled: [4]mm.Tiled = undefined;
++        for (idx, 0..) |ci, j| { // the interim lane's tiles: the ring's bytes after one native call
++            const c = projs[ci];
++            x8.forget(r.run);
++            try x8.matmul(r.set, r.s, &c.proj, r.xbuf, c.k, r.out, r.part, 2048, c.n, c.k, false);
++            const base = r.run.ring_ptr + r.run.ring.find(x8.keyOf(&c.proj), r.sid).?;
++            const copy = try r.alloc(x8.entryBytes(c.n, c.k));
++            try r.s.d.check(r.s.d.api.cuMemcpyDtoDAsync_v2(copy, base, x8.entryBytes(c.n, c.k), r.s.handle), "cuMemcpyDtoDAsync");
++            tiled[j] = .{ .w = copy, .n = c.n, .k = c.k, .s = copy + mm.packedBytes(c.n, c.k, 8)[0], .bits = 8 };
++        }
++        res[pat] = .{ 1e30, 1e30, 1e30 };
++        for ([_]usize{ 2, 1, 0, 0, 1, 2 }) |kind| { // two rounds in opposite orders, the minimum of each: the GPU's clock ramps up in the first
++            const warm = 12;
++            const reps = 12;
++            var t0: i96 = 0;
++            for (0..warm + reps) |rep| {
++                if (rep == warm) {
++                    try r.s.synchronize();
++                    t0 = check.now(io);
++                }
++                if (kind == 1) x8.forget(r.run); // every layer has its own weights: the ring rebuilds each projection once per pattern (a ring left alone would hit)
++                for (calls, 0..) |ci, step| {
++                    const c = &projs[idx[ci]]; // (a pointer into the list: the bf16 rebuild's cache is keyed by the Proj's address)
++                    const x = r.xbuf + (step % 2) * 2048 * c.k * 2;
++                    switch (kind) {
++                        0 => try x8.matmul(set_old, r.s, &c.proj, x, c.k, r.out, r.part, 2048, c.n, c.k, false),
++                        1 => try x8.matmul(r.set, r.s, &c.proj, x, c.k, r.out, r.part, 2048, c.n, c.k, false),
++                        else => try mm.matmul(r.mk, r.s, x, c.k, tiled[ci], r.out2, r.part, 2048, false, true),
++                    }
++                }
++            }
++            try r.s.synchronize();
++            res[pat][kind] = @min(res[pat][kind], @as(f64, @floatFromInt(check.now(io) - t0)) / 1e6 / reps);
++        }
++        std.debug.print("TIME {s} pattern ({d} calls): bf16 rebuild per call {d:.1} ms, int8 ring {d:.1} ms, interim GEMM only {d:.1} ms\n", .{ if (pat == 0) "MoE layer" else "dense MLP", calls.len, res[pat][0], res[pat][1], res[pat][2] });
++    }
++    // 76 layers of the MoE pattern (layers 3-77 + q_b of the rest: 75-76), 3 dense MLP patterns
++    var tot: [3]f64 = undefined;
++    for (0..3) |k| tot[k] = 75 * res[0][k] + 3 * res[1][k];
++    std.debug.print("TIME per 4,096-row chunk of two halves (75 MoE-shaped layers + 3 dense MLPs, GEMMs and rebuilds only): bf16 rebuild {d:.0} ms, int8 ring {d:.0} ms, interim {d:.0} ms; native over interim: old +{d:.0} ms, new +{d:.0} ms (the x17 report's estimate +130-160)\n", .{ tot[0], tot[1], tot[2], tot[0] - tot[2], tot[1] - tot[2] });
++}
++
++pub fn run(gpu: check.Gpu, dir: []const u8) !void {
++    const a = gpu.gpa;
++    const io = gpu.io;
++    var s = try cuda.Stream.init(gpu.d, false);
++    defer s.deinit();
++    var mmod = try cuda.Module.load(gpu.d, cuda.kernels.glm_mm);
++    defer mmod.unload();
++    const mk = try mm.Kernels.load(mmod);
++    var image: []const u8 = cuda.kernels.exlr8_recon;
++    var mutant = false;
++    if (std.c.getenv("X18_RECON_CUBIN")) |p| {
++        image = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(p), a, .limited(64 << 20));
++        mutant = if (std.c.getenv("X18_MUTANT")) |m| std.mem.eql(u8, std.mem.span(m), "1") else false;
++        std.debug.print("glm-x8-q8: exlr8_recon image {s}{s}\n", .{ std.mem.span(p), if (mutant) " (X18_MUTANT=1: a mutated build, the checks must FAIL)" else " (an nvcc-built image of the clean source: the checks must pass)" });
++    }
++    var runk = try x8.Run.loadWith(gpu.d, image);
++    defer runk.deinit();
++    runk.q8 = true;
++    var glue_dummy: glm.glue.Kernels = undefined; // the x8 prompt path reads none of it
++    var rig: Rig = .{ .gpu = gpu, .s = s, .mk = &mk, .run = &runk, .set = .{ .glue = &glue_dummy, .mm = &mk, .prompt = true, .x8 = &runk } };
++    defer rig.deinit();
++    rig.sid = @intFromPtr(s.handle);
++    const d = try std.Io.Dir.cwd().openDir(io, dir, .{});
++    const manifest = try readAll(io, d, a, "cases.txt");
++    defer a.free(manifest);
++    var cases: std.ArrayList(Case) = .empty;
++    defer cases.deinit(a);
++    var it = std.mem.tokenizeScalar(u8, manifest, '\n');
++    while (it.next()) |line| {
++        var f = std.mem.tokenizeScalar(u8, line, ' ');
++        const name = f.next().?;
++        const k = try std.fmt.parseInt(usize, f.next().?, 10);
++        const n = try std.fmt.parseInt(usize, f.next().?, 10);
++        const nm = try std.fmt.parseInt(usize, f.next().?, 10);
++        try cases.append(a, try load(&rig, io, d, name, k, n, nm));
++    }
++    // synthetic projections: TP4 rank shapes (q_b, o_proj, shared [gate | up], shared down, dense [gate | up], dense down) and two TP2 shapes
++    const S = struct { n: usize, k: usize, stack: bool, special: bool = false };
++    const syn = [_]S{
++        .{ .n = 4096, .k = 2048, .stack = false }, .{ .n = 6144, .k = 4096, .stack = false }, .{ .n = 1024, .k = 6144, .stack = true },
++        .{ .n = 6144, .k = 512, .stack = false },  .{ .n = 6144, .k = 6144, .stack = true },  .{ .n = 6144, .k = 3072, .stack = false },
++        .{ .n = 8192, .k = 2048, .stack = false }, .{ .n = 6144, .k = 8192, .stack = false },
++        .{ .n = 1024, .k = 1024, .stack = true, .special = true }, .{ .n = 512, .k = 384, .stack = false, .special = true },
++    };
++    var scases: std.ArrayList(Case) = .empty;
++    defer scases.deinit(a);
++    for (syn, 0..) |sh, i| try scases.append(a, try synthetic(&rig, "synthetic", sh.n, sh.k, sh.stack, sh.special, 1800 + i));
++    var most: x8.Most = .{};
++    for (cases.items) |c| x8.mostOf(&most, c.proj);
++    for (scases.items) |c| x8.mostOf(&most, c.proj);
++    try runk.reserve(a, most);
++    const max_n = blk: {
++        var m: usize = 0;
++        for (cases.items) |c| m = @max(m, c.n);
++        for (scases.items) |c| m = @max(m, c.n);
++        break :blk m;
++    };
++    rig.out = try rig.alloc(max_rows * max_n * 4);
++    rig.out2 = try rig.alloc(max_rows * max_n * 4);
++    rig.part = try rig.alloc(1 << 20);
++    var refs: std.ArrayList([]u8) = .empty;
++    defer refs.deinit(a);
++
++    // 1. real rank-0 projections: tiles and GEMM rows against the interim lane's
++    for (cases.items) |c| {
++        const ref_tiles = try interim(&rig, c.ref, c.n, c.k);
++        try refs.append(a, ref_tiles);
++        try oneCase(&rig, c, ref_tiles);
++        check.pass("glm-x8-q8 {s} ({d} x {d}{s}): int8 tiles + scales == the interim lane's, {d} row counts through glm_mm8_128s2 == interim", .{ c.name, c.n, c.k, if (c.proj.b != null) ", [gate | up]" else "", row_counts.len });
++    }
++    // 2. controls: a trellis byte changed -> the tiles differ from the interim's (the comparison can fail); a reference weight changed too
++    for (cases.items, 0..) |c, i| {
++        if (i % 3 != 0) continue;
++        const pb = mm.packedBytes(c.n, c.k, 8);
++        const mp = try mutated(&rig, io, d, c);
++        try fillX(&rig, c.k, max_rows, 18);
++        x8.forget(rig.run);
++        try native(&rig, &mp, 2048, 0, false);
++        const got = try ringBytes(&rig, &mp);
++        defer a.free(got);
++        try check.expect(!std.mem.eql(u8, got[0..pb[0]], refs.items[i][0..pb[0]]), "glm-x8-q8 control {s}: a changed trellis byte gave the interim lane's codes", .{c.name});
++        const ref2 = try a.dupe(u16, c.ref);
++        defer a.free(ref2);
++        ref2[ref2.len / 3] ^= 0x4000; // an exponent bit of one weight: its group's scale or code moves
++        const t2 = try interim(&rig, ref2, c.n, c.k);
++        defer a.free(t2);
++        try check.expect(!std.mem.eql(u8, t2, refs.items[i]), "glm-x8-q8 control {s}: a changed reference weight gave the same interim bytes", .{c.name});
++        rig.controls += 2;
++        check.pass("glm-x8-q8 control {s}: a changed trellis byte and a changed reference weight both fail the byte comparison", .{c.name});
++    }
++    // 3. the cache: layers 40 then 77 as a chunk of two halves runs them (q_b o q_b o | shared gu down gu down): four rebuilds a layer, every call
++    //    equal to its own interim result; a request boundary (forget) rebuilds; layers of the same shapes never read each other's tiles
++    {
++        const names = [_][]const u8{ "q_b", "o", "sh_gu", "sh_down" };
++        const suffix = [_][]const u8{ "_qb", "_o", "_sh_gu", "_sh_down" };
++        const order = [_]usize{ 0, 1, 0, 1, 2, 3, 2, 3 };
++        var before = rig.run.rebuilds;
++        x8.forget(rig.run);
++        for ([_]u32{ 40, 77, 40 }, 0..) |layer, pass_no| {
++            before = rig.run.rebuilds;
++            for (order, 0..) |pi, step| {
++                var nb: [32]u8 = undefined;
++                const want_name = try std.fmt.bufPrint(&nb, "l{d}{s}", .{ layer, suffix[pi] });
++                var ci: usize = 0;
++                while (!std.mem.eql(u8, cases.items[ci].name, want_name)) ci += 1;
++                const c = cases.items[ci];
++                const half = step % 2;
++                try fillX(&rig, c.k, max_rows, 18);
++                const pb = mm.packedBytes(c.n, c.k, 8);
++                const ref_dev = try rig.alloc(x8.entryBytes(c.n, c.k));
++                try (cuda.DeviceBuffer{ .d = gpu.d, .ptr = ref_dev, .len = refs.items[ci].len }).upload(0, refs.items[ci]);
++                const tiled: mm.Tiled = .{ .w = ref_dev, .n = c.n, .k = c.k, .s = ref_dev + pb[0], .bits = 8 };
++                try native(&rig, &c.proj, 2048, half * 2048, false);
++                const n_out = try rig.get(rig.out, 2048 * c.n * 2);
++                defer a.free(n_out);
++                try mm.matmul(rig.mk, s, rig.xbuf + half * 2048 * c.k * 2, c.k, tiled, rig.out2, rig.part, 2048, false, true);
++                const i_out = try rig.get(rig.out2, 2048 * c.n * 2);
++                defer a.free(i_out);
++                try sameBytes(&rig, "chunk half through the per-layer cache == interim lane", want_name, n_out, i_out);
++            }
++            const made = rig.run.rebuilds - before;
++            // a layer's calls: at most four rebuilds (each projection once, however many halves); the layers after the first may find tiles
++            // another call left (the ring holds more than one MoE layer)
++            try check.expect(made <= 4, "glm-x8-q8: layer {d}: {d} rebuilds for 8 calls (at most 4 expected)", .{ layer, made });
++            if (pass_no < 2) try check.expect(made == 4, "glm-x8-q8: layer {d} (new weights): {d} rebuilds, expected 4", .{ layer, made });
++            check.pass("glm-x8-q8 cache: layer {d} {s}/{s}/{s}/{s} x2 halves: {d} rebuilds, all 8 calls == interim", .{ layer, names[0], names[1], names[2], names[3], made });
++        }
++        // another request: forget, then layer 77 again must rebuild its four
++        x8.forget(rig.run);
++        before = rig.run.rebuilds;
++        for (order, 0..) |pi, step| {
++            var nb: [32]u8 = undefined;
++            const want_name = try std.fmt.bufPrint(&nb, "l77{s}", .{suffix[pi]});
++            var ci: usize = 0;
++            while (!std.mem.eql(u8, cases.items[ci].name, want_name)) ci += 1;
++            try native(&rig, &cases.items[ci].proj, 2048, (step % 2) * 2048, false);
++        }
++        try check.expect(rig.run.rebuilds - before == 4, "glm-x8-q8: after forget: {d} rebuilds, expected 4", .{rig.run.rebuilds - before});
++        check.pass("glm-x8-q8 cache: after a request boundary (forget) layer 77's four projections rebuild once each", .{});
++    }
++    // 4. synthetic TP4 (and two TP2) shapes: the native lane's old bf16 rebuild (exact) through qpack and tile8 == the fused int8 tiles
++    for (scases.items) |c| {
++        const rows16 = try rebuiltBf16(&rig, c);
++        defer a.free(rows16);
++        const ref_tiles = try interim(&rig, rows16, c.n, c.k);
++        defer a.free(ref_tiles);
++        x8.forget(rig.run);
++        try fillX(&rig, c.k, max_rows, 18);
++        try native(&rig, &c.proj, 2048, 0, false);
++        const got = try ringBytes(&rig, &c.proj);
++        defer a.free(got);
++        var buf: [48]u8 = undefined;
++        const nm = try std.fmt.bufPrint(&buf, "synthetic {d}x{d}{s}", .{ c.n, c.k, if (c.proj.b != null) " [gate | up]" else "" });
++        try sameBytes(&rig, "random trellis and scales: fused tiles == bf16 rebuild + qpack + tile8", nm, got, ref_tiles[0..got.len]);
++        check.pass("glm-x8-q8 {s}: fused int8 tiles + scales == the bf16 rebuild's through qpack.quantize + glm_mm_tile8 ({d} bytes)", .{ nm, got.len });
++    }
++    if (std.c.getenv("X18_TIME") != null) {
++        var old = try x8.Run.loadWith(gpu.d, image);
++        defer old.deinit();
++        try old.reserve(a, most); // q8 false: the bf16 rows and tiles
++        try timing(&rig, &old, scases.items);
++    }
++    for (refs.items) |b| a.free(b);
++    try check.expect(!mutant, "glm-x8-q8: a MUTATED kernel image passed every check ({d} comparisons): the test cannot see the mutation", .{rig.checks});
++    check.pass("glm-x8-q8: {d} byte comparisons ({d} bytes) equal, {d} controls differ, {d} real projections + {d} synthetic shapes", .{ rig.checks, rig.compared, rig.controls, cases.items.len, scases.items.len });
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index ab23a4bba..aca6de791 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -251,6 +251,7 @@ const usage =
+     \\  glm-conc-rows [DIR]         TF_GLM_DSA_SHARED: a stream's decode rows alone and in a shared window of 2..32 rows, byte for byte (DIR: x9a layer.bin, K4)
+     \\  glm-conc-rows-e4m3 [DIR]    the same on the E4M3 image (EXLR8 values; DIR: an up1 layer.bin), with controls
+     \\  exl3-prompt-once-e4m3 [DIR] the same on the E4M3 image (EXLR8 values; DIR: an up1 layer.bin, codebook mcg_e4m3), with K4-image controls
++    \\  glm-x8-q8 DIR              X18: prompt int8 tiles built from the EXLR8 trellis == the interim lane's (qpack.quantize + tile8), byte for byte; DIR: night/gr8x/x18/gpu_cases_q8.py; X18_RECON_CUBIN=path: a mutated kernel (must FAIL)
+     \\  glm-exl3-fuse-e4m3        glm-exl3-fuse on the E4M3 image (EXLR8 values), with K4-image controls; TF_GLM_PF_DOWN_FUSE=1
+     \\  glm-exl3-fuse             TF_GLM_PF_DOWN_FUSE=1: the fused down + fold byte-equal to down + put_slot + combine
+     \\  glm-exl3-layer <ckpt> <layer> <rank> <world>  one checkpoint layer's EXL3 experts through the GLM loader, against float64
+@@ -400,6 +401,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "affine4-decode")) return affine4_decode_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "w4a8")) return w4a8_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "glm-exl3")) return glm_exl3_tests.run_(gpu);
++    if (std.mem.eql(u8, cmd, "glm-x8-q8")) return @import("glm_x8_q8_tests.zig").run(gpu, try arg(rest, 0));
+     if (std.mem.eql(u8, cmd, "glm-exl3-fuse-e4m3")) return @import("glm_exl3_fuse_tests.zig").runE4m3(gpu);
+     if (std.mem.eql(u8, cmd, "glm-exl3-fuse")) return @import("glm_exl3_fuse_tests.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "glm-exl3-layer")) return glm_exl3_layer_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
+-- 
+2.43.0
+

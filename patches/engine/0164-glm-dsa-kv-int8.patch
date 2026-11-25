@@ -1,0 +1,400 @@
+From ca59438b85cad6840db275a093f39cc410eb9e0c Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 04:21:07 +0200
+Subject: [PATCH] glm: TF_GLM_KV8_INT8=1, int8 codes with two scales a row in
+ the 8-bit dsa cache
+
+With --kv-cache fp8 on glm_moe_dsa, TF_GLM_KV8_INT8=1 stores each 576-wide row as int8 codes (the same cache
+layout) with two power-of-two scales, 2^ceil(log2(amax / 127)), one for the 512 latent values and one for the 64
+rope values (k_pe is not normalized and would set the latent's step): 584 B a token and layer. Codes times scale
+stay exact in bf16, so every reader is the bf16 kernel on the dequantized rows (GPU check: bitwise equal, chunks,
+decode split, fused, msa sparse and dense). Row RMS error 0.96% on the check's rows against E4M3's 2.67% (the
+E4M3 format of patch 0162 failed the 8K agent panel's +0.005 KL gate: +0.037).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/glm_glue_attn.cuh      | 48 +++++++++++++++++---
+ zig/kernels/cuda/glm_glue_latent.cuh    | 34 ++++++++++++++
+ zig/kernels/cuda/glm_glue_msa.cuh       | 59 ++++++++++++++++++++-----
+ zig/src/families/glm/cuda_dsa_block.zig |  4 +-
+ zig/src/families/glm/cuda_glue.zig      |  9 ++++
+ zig/src/families/glm/cuda_latent.zig    | 20 ++++++---
+ 6 files changed, 150 insertions(+), 24 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index f82c230..2efde52 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -26,6 +26,14 @@ __device__ __forceinline__ float quad_max(float v) {
+   return fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
+ }
+ 
++// Two cache codes (little-endian u16) as floats: E4M3, or (I8, TF_GLM_KV8_INT8) two's-complement int8. Either way the
++// row's power-of-two scale times a code is exact in bf16.
++template <bool I8>
++__device__ __forceinline__ float2 codes2(uint16_t bits) {
++  if constexpr (I8) return make_float2((float)(int8_t)(bits & 0xff), (float)(int8_t)(bits >> 8));
++  else return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
++}
++
+ __device__ __forceinline__ void cp16(void* dst, const void* src, bool ok) {
+   const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src), "r"(ok ? 16 : 0));
+@@ -64,7 +72,7 @@ constexpr int wide_smem() {
+ // PAGED8: an E4M3 cache on KV pages (pt, pstep bytes apart): a dense chunk is one page, a sparse key's logical token goes
+ // through the table to its page; codes and scales then load as on a window, so the arithmetic is the window's.
+ // CHL: the keys a chunk covers (CH; glm_moe_dsa's decode windows split a row's 2,048 picks finer, CH / 4, for blocks)
+-template <int HB, bool FP8 = false, bool PAGED8 = false, int LWV = LW, int CHL = CH>
++template <int HB, bool FP8 = false, bool PAGED8 = false, int LWV = LW, int CHL = CH, bool I8 = false>
+ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
+@@ -128,7 +136,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+       const bool ok = sparse ? ki < n : ki <= limit;
+       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+       raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + src * LWV + u * 8)) : make_uint2(0u, 0u);
+-      rsc[i] = ok ? __ldg(scales8 + src) : 1.0f;
++      // I8: two scales a row, the latent's then the rope plane's (units 64.. of a 576-wide row)
++      rsc[i] = ok ? (I8 ? __ldg(scales8 + src * 2 + (u >= LW / 8 ? 1 : 0)) : __ldg(scales8 + src)) : 1.0f;
+     }
+   };
+   auto store8 = [&](int tile) {
+@@ -140,7 +149,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+ #pragma unroll
+       for (int j = 0; j < 8; j += 2) {
+         const uint16_t bits = (uint16_t)((wv[j / 4] >> (8 * (j % 4))) & 0xffffu);  // codes j, j + 1 (little-endian)
+-        const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
++        const float2 v = codes2<I8>(bits);
+         dst[wof(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, rsc[i]));
+         dst[wof(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, rsc[i]));
+       }
+@@ -299,7 +308,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+ // in turn, each computed as chunks_wide's own block computes it (fresh m, l, o; the same code, copied, so chunks_wide's
+ // kernels keep their bytes), then merged into the row's running result by tf_glm_merge's sequence, chunk by chunk;
+ // out bf16 [rows][heads][LW] as tf_glm_merge writes it, and count-0 rows left alone. No partials.
+-template <int HB, bool FP8 = false, bool PAGED8 = false, int LWV = LW>
++template <int HB, bool FP8 = false, bool PAGED8 = false, int LWV = LW, bool I8 = false>
+ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
+@@ -366,7 +375,8 @@ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, c
+       const bool ok = sparse ? ki < n : ki <= limit;
+       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+       raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + src * LWV + u * 8)) : make_uint2(0u, 0u);
+-      rsc[i] = ok ? __ldg(scales8 + src) : 1.0f;
++      // I8: two scales a row, the latent's then the rope plane's (units 64.. of a 576-wide row)
++      rsc[i] = ok ? (I8 ? __ldg(scales8 + src * 2 + (u >= LW / 8 ? 1 : 0)) : __ldg(scales8 + src)) : 1.0f;
+     }
+   };
+   auto store8 = [&](int tile) {
+@@ -378,7 +388,7 @@ __device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, c
+ #pragma unroll
+       for (int j = 0; j < 8; j += 2) {
+         const uint16_t bits = (uint16_t)((wv[j / 4] >> (8 * (j % 4))) & 0xffffu);  // codes j, j + 1 (little-endian)
+-        const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
++        const float2 v = codes2<I8>(bits);
+         dst[wof(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, rsc[i]));
+         dst[wof(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, rsc[i]));
+       }
+@@ -705,6 +715,32 @@ extern "C" __global__ void __launch_bounds__(256)
+                                                             1, nullptr, 0, scales, out, nch);
+ }
+ 
++// TF_GLM_KV8_INT8=1: the same E4M3-layout cache holding int8 codes (tf_glm_lat_write_i8_w576), read as int8.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_16_w576_i8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
++                             const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
++                             int64_t heads, int64_t w, float scale, int sparse) {
++  glm_attn::chunks_wide<16, true, false, glm_attn::DSA_LW, glm_attn::CH, true>(
++      qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, nullptr,
++      0, scales);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_16_w576_s4_i8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
++                                const int* pos, const int* tok, const int* cnt, float* po, float* pm, float* pl,
++                                int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
++  glm_attn::chunks_wide<16, true, false, glm_attn::DSA_LW, glm_attn::CH / 4, true>(
++      qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse,
++      nullptr, 0, scales);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_16_fused_w576_i8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
++                                   const int* tok, const int* cnt, __nv_bfloat16* out, int64_t rows, int64_t heads,
++                                   int64_t w, float scale, int nch) {
++  glm_attn::chunks_fused<16, true, false, glm_attn::DSA_LW, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc),
++                                                                  nullptr, tok, cnt, nullptr, nullptr, nullptr, rows,
++                                                                  heads, w, scale, 1, nullptr, 0, scales, out, nch);
++}
++
+ // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
+diff --git a/zig/kernels/cuda/glm_glue_latent.cuh b/zig/kernels/cuda/glm_glue_latent.cuh
+index aafa683..f12c9e2 100644
+--- a/zig/kernels/cuda/glm_glue_latent.cuh
++++ b/zig/kernels/cuda/glm_glue_latent.cuh
+@@ -225,3 +225,37 @@ extern "C" __global__ void __launch_bounds__(576)
+   cache[at * W + d] = __nv_cvt_float_to_fp8(__fmul_rn(x, inv), __NV_SATFINITE, __NV_E4M3);
+   if (d == 0) scales[at] = s;
+ }
++
++// TF_GLM_KV8_INT8=1: the same rows as int8 codes, two scales a row ([cap][2] fp32: the 512 latent values', the 64 rope
++// values'; k_pe is not normalized and would otherwise set the latent's step), each 2^ceil(log2(amax / 127)) (biased
++// exponent held to 1..254): codes round(x / scale) within +-127, codes times scale exact in bf16 (7 significant bits).
++extern "C" __global__ void __launch_bounds__(576)
++    tf_glm_lat_write_i8_w576(const __nv_bfloat16* lat, int64_t stride, unsigned char* cache, float* scales,
++                             const int* pos) {
++  constexpr int W = 576;
++  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
++  const int d = threadIdx.x;
++  __shared__ float red[W / 32];
++  const float x = __bfloat162float(lat[r * stride + d]);
++  float amax = fabsf(x);
++#pragma unroll
++  for (int o = 16; o > 0; o /= 2) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
++  if ((d & 31) == 0) red[d >> 5] = amax;
++  __syncthreads();
++  // two scales: the 512 latent values' (warps 0..15) and the 64 rope values' (warps 16, 17)
++  if (d < 512) {
++    amax = red[0];
++#pragma unroll
++    for (int i = 1; i < 16; ++i) amax = fmaxf(amax, red[i]);
++  } else {
++    amax = fmaxf(red[16], red[17]);
++  }
++  const int bits = __float_as_int(__fdiv_rn(amax, 127.0f));
++  int e = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0 ? 1 : 0);
++  e = min(max(e, 1), 254);
++  const float s = __int_as_float(e << 23), inv = __int_as_float((254 - e) << 23);
++  const int q = max(-127, min(127, __float2int_rn(__fmul_rn(x, inv))));
++  cache[at * W + d] = (unsigned char)(int8_t)q;
++  if (d == 0) scales[2 * at] = s;
++  if (d == 512) scales[2 * at + 1] = s;
++}
+diff --git a/zig/kernels/cuda/glm_glue_msa.cuh b/zig/kernels/cuda/glm_glue_msa.cuh
+index 081591b..a889ac3 100644
+--- a/zig/kernels/cuda/glm_glue_msa.cuh
++++ b/zig/kernels/cuda/glm_glue_msa.cuh
+@@ -101,20 +101,36 @@ struct Raw8 {
+     uint2 r;
+     float s;
+ };
++template <bool I8>
+ __device__ __forceinline__ uint32_t deq2(uint32_t two, float s) {
+-    const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(two & 0xffffu), __NV_E4M3)));
++    const uint16_t b = (uint16_t)(two & 0xffffu);
++    float2 v;
++    if constexpr (I8) v = make_float2((float)(int8_t)(b & 0xff), (float)(int8_t)(b >> 8));
++    else v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)b, __NV_E4M3)));
+     return pack_bf16(__fmul_rn(v.x, s), __fmul_rn(v.y, s));
+ }
++template <bool I8>
+ __device__ __forceinline__ uint4 deq8(uint32_t lo, uint32_t hi, float s) {
+-    return make_uint4(deq2(lo, s), deq2(lo >> 16, s), deq2(hi, s), deq2(hi >> 16, s));
++    return make_uint4(deq2<I8>(lo, s), deq2<I8>(lo >> 16, s), deq2<I8>(hi, s), deq2<I8>(hi >> 16, s));
+ }
+-__device__ __forceinline__ void put(const Raw8& x, __nv_bfloat16* __restrict__ krow, int h) {
++// Raw8I: Raw8's bytes holding int8 codes (TF_GLM_KV8_INT8)
++struct Raw8I : Raw8 {
++    float s2;  // the rope plane's own scale
++};
++template <bool I8, class R>
++__device__ __forceinline__ void put8(const R& x, __nv_bfloat16* __restrict__ krow, int h) {
+ #pragma unroll
+     for (int i = 0; i < 4; ++i) {
+-        *reinterpret_cast<uint4*>(krow + 64 * h + 16 * i) = deq8(x.c[i].x, x.c[i].y, x.s);
+-        *reinterpret_cast<uint4*>(krow + 64 * h + 16 * i + 8) = deq8(x.c[i].z, x.c[i].w, x.s);
++        *reinterpret_cast<uint4*>(krow + 64 * h + 16 * i) = deq8<I8>(x.c[i].x, x.c[i].y, x.s);
++        *reinterpret_cast<uint4*>(krow + 64 * h + 16 * i + 8) = deq8<I8>(x.c[i].z, x.c[i].w, x.s);
+     }
+-    *reinterpret_cast<uint4*>(krow + WC + 8 * h) = deq8(x.r.x, x.r.y, x.s);
++    float sr = x.s;
++    if constexpr (I8) sr = x.s2;
++    *reinterpret_cast<uint4*>(krow + WC + 8 * h) = deq8<I8>(x.r.x, x.r.y, sr);
++}
++__device__ __forceinline__ void put(const Raw8I& x, __nv_bfloat16* __restrict__ krow, int h) { put8<true>(x, krow, h); }
++__device__ __forceinline__ void put(const Raw8& x, __nv_bfloat16* __restrict__ krow, int h) {
++    put8<false>(x, krow, h);
+ }
+ 
+ // the two caches as the kernel reads them: bf16 rows, or E4M3 codes and their scales
+@@ -123,16 +139,18 @@ struct Cache16 {
+     using R = Raw;
+     __device__ __forceinline__ void load(Raw& x, int tok, int w, int h) const { load_raw(x, p, tok, w, h); }
+ };
+-struct Cache8 {
++template <class RawT>
++struct Cache8T {
+     const unsigned char* __restrict__ p;
+     const float* __restrict__ sc;
+-    using R = Raw8;
+-    __device__ __forceinline__ void load(Raw8& x, int tok, int w, int h) const {
++    using R = RawT;
++    __device__ __forceinline__ void load(RawT& x, int tok, int w, int h) const {
+         if (tok < 0) {
+ #pragma unroll
+             for (int i = 0; i < 4; ++i) x.c[i] = make_uint4(0u, 0u, 0u, 0u);
+             x.r = make_uint2(0u, 0u);
+             x.s = 1.f;
++            if constexpr (sizeof(RawT) > sizeof(Raw8)) reinterpret_cast<Raw8I&>(x).s2 = 1.f;
+             return;
+         }
+         const unsigned char* row = p + (long long)tok * ROW;
+@@ -140,9 +158,16 @@ struct Cache8 {
+ #pragma unroll
+         for (int i = 0; i < 4; ++i) x.c[i] = __ldg(src + i);
+         x.r = __ldg(reinterpret_cast<const uint2*>(row + LW + WR * w + 8 * h));
+-        x.s = __ldg(sc + tok);
++        if constexpr (sizeof(RawT) > sizeof(Raw8)) {  // Raw8I: [latent scale, rope scale] a row
++            x.s = __ldg(sc + 2 * (long long)tok);
++            reinterpret_cast<Raw8I&>(x).s2 = __ldg(sc + 2 * (long long)tok + 1);
++        } else {
++            x.s = __ldg(sc + tok);
++        }
+     }
+ };
++using Cache8 = Cache8T<Raw8>;
++using Cache8I = Cache8T<Raw8I>;
+ 
+ // one tile of KT keys at t0: store the lane's raw values (then load the next tile's into them), the warp's partial
+ // scores, their sum over the warps in warp order, the online softmax and the warp's columns of O += P V
+@@ -338,6 +363,20 @@ extern "C" __global__ void __launch_bounds__(glm_msa::NT, 2)
+     glm_msa::run<true>(qa, glm_msa::Cache8{codes, scales}, nullptr, pos, out, H, 0, scale);
+ }
+ 
++// TF_GLM_KV8_INT8=1: the same over int8 codes
++extern "C" __global__ void __launch_bounds__(glm_msa::NT, 2)
++    tf_glm_msa_w576_i8(const __nv_bfloat16* __restrict__ qa, const unsigned char* __restrict__ codes,
++                       const float* __restrict__ scales, const int* __restrict__ tokens,
++                       const int* __restrict__ counts, __nv_bfloat16* __restrict__ out, int H, int W, float scale) {
++    glm_msa::run<false>(qa, glm_msa::Cache8I{codes, scales}, tokens, counts, out, H, W, scale);
++}
++extern "C" __global__ void __launch_bounds__(glm_msa::NT, 2)
++    tf_glm_msa_w576_dense_i8(const __nv_bfloat16* __restrict__ qa, const unsigned char* __restrict__ codes,
++                             const float* __restrict__ scales, const int* __restrict__ pos,
++                             __nv_bfloat16* __restrict__ out, int H, float scale) {
++    glm_msa::run<true>(qa, glm_msa::Cache8I{codes, scales}, nullptr, pos, out, H, 0, scale);
++}
++
+ // glm_moe_dsa's split [q_a | kv_a] in a decode window: every rank's columns gathered as [world][rows][cw] slots, rank
+ // q's slot holding [rows][n_q] (n_q = min(cw, total - q cw): its columns q cw ..), back into dst [rows][total] (rows
+ // dst_stride apart). Block a row, 256 threads, 16-byte pieces where they fall (column runs of 8).
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index 2d96329..195c861 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -281,7 +281,7 @@ fn msaSparse(set: glue.Set, stream: cuda.Stream, l: Layer, c: Caches, v: Scratch
+     a.add(c.lc);
+     if (c.ls != 0) a.add(c.ls); // KV=fp8: tf_glm_msa_w576_fp8 takes the codes' row scales after them
+     inline for (.{ v.tokens, v.counts, v.ol, @as(c_int, @intCast(l.heads)), @as(c_int, sparse.dsa_width), scale }) |x| a.add(x);
+-    try cuda.launch.launch(if (c.ls != 0) set.glue.msa_w576_fp8 else set.glue.msa_w576, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 }, .shared = msa_smem }, stream, &a);
++    try cuda.launch.launch(if (c.ls != 0) (if (latent.int8()) set.glue.msa_w576_i8 else set.glue.msa_w576_fp8) else set.glue.msa_w576, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 }, .shared = msa_smem }, stream, &a);
+ }
+ 
+ /// The first `n` prompt rows' dense attention: row r at position pos + r over keys 0 .. pos + r.
+@@ -292,7 +292,7 @@ fn msaDense(set: glue.Set, stream: cuda.Stream, l: Layer, c: Caches, v: Scratch,
+     a.add(c.lc);
+     if (c.ls != 0) a.add(c.ls);
+     inline for (.{ pos, v.ol, @as(c_int, @intCast(l.heads)), scale }) |x| a.add(x);
+-    try cuda.launch.launch(if (c.ls != 0) set.glue.msa_w576_dense_fp8 else set.glue.msa_w576_dense, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 128 }, .shared = msa_smem }, stream, &a);
++    try cuda.launch.launch(if (c.ls != 0) (if (latent.int8()) set.glue.msa_w576_dense_i8 else set.glue.msa_w576_dense_fp8) else set.glue.msa_w576_dense, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 128 }, .shared = msa_smem }, stream, &a);
+ }
+ 
+ fn attnScale(l: Layer) f32 {
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 2545688..91d4ec6 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -111,11 +111,17 @@ pub const Kernels = struct {
+     chunks_16_w576_fp8: cuda.Function, // and the chunk kernels over them (dense / sparse, the 128-key split, fused)
+     chunks_16_w576_s4_fp8: cuda.Function,
+     chunks_16_fused_w576_fp8: cuda.Function,
++    lat_write_i8_w576: cuda.Function, // TF_GLM_KV8_INT8=1: the same cache layout holding int8 codes, two scales a row
++    chunks_16_w576_i8: cuda.Function,
++    chunks_16_w576_s4_i8: cuda.Function,
++    chunks_16_fused_w576_i8: cuda.Function,
+     unblock: cuda.Function, // a split [q_a | kv_a]'s gathered column slots back into rows (glm_glue_msa.cuh)
+     msa_w576: cuda.Function, // glm_glue_msa.cuh: a prompt row a block over its token list, the rank's heads one m16 tile
+     msa_w576_dense: cuda.Function, // and a dense prompt row over keys 0 .. its position (the implicit list)
+     msa_w576_fp8: cuda.Function, // KV=fp8: the same two over E4M3 codes and their row scales
+     msa_w576_dense_fp8: cuda.Function,
++    msa_w576_i8: cuda.Function,
++    msa_w576_dense_i8: cuda.Function,
+ 
+     pub fn load(m: cuda.Module) !Kernels {
+         var k: Kernels = undefined;
+@@ -141,6 +147,9 @@ pub const Kernels = struct {
+         try k.chunks_16_w576_fp8.allowDynamicShared(chunksSmemW(16, dsa_row));
+         try k.chunks_16_w576_s4_fp8.allowDynamicShared(chunksSmemW(16, dsa_row));
+         try k.chunks_16_fused_w576_fp8.allowDynamicShared(chunksSmemW(16, dsa_row));
++        try k.chunks_16_w576_i8.allowDynamicShared(chunksSmemW(16, dsa_row));
++        try k.chunks_16_w576_s4_i8.allowDynamicShared(chunksSmemW(16, dsa_row));
++        try k.chunks_16_fused_w576_i8.allowDynamicShared(chunksSmemW(16, dsa_row));
+         try k.latent_mma_kn.allowDynamicShared(latent_mma_smem[0]);
+         try k.latent_mma_nk.allowDynamicShared(latent_mma_smem[1]);
+         return k;
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index e3564f4..70cd797 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -80,10 +80,18 @@ pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, r
+     try rowBlocks(set.glue.expand_v, stream, ol, wv, out, rows, heads, dv / 16);
+ }
+ 
+-/// A latent cache holds BF16 rows, or E4M3 rows followed by one FP32 scale per row (512 wide, or the dsa's 576).
++/// TF_GLM_KV8_INT8=1 (with --kv-cache fp8, glm_moe_dsa): the 8-bit dsa rows hold int8 codes with two power-of-two
++/// scales a row (the 512 latent values', the 64 rope values') instead of E4M3 with one.
++pub fn int8() bool {
++    const v = std.c.getenv("TF_GLM_KV8_INT8") orelse return false;
++    return !std.mem.eql(u8, std.mem.span(v), "0");
++}
++
++/// A latent cache holds BF16 rows, or E4M3 rows followed by one FP32 scale per row (512 wide, or the dsa's 576; int8
++/// dsa rows two scales).
+ pub fn cacheBytes(capacity: usize, lw: usize, kv8: bool) !usize {
+     if (kv8 and lw != 512 and lw != glue.dsa_row) return error.LatentShape;
+-    const row = if (kv8) try std.math.add(usize, lw, 4) else try std.math.mul(usize, lw, 2);
++    const row = if (kv8) try std.math.add(usize, lw, if (lw == glue.dsa_row and int8()) 8 else 4) else try std.math.mul(usize, lw, 2);
+     return std.math.mul(usize, capacity, row);
+ }
+ 
+@@ -100,7 +108,7 @@ pub fn latentWriteFormat(set: glue.Set, stream: cuda.Stream, lat: u64, lat_strid
+         if (t.pt != 0) return error.LatentShape;
+         var b: cuda.Args = .{};
+         inline for (.{ lat, @as(i64, @intCast(lat_stride)), cache, scales, pos }) |v| b.add(v);
+-        return cuda.launch.launch(set.glue.lat_write_fp8_w576, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = glue.dsa_row } }, stream, &b);
++        return cuda.launch.launch(if (int8()) set.glue.lat_write_i8_w576 else set.glue.lat_write_fp8_w576, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = glue.dsa_row } }, stream, &b);
+     }
+     if (lw != 512) return error.LatentShape;
+     var a: cuda.Args = .{};
+@@ -145,7 +153,7 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64,
+     // a paged sparse list's units are the kernel's: positions for E4M3 (Table.logical), the BF16 rows otherwise
+     if (sparse and t.pt != 0 and t.logical != paged8) return error.TokenUnits;
+     const f = switch (hb) {
+-        heads_tile => if (lw == glue.dsa_row) (if (kv8) set.glue.chunks_16_w576_fp8 else set.glue.chunks_16_w576) else if (!kv8) set.glue.chunks_16 else if (paged8) set.glue.chunks_16_fp8_paged else set.glue.chunks_16_fp8,
++        heads_tile => if (lw == glue.dsa_row) (if (kv8) (if (int8()) set.glue.chunks_16_w576_i8 else set.glue.chunks_16_w576_fp8) else set.glue.chunks_16_w576) else if (!kv8) set.glue.chunks_16 else if (paged8) set.glue.chunks_16_fp8_paged else set.glue.chunks_16_fp8,
+         heads_tile_wide => if (!kv8) set.glue.chunks_32 else if (paged8) set.glue.chunks_32_fp8_paged else set.glue.chunks_32_fp8,
+         else => return error.HeadBlock,
+     };
+@@ -191,7 +199,7 @@ pub fn sparseDsaSplit(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, s
+         a.add(t.pt);
+         a.add(@as(i64, @intCast(t.ps)));
+     }
+-    try cuda.launch.launch(if (scales != 0) set.glue.chunks_16_w576_s4_fp8 else set.glue.chunks_16_w576_s4, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, heads_tile), .z = @intCast(nch) }, .block = .{ .x = chunk_threads }, .shared = glue.chunksSmemW(heads_tile, glue.dsa_row) }, stream, &a);
++    try cuda.launch.launch(if (scales != 0) (if (int8()) set.glue.chunks_16_w576_s4_i8 else set.glue.chunks_16_w576_s4_fp8) else set.glue.chunks_16_w576_s4, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, heads_tile), .z = @intCast(nch) }, .block = .{ .x = chunk_threads }, .shared = glue.chunksSmemW(heads_tile, glue.dsa_row) }, stream, &a);
+     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
+     return true;
+ }
+@@ -210,7 +218,7 @@ fn fused(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t
+     const paged8 = kv8 and t.pt != 0;
+     if (t.pt != 0 and t.logical != paged8) return error.TokenUnits;
+     const f = switch (hb) {
+-        heads_tile => if (lw == glue.dsa_row) (if (kv8) set.glue.chunks_16_fused_w576_fp8 else set.glue.chunks_16_fused_w576) else if (!kv8) set.glue.chunks_16_fused else if (paged8) set.glue.chunks_16_fp8_paged_fused else set.glue.chunks_16_fp8_fused,
++        heads_tile => if (lw == glue.dsa_row) (if (kv8) (if (int8()) set.glue.chunks_16_fused_w576_i8 else set.glue.chunks_16_fused_w576_fp8) else set.glue.chunks_16_fused_w576) else if (!kv8) set.glue.chunks_16_fused else if (paged8) set.glue.chunks_16_fp8_paged_fused else set.glue.chunks_16_fp8_fused,
+         heads_tile_wide => if (!kv8) set.glue.chunks_32_fused else if (paged8) set.glue.chunks_32_fp8_paged_fused else set.glue.chunks_32_fp8_fused,
+         else => return error.HeadBlock,
+     };
+-- 
+2.43.0
+

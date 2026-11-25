@@ -1,0 +1,40 @@
+From d646949650bc7dfbd8141cc607940e06b521da26 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 05:28:18 +0200
+Subject: [PATCH] glm: DSpark's Markov tables sized from the checkpoint
+ (154,880 rows, not the padded head slices); padded ids never drafted
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/dspark.zig | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/dspark.zig b/zig/src/families/glm/dspark.zig
+index b9227b2..631bf93 100644
+--- a/zig/src/families/glm/dspark.zig
++++ b/zig/src/families/glm/dspark.zig
+@@ -205,7 +205,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     }
+     const sp = try gpa.create(Spark);
+     errdefer gpa.destroy(sp);
+-    sp.* = .{ .module = module, .k = try Kernels.load(module), .weights = wbuf, .vocab = head.n * world };
++    // the Markov tables' rows are the drafter's vocabulary (154,880), not the draft head's padded slices x world
++    const w1e = ents.get("markov_head.markov_w1.weight") orelse return error.DrafterTensorMissing;
++    sp.* = .{ .module = module, .k = try Kernels.load(module), .weights = wbuf, .vocab = w1e.n / (RANK * 2) };
+     defer @import("cuda_load_owner.zig").drain(e.stream, d);
+     var nb: [4][96]u8 = undefined;
+     for (&sp.layers, 0..) |*lw, i| {
+@@ -464,7 +466,8 @@ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
+         for (0..dr.world) |rk| {
+             const blk = dr.cand[rk * M * df.CW + r * df.CW ..][0..df.CW];
+             for (0..df.TOPK) |j| {
+-                if (blk[j] < 0 or n == c.len) continue;
++                // a padded head row (ids past the vocabulary) is never a draft
++                if (blk[j] < 0 or @as(usize, @intCast(blk[j])) >= sp.vocab or n == c.len) continue;
+                 c[n] = .{ .v = @bitCast(blk[df.TOPK + j]), .id = @intCast(blk[j]) };
+                 n += 1;
+             }
+-- 
+2.43.0
+

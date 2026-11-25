@@ -1,0 +1,55 @@
+From 641b67f02587830928bca73f825caf88992a3ed1 Mon Sep 17 00:00:00 2001
+From: Mia <mia@localhost>
+Date: Fri, 13 Nov 2026 02:19:36 +0200
+Subject: [PATCH] 0304: glm_moe_dsa's rmsnorm widths 6144 (hidden) and 2048
+ (q_lora)
+
+GLM-5.3's hidden is 6144 and its q_a_layernorm width is 2048: glue.rmsnorm's
+{4096,1536,512} table refused the family's first forward (NoRmsnormWidth).
+RMSNORM(6144, 8192, 8, 8) and RMSNORM(2048, 2048, 4, 8) instantiate the same
+template (D % S == 0, D a multiple of 64 for the 64-sums); Kernels.load binds
+the two new tf_glm_rmsnorm_* symbols by field name.
+---
+ zig/kernels/cuda/glm_glue_norm.cuh | 3 +++
+ zig/src/families/glm/cuda_glue.zig | 4 ++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/zig/kernels/cuda/glm_glue_norm.cuh b/zig/kernels/cuda/glm_glue_norm.cuh
+index 92db977..5efa982 100644
+--- a/zig/kernels/cuda/glm_glue_norm.cuh
++++ b/zig/kernels/cuda/glm_glue_norm.cuh
+@@ -145,6 +145,9 @@ __device__ void rmsnorm(const __nv_bfloat16* x, int64_t x_stride, const W* w, __
+ RMSNORM(4096, 4096, 8, 8)
+ RMSNORM(1536, 2048, 4, 8)
+ RMSNORM(512, 512, 4, 4)
++// glm_moe_dsa's: hidden 6144 (8 warps over an 8192 block, D % S == 0) and q_lora 2048 (4 warps as 1536's block).
++RMSNORM(6144, 8192, 8, 8)
++RMSNORM(2048, 2048, 4, 8)
+ 
+ // FP4-Local's float32 hidden norm weight: rmsnorm_4096's arithmetic, the weight read as float32.
+ extern "C" __global__ void __launch_bounds__(256)
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 28b811d..2722427 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -23,6 +23,8 @@ pub const Kernels = struct {
+     rmsnorm_4096: cuda.Function,
+     rmsnorm_1536: cuda.Function,
+     rmsnorm_512: cuda.Function,
++    rmsnorm_6144: cuda.Function,
++    rmsnorm_2048: cuda.Function,
+     rmsnorm_4096_f32w: cuda.Function,
+     residual_add: cuda.Function,
+     stream_mean: cuda.Function,
+@@ -161,6 +163,8 @@ pub fn rmsnorm(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, o
+         4096 => .{ set.glue.rmsnorm_4096, 8 },
+         1536 => .{ set.glue.rmsnorm_1536, 4 },
+         512 => .{ set.glue.rmsnorm_512, 4 },
++        6144 => .{ set.glue.rmsnorm_6144, 8 },
++        2048 => .{ set.glue.rmsnorm_2048, 4 },
+         else => return error.NoRmsnormWidth,
+     };
+     var a: cuda.Args = .{};
+-- 
+2.43.0
+

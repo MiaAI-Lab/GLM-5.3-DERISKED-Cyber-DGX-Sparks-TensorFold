@@ -1,0 +1,390 @@
+From 292bee6f15b94a4b179c105050d5fdaed58d5e76 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 02:18:49 +0200
+Subject: [PATCH] glm_moe_dsa: prompt attention through msa2 on BF16 576-wide
+ rows
+
+Mia's AI Lab's msa2 kernel (their GLM-5.3 recipe, patches 0150 / 0158 /
+0162; Apache-2.0) ported from its FP8 / FP4 latent caches with a separate
+rope cache to this engine's interleaved BF16 rows: one block a prompt
+row, the rank's heads one m16 tile, each warp loading its own 128 latent
+and 16 rope columns of a 16-key tile one tile ahead, warp-order score
+sums, online softmax, P V straight to the output (no partials, no
+merge). The dense rows below the DSA's dense limit take the implicit
+list 0 .. p. Prompt passes of 64 rows or more at <= 16 heads a rank;
+TF_GLM_MSA=0 keeps the chunk kernels. 206 registers, two blocks an SM,
+27.6 KB of shared memory.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/glm_glue.cu            |   1 +
+ zig/kernels/cuda/glm_glue_msa.cuh       | 272 ++++++++++++++++++++++++
+ zig/src/families/glm/cuda_dsa_block.zig |  30 ++-
+ zig/src/families/glm/cuda_glue.zig      |   2 +
+ 4 files changed, 304 insertions(+), 1 deletion(-)
+ create mode 100644 zig/kernels/cuda/glm_glue_msa.cuh
+
+diff --git a/zig/kernels/cuda/glm_glue.cu b/zig/kernels/cuda/glm_glue.cu
+index c4e2bb4..21ab6d8 100644
+--- a/zig/kernels/cuda/glm_glue.cu
++++ b/zig/kernels/cuda/glm_glue.cu
+@@ -8,6 +8,7 @@
+ #include "glm_glue_index.cuh"
+ #include "glm_glue_bmm.cuh"
+ #include "glm_glue_attn.cuh"
++#include "glm_glue_msa.cuh"
+ #include "glm_glue_p2p.cuh"
+ #include "glm_glue_num.cuh"
+ #include "glm_index_decode.cuh"
+diff --git a/zig/kernels/cuda/glm_glue_msa.cuh b/zig/kernels/cuda/glm_glue_msa.cuh
+new file mode 100644
+index 0000000..108ce89
+--- /dev/null
++++ b/zig/kernels/cuda/glm_glue_msa.cuh
+@@ -0,0 +1,272 @@
++// glm_moe_dsa's prompt attention over its BF16 576-wide latent rows (512 latent + 64 rope): Mia's sparse attention
++// kernel 2 (msa2, the lab's GLM-5.3 recipe patches 0150 / 0158 / 0162, by Mia's AI Lab, Apache-2.0) ported from its
++// FP8 / FP4 latent caches with a separate rope cache to this engine's interleaved BF16 rows.
++//
++// One block a prompt row (4 warps). The rank's heads (at most 16) are the mma's M: one m16 tile. Warp w owns latent
++// columns 128 w .. 128 w + 127 and rope columns 512 + 16 w .. + 15 of every key, for both products:
++//   - it loads (one tile ahead, in registers) only those columns of a tile's 16 keys, straight BF16 (no dequant), into
++//     its own region of shared memory, so no other warp reads them: no barrier for the key tile;
++//   - QK: its 9 k steps (8 latent, 1 rope) of the scores, the query fragments in registers for the whole row; the four
++//     warps' partial scores add up through shared memory in warp order (one barrier a tile);
++//   - every warp runs the same online softmax on the summed scores and its 128 output columns of O += P V.
++// Keys run in tiles of 16 in list order; a row's bits depend on its query, its token list and the cache only. A row
++// with count 0 is left alone (it keeps the dense pass's result). DENSE (0158): a causal row at position p attends the
++// implicit list 0 .. p (`counts` holds the first row's device position), the longest rows first.
++#pragma once
++
++#include <cuda_bf16.h>
++
++namespace glm_msa {
++
++constexpr int LW = 512;                       // latent values a key (the output's columns)
++constexpr int RD = 64;                        // rope values a key
++constexpr int ROW = LW + RD;                  // a cache row and a query row (576)
++constexpr int NW = 4;                         // warps
++constexpr int NT = NW * 32;
++constexpr int KT = 16;                        // keys a tile
++constexpr int WC = LW / NW;                   // latent columns a warp (128)
++constexpr int WR = RD / NW;                   // rope columns a warp (16)
++constexpr int KROW = WC + WR + 8;             // a key's row in a warp's region (halves; 304 B: ldmatrix conflict-free)
++constexpr int SPL = KT / 8 * 4;               // partial scores a lane (8)
++constexpr size_t SM_K = 0;                                            // [NW][KT][KROW] bf16 key regions
++constexpr size_t SM_S = SM_K + (size_t)NW * KT * KROW * 2;            // [2][NW][2][32] float4 partial scores
++constexpr size_t SMEM = SM_S + (size_t)2 * NW * 32 * SPL * 4;          // 27,648 bytes
++static_assert(KT == 16, "a lane loads half a key's warp columns");
++
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
++}
++__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const void* p) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
++}
++__device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++__device__ __forceinline__ float ex2(float x) {
++    float y;
++    asm("ex2.approx.ftz.f32 %0, %1;\n" : "=f"(y) : "f"(x));
++    return y;
++}
++__device__ __forceinline__ uint32_t pack_bf16(float a, float b) {
++    const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
++    return *reinterpret_cast<const uint32_t*>(&v);
++}
++template <bool DENSE>
++__device__ __forceinline__ int tok_at(const int* __restrict__ toks, int i) {
++    if constexpr (DENSE) return i;
++    else return __ldg(toks + i);
++}
++
++// a lane's raw bytes of one tile: key (lane >> 1), half h (lane & 1) of its warp's columns: 64 latent, 8 rope values
++struct Raw {
++    uint4 c[8];
++    uint4 r;
++};
++
++__device__ __forceinline__ void load_raw(Raw& x, const __nv_bfloat16* __restrict__ cache, int tok, int w, int h) {
++    if (tok < 0) {
++#pragma unroll
++        for (int i = 0; i < 8; ++i) x.c[i] = make_uint4(0u, 0u, 0u, 0u);
++        x.r = make_uint4(0u, 0u, 0u, 0u);
++        return;
++    }
++    const __nv_bfloat16* row = cache + (long long)tok * ROW;
++    const uint4* src = reinterpret_cast<const uint4*>(row + WC * w + 64 * h);
++#pragma unroll
++    for (int i = 0; i < 8; ++i) x.c[i] = __ldg(src + i);
++    x.r = __ldg(reinterpret_cast<const uint4*>(row + LW + WR * w + 8 * h));
++}
++
++// the lane's raw values into its key's row of the warp region
++__device__ __forceinline__ void put(const Raw& x, __nv_bfloat16* __restrict__ krow, int h) {
++#pragma unroll
++    for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(krow + 64 * h + 8 * i) = x.c[i];
++    *reinterpret_cast<uint4*>(krow + WC + 8 * h) = x.r;
++}
++
++// one tile of KT keys at t0: store the lane's raw values (then load the next tile's into them), the warp's partial
++// scores, their sum over the warps in warp order, the online softmax and the warp's columns of O += P V
++template <bool DENSE>
++__device__ __forceinline__ void tile(Raw& raw, int t0, int n, const int* __restrict__ toks,
++                                     const __nv_bfloat16* __restrict__ cache, __nv_bfloat16* Kw, float* Sp,
++                                     const uint32_t (&qf)[9][4], const __nv_bfloat16* bq, const __nv_bfloat16* bv,
++                                     int& tok_next, int& buf, float (&o)[16][4], float (&m)[2], float (&l)[2],
++                                     float sl2) {
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, t = lane & 3;
++    const int lk = lane >> 1, lh = lane & 1;
++    put(raw, Kw + (size_t)lk * KROW, lh);
++    __syncwarp();
++    if (t0 + KT < n) load_raw(raw, cache, tok_next, warp, lh);
++    tok_next = t0 + 2 * KT + lk < n ? tok_at<DENSE>(toks, t0 + 2 * KT + lk) : -1;
++
++    float acc[2][2][4] = {};
++#pragma unroll
++    for (int i = 0; i < 9; ++i) {
++        uint32_t b[4];
++        ldsm_x4(b, bq + 16 * i);
++        mma_bf16(acc[0][i & 1], qf[i], b[0], b[1]);
++        mma_bf16(acc[1][i & 1], qf[i], b[2], b[3]);
++    }
++    float4 my[2];
++    my[0] = make_float4(acc[0][0][0] + acc[0][1][0], acc[0][0][1] + acc[0][1][1], acc[0][0][2] + acc[0][1][2],
++                        acc[0][0][3] + acc[0][1][3]);
++    my[1] = make_float4(acc[1][0][0] + acc[1][1][0], acc[1][0][1] + acc[1][1][1], acc[1][0][2] + acc[1][1][2],
++                        acc[1][0][3] + acc[1][1][3]);
++    float* mine = Sp + ((size_t)(buf * NW + warp) * 64 + lane) * 4;
++    *reinterpret_cast<float4*>(mine) = my[0];
++    *reinterpret_cast<float4*>(mine + 32 * 4) = my[1];
++    __syncthreads();
++    float s[2][4];
++    {
++        const float* base = Sp + ((size_t)(buf * NW) * 64 + lane) * 4;
++        constexpr int H4 = 32 * 4;
++        float4 a0 = warp == 0 ? my[0] : *reinterpret_cast<const float4*>(base);
++        float4 a1 = warp == 0 ? my[1] : *reinterpret_cast<const float4*>(base + H4);
++#pragma unroll
++        for (int v = 1; v < NW; ++v) {
++            const float4 b0 = warp == v ? my[0] : *reinterpret_cast<const float4*>(base + (size_t)v * 32 * SPL);
++            const float4 b1 = warp == v ? my[1] : *reinterpret_cast<const float4*>(base + (size_t)v * 32 * SPL + H4);
++            a0.x += b0.x; a0.y += b0.y; a0.z += b0.z; a0.w += b0.w;
++            a1.x += b1.x; a1.y += b1.y; a1.z += b1.z; a1.w += b1.w;
++        }
++        s[0][0] = a0.x; s[0][1] = a0.y; s[0][2] = a0.z; s[0][3] = a0.w;
++        s[1][0] = a1.x; s[1][1] = a1.y; s[1][2] = a1.z; s[1][3] = a1.w;
++    }
++    buf ^= 1;
++    float mx0 = -INFINITY, mx1 = -INFINITY;
++#pragma unroll
++    for (int j = 0; j < 2; ++j)
++#pragma unroll
++        for (int q = 0; q < 4; ++q) {
++            const bool ok = t0 + 8 * j + 2 * t + (q & 1) < n;
++            s[j][q] = ok ? s[j][q] * sl2 : -INFINITY;
++            if (q < 2) mx0 = fmaxf(mx0, s[j][q]);
++            else mx1 = fmaxf(mx1, s[j][q]);
++        }
++    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
++    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
++    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
++    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
++    const float n0 = fmaxf(m[0], mx0), n1 = fmaxf(m[1], mx1);
++    const float al0 = ex2(m[0] - n0), al1 = ex2(m[1] - n1);
++    m[0] = n0;
++    m[1] = n1;
++    float p[2][4];
++#pragma unroll
++    for (int j = 0; j < 2; ++j) {
++        p[j][0] = ex2(s[j][0] - n0);
++        p[j][1] = ex2(s[j][1] - n0);
++        p[j][2] = ex2(s[j][2] - n1);
++        p[j][3] = ex2(s[j][3] - n1);
++    }
++    float ps0 = ((p[0][0] + p[0][1]) + p[1][0]) + p[1][1];
++    float ps1 = ((p[0][2] + p[0][3]) + p[1][2]) + p[1][3];
++    ps0 += __shfl_xor_sync(0xffffffffu, ps0, 1);
++    ps1 += __shfl_xor_sync(0xffffffffu, ps1, 1);
++    ps0 += __shfl_xor_sync(0xffffffffu, ps0, 2);
++    ps1 += __shfl_xor_sync(0xffffffffu, ps1, 2);
++    l[0] = l[0] * al0 + ps0;
++    l[1] = l[1] * al1 + ps1;
++    uint32_t pa[4] = {pack_bf16(p[0][0], p[0][1]), pack_bf16(p[0][2], p[0][3]), pack_bf16(p[1][0], p[1][1]),
++                      pack_bf16(p[1][2], p[1][3])};
++    if (__any_sync(0xffffffffu, al0 != 1.f || al1 != 1.f)) {
++#pragma unroll
++        for (int b = 0; b < 16; ++b) {
++            o[b][0] *= al0;
++            o[b][1] *= al0;
++            o[b][2] *= al1;
++            o[b][3] *= al1;
++        }
++    }
++#pragma unroll
++    for (int b = 0; b < 8; ++b) {
++        uint32_t v[4];
++        ldsm_x4_t(v, bv + 16 * b);
++        mma_bf16(o[2 * b], pa, v[0], v[1]);
++        mma_bf16(o[2 * b + 1], pa, v[2], v[3]);
++    }
++}
++
++template <bool DENSE>
++__device__ __forceinline__ void run(const __nv_bfloat16* __restrict__ qa, const __nv_bfloat16* __restrict__ cache,
++                                    const int* __restrict__ tokens, const int* __restrict__ counts,
++                                    __nv_bfloat16* __restrict__ out, int H, int W, float scale) {
++    extern __shared__ __align__(16) unsigned char smem[];
++    const int r = DENSE ? (int)(gridDim.x - 1 - blockIdx.x) : (int)blockIdx.x;
++    const int n = DENSE ? __ldg(counts) + r + 1 : counts[r];
++    if (n <= 0) return;  // the dense pass's result stays
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    const int lk = lane >> 1, lh = lane & 1;
++    __nv_bfloat16* Kw = reinterpret_cast<__nv_bfloat16*>(smem + SM_K) + (size_t)warp * KT * KROW;
++    float* Sp = reinterpret_cast<float*>(smem + SM_S);
++    const int* toks = DENSE ? tokens : tokens + (size_t)r * W;
++
++    Raw raw;
++    load_raw(raw, cache, lk < n ? tok_at<DENSE>(toks, lk) : -1, warp, lh);
++    int tok_next = KT + lk < n ? tok_at<DENSE>(toks, KT + lk) : -1;
++
++    // the query fragments (A, m16 x k16, rows = heads; heads >= H zero) of the warp's 9 k steps: latent columns
++    // 128 warp + 16 i (i < 8), rope columns 512 + 16 warp (i = 8); a head's query row is 576 wide
++    uint32_t qf[9][4];
++    {
++        const bool ok0 = g < H, ok1 = g + 8 < H;
++        const uint32_t* q0 = reinterpret_cast<const uint32_t*>(qa + ((size_t)r * H + (ok0 ? g : 0)) * ROW + 2 * t);
++        const uint32_t* q1 = reinterpret_cast<const uint32_t*>(qa + ((size_t)r * H + (ok1 ? g + 8 : 0)) * ROW + 2 * t);
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const int c = (WC * warp + 16 * i) / 2;
++            qf[i][0] = ok0 ? __ldg(q0 + c) : 0u;
++            qf[i][1] = ok1 ? __ldg(q1 + c) : 0u;
++            qf[i][2] = ok0 ? __ldg(q0 + c + 4) : 0u;
++            qf[i][3] = ok1 ? __ldg(q1 + c + 4) : 0u;
++        }
++        const int c = (LW + WR * warp) / 2;
++        qf[8][0] = ok0 ? __ldg(q0 + c) : 0u;
++        qf[8][1] = ok1 ? __ldg(q1 + c) : 0u;
++        qf[8][2] = ok0 ? __ldg(q0 + c + 4) : 0u;
++        qf[8][3] = ok1 ? __ldg(q1 + c + 4) : 0u;
++    }
++    float o[16][4];
++#pragma unroll
++    for (int b = 0; b < 16; ++b)
++#pragma unroll
++        for (int c = 0; c < 4; ++c) o[b][c] = 0.f;
++    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
++    const float sl2 = scale * 1.4426950408889634f;
++    const __nv_bfloat16* bq = Kw + (size_t)((lane & 7) + ((lane >> 4) & 1) * 8) * KROW + ((lane >> 3) & 1) * 8;
++    const __nv_bfloat16* bv = Kw + (size_t)(lane & 15) * KROW + (lane >> 4) * 8;
++    int buf = 0;
++    for (int t0 = 0; t0 < n; t0 += KT) tile<DENSE>(raw, t0, n, toks, cache, Kw, Sp, qf, bq, bv, tok_next, buf, o, m, l, sl2);
++    const int h0 = g, h1 = g + 8;
++#pragma unroll
++    for (int b = 0; b < 16; ++b) {
++        const int col = WC * warp + 8 * b + 2 * t;
++        if (h0 < H) *reinterpret_cast<uint32_t*>(out + ((size_t)r * H + h0) * LW + col) = pack_bf16(o[b][0] / l[0], o[b][1] / l[0]);
++        if (h1 < H) *reinterpret_cast<uint32_t*>(out + ((size_t)r * H + h1) * LW + col) = pack_bf16(o[b][2] / l[1], o[b][3] / l[1]);
++    }
++}
++
++}  // namespace glm_msa
++
++// qa [rows][H][576] (absorbed 512 then roped 64), cache [positions][576] bf16, tokens [rows][W] i32 positions,
++// counts [rows] (0: leave the row), out [rows][H][512] bf16; H <= 16. Grid rows, block 128, glm_msa::SMEM bytes.
++extern "C" __global__ void __launch_bounds__(glm_msa::NT, 2)
++    tf_glm_msa_w576(const __nv_bfloat16* __restrict__ qa, const __nv_bfloat16* __restrict__ cache,
++                    const int* __restrict__ tokens, const int* __restrict__ counts, __nv_bfloat16* __restrict__ out,
++                    int H, int W, float scale) {
++    glm_msa::run<false>(qa, cache, tokens, counts, out, H, W, scale);
++}
++
++// the dense prompt rows: row r at position pos[0] + r over keys 0 .. pos[0] + r (the implicit list), rows longest first
++extern "C" __global__ void __launch_bounds__(glm_msa::NT, 2)
++    tf_glm_msa_w576_dense(const __nv_bfloat16* __restrict__ qa, const __nv_bfloat16* __restrict__ cache,
++                          const int* __restrict__ pos, __nv_bfloat16* __restrict__ out, int H, float scale) {
++    glm_msa::run<true>(qa, cache, nullptr, pos, out, H, 0, scale);
++}
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index 0605c3a..757ae1e 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -182,9 +182,11 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
+     if (l.rope != 0) try qaRope(set, stream, l, s.q, v.qa, pos, rows);
+     const t = table(l, c);
+     const scale = attnScale(l);
++    const msa = msaRows(l, c, rows);
+     if (host_pos < l.dense_limit) {
+         const stamp = prof.span(k.prof, stream, .mla);
+-        try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
++        // msa: only the rows below the dense limit (the rest take their sparse lists next)
++        if (msa) try msaDense(set, stream, l, c, v, pos, @min(rows, l.dense_limit - host_pos), scale) else try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
+         stamp.end();
+     }
+     if (sparseRows(l, host_pos, rows)) {
+@@ -194,6 +196,7 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
+         const stamp = prof.span(k.prof, stream, .mla);
+         defer stamp.end();
+         const w: usize = if (l.rope != 0) sparse.dsa_width else sparse.width;
++        if (msa) return msaSparse(set, stream, l, c, v, rows, scale);
+         if (l.rope != 0) { // the fused w576 merge drops distant picks: 512-row calls always fit the partials
+             var ro: usize = 0;
+             while (ro < rows) : (ro += prompt_att_rows) {
+@@ -246,6 +249,31 @@ fn latTable(l: Layer, c: Caches) latent.Table {
+     return .{ .pt = c.latPt(), .ps = c.latPs(), .page_rows = c.latPs() / (l.lw * 2), .logical = c.ls != 0 };
+ }
+ 
++/// TF_GLM_MSA (default on; 0: the chunk kernels): a glm_moe_dsa prompt pass (64 rows or more, at most 16 heads, BF16
++/// rows in order) attends through glm_glue_msa.cuh, one block a row, straight to the output (no partials, no merge).
++fn msaRows(l: Layer, c: Caches, rows: usize) bool {
++    if (l.rope == 0 or rows < 64 or l.heads > 16 or c.ls != 0 or c.latPt() != 0) return false;
++    const v = std.c.getenv("TF_GLM_MSA") orelse return true;
++    return !std.mem.eql(u8, std.mem.span(v), "0");
++}
++
++const msa_smem: u32 = 27_648; // glm_msa::SMEM: four warps' key regions and two buffers of partial scores
++
++/// The prompt rows' sparse attention: row r over its count of tokens (0: left as the dense pass wrote it).
++fn msaSparse(set: glue.Set, stream: cuda.Stream, l: Layer, c: Caches, v: Scratch, rows: usize, scale: f32) !void {
++    var a: cuda.Args = .{};
++    inline for (.{ v.qa, c.lc, v.tokens, v.counts, v.ol, @as(c_int, @intCast(l.heads)), @as(c_int, sparse.dsa_width), scale }) |x| a.add(x);
++    try cuda.launch.launch(set.glue.msa_w576, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 }, .shared = msa_smem }, stream, &a);
++}
++
++/// The first `n` prompt rows' dense attention: row r at position pos + r over keys 0 .. pos + r.
++fn msaDense(set: glue.Set, stream: cuda.Stream, l: Layer, c: Caches, v: Scratch, pos: u64, n: usize, scale: f32) !void {
++    if (n == 0) return;
++    var a: cuda.Args = .{};
++    inline for (.{ v.qa, c.lc, pos, v.ol, @as(c_int, @intCast(l.heads)), scale }) |x| a.add(x);
++    try cuda.launch.launch(set.glue.msa_w576_dense, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 128 }, .shared = msa_smem }, stream, &a);
++}
++
+ fn attnScale(l: Layer) f32 {
+     return @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
+ }
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 2722427..80a0a59 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -106,6 +106,8 @@ pub const Kernels = struct {
+     dsa_topk: cuda.Function, // and each row's best 2048 of them (select_row's unpooled, i32 form)
+     chunks_16_w576: cuda.Function, // the chunk kernels over the dsa's 576-wide rows (512 latent + the 64 rope);
+     chunks_16_fused_w576: cuda.Function, // 16-head blocks only: the 32-head block's 113 KB passes no GB10
++    msa_w576: cuda.Function, // glm_glue_msa.cuh: a prompt row a block over its token list, the rank's heads one m16 tile
++    msa_w576_dense: cuda.Function, // and a dense prompt row over keys 0 .. its position (the implicit list)
+ 
+     pub fn load(m: cuda.Module) !Kernels {
+         var k: Kernels = undefined;
+-- 
+2.43.0
+

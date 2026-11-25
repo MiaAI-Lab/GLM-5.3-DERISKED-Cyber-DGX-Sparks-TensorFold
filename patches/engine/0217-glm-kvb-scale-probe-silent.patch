@@ -1,0 +1,28 @@
+From eb9a56247748ff9ad8162f5d7a51e1da89b3f2dc Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Mon, 23 Nov 2026 00:03:39 +0200
+Subject: [PATCH] glm: probe kv_b_proj.weight_scale_inv with has, not get
+
+Patch 0161's block-FP8 probe called get, which logs "checkpoint has no
+tensor ..." for every layer whose kv_b has no scales (78 lines a rank on
+the derisked 4bpw checkpoint). has answers the same question silently.
+---
+ zig/src/families/glm/cuda_weights.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 5e26ba9b5..82749777f 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -298,7 +298,7 @@ const Loader = struct {
+         const kv_name = try std.fmt.bufPrint(&kb, "{s}layers.{d}.self_attn.kv_b_proj", .{ L.pfx, i });
+         // an FP8 kv_b with 128x128 weight_scale_inv blocks is block FP8 even on the MTP layer (EXL3-K4-v1 keeps its
+         // FP8 source's layer 78): only an FP8 kv_b without them is MXFP8 (FP4-Local's MTP layer)
+-        const kv_blocked = if (L.get("layers.{d}.self_attn.kv_b_proj.weight_scale_inv", .{i})) |_| true else |_| false;
++        const kv_blocked = try L.has("layers.{d}.self_attn.kv_b_proj.weight_scale_inv", .{i});
+         const kv_mx = mtp and !kv_blocked and (try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i})).dtype == .f8_e4m3;
+         // a block FP8 kv_b (EXL3-K4-v1 keeps its FP8 source's): dequantized on the host to the bf16 its absorb reads
+         const kv_f8 = !kv_mx and (try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i})).dtype == .f8_e4m3;
+-- 
+2.43.0
+

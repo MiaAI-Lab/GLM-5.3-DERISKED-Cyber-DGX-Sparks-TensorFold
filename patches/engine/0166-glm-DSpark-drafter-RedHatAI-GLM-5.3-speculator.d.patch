@@ -1,0 +1,1147 @@
+From 2bcd676817c3c7428570e6f84afd2ab87df11a80 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 02:10:48 +0200
+Subject: [PATCH] glm: DSpark drafter (RedHatAI/GLM-5.3-speculator.dspark) on
+ glm_moe_dsa
+
+--drafter <folder> with speculators_model_type "dspark" loads DSpark instead of DFlash2. The engine side is
+DFlash2's Drafter (slots, rings, taps, requests, lanes, followers) with `spark` set; its ingest, block pass and
+selection dispatch to dspark.zig:
+- context rows: fc (bf16) over the 5 taps, hidden_norm, per layer [k | v] (4 bits), k_norm + neox RoPE (theta 8e6)
+  into the stream's ring (ds_ctx_kv; 3 layers x K, V x 2048 x 4096 bf16, 101 MB);
+- block [anchor, mask x 7] at p..p+7: 3 Qwen3 layers (q_norm / k_norm, neox RoPE; ds_block_qkv), multi-head
+  attention over the window [p - 2048, p) and the block causally (ds_attn_part / ds_attn_merge, 64 heads of 64),
+  o, SwiGLU MLP (4-bit gate|up, bf16 down), final norm, the verifier's 4-bit draft head, each rank's 16 best a
+  slot (DFlash2's top16 kernels), gathered;
+- rank 0: candidates merged (value desc, id asc), Markov score base + W2[c] . W1[prev] (prev_0 = anchor) in f64,
+  confidence sigmoid(w_h . h + w_m . W1[prev] + b); slots 0..6 are the 7 drafts and their chances.
+DFlash2's TAP_ROW / ring_bytes become the Drafter's tap_row / ring_size (max_ring_bytes for sizes taken before a
+drafter is read); the engine taps and ingests prompt chunks on glm_moe_dsa when the drafter is DSpark.
+
+Ported from the owner's 3x recipe patches 0114 / 0125 (dspark.py; MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold),
+which adapted the model definition from vllm-project/speculators @ 36a19ca and the sequential top-k Markov sampling
+from vLLM @ 5f30fc7 (Apache-2.0); kernel check night/bin/dscheck (ctx_kv, block_qkv, attention vs a CPU reference).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/build/cuda_kernels.zig              |   1 +
+ zig/glm_prompt_host.zig                 |  11 +-
+ zig/glm_snapshot_host.zig               |   5 +-
+ zig/kernels/cuda/glm_dspark.cu          | 202 ++++++++++
+ zig/src/cuda/kernels.zig                |   1 +
+ zig/src/families/glm/cuda_engine.zig    |   5 +-
+ zig/src/families/glm/cuda_native.zig    |   5 +-
+ zig/src/families/glm/cuda_snapshots.zig |   6 +-
+ zig/src/families/glm/dflash.zig         |  48 ++-
+ zig/src/families/glm/dflash_load.zig    |  16 +-
+ zig/src/families/glm/dspark.zig         | 504 ++++++++++++++++++++++++
+ 11 files changed, 771 insertions(+), 33 deletions(-)
+ create mode 100644 zig/kernels/cuda/glm_dspark.cu
+ create mode 100644 zig/src/families/glm/dspark.zig
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 045b7c9..820c059 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -108,6 +108,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "glm_vision", .flags = &.{"-O3"} }, // ours: GLM's image tower steps around cuBLASLt (norms, rotary, softmax, merger)
+     .{ .name = "glm_mm", .flags = &.{"-O3"} }, // ours: GLM's bf16 linears on tensor cores, weights tiled at load, row-stable
+     .{ .name = "glm_dflash", .flags = &.{"-O3"} }, // the DFlash2 block drafter
++    .{ .name = "glm_dspark", .flags = &.{"-O3"} }, // the DSpark block drafter (glm_moe_dsa)
+     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
+     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
+     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
+diff --git a/zig/glm_prompt_host.zig b/zig/glm_prompt_host.zig
+index 722c9a2..0e3c556 100644
+--- a/zig/glm_prompt_host.zig
++++ b/zig/glm_prompt_host.zig
+@@ -102,6 +102,7 @@ const engine = struct {
+     };
+     pub const Drafter = struct {
+         taps_prefill: u64 = 0,
++        tap_row: usize = glm.dflash.TAP_ROW,
+         states: [32]Slot = @splat(.{}),
+         const Slot = struct { ring: ?struct { ptr: u64 } = null, first: i64 = glm.dflash.no_rows, end: i64 = 0 }; // mem2's prompt run
+         pub fn taps(dr: *Drafter, _: bool) fw.Taps {
+@@ -216,16 +217,16 @@ test "GLM prompt workflow: DFlash context equals ordinary ingest at own offsets
+ }
+ test "GLM prompt workflow: context window cut preserves sequence positions independently of tap offsets" {
+     const dr = glm.dflash;
+-    const run = (try dr.promptRun(1000, 2000, 2048, 2048, 5000, 0)).?;
++    const run = (try dr.promptRun(1000, 2000, 2048, 2048, 5000, 0, dr.TAP_ROW)).?;
+     try t.expectEqual(@as(i64, 2952), run.pos0);
+     try t.expectEqual(@as(usize, 1144), run.n);
+     try t.expectEqual(@as(u64, 2000 + 904 * dr.TAP_ROW), run.taps);
+-    const shifted = (try dr.promptRun(1000, 2000, 0, 5, 5, 11)).?;
++    const shifted = (try dr.promptRun(1000, 2000, 0, 5, 5, 11, dr.TAP_ROW)).?;
+     try t.expectEqual(@as(i64, 0), shifted.pos0);
+     try t.expectEqual(@as(u64, 2000 + 11 * dr.TAP_ROW), shifted.taps);
+-    try t.expectEqual(@as(?dr.Run, null), try dr.promptRun(1000, 2000, 0, 2048, 5000, 0));
+-    try t.expectError(error.BadPromptContext, dr.promptRun(0, 0, 9, 2, 10, 0));
+-    try t.expectError(error.DrafterContextTooWide, dr.promptRun(0, 0, 0, 5, 5, 2044));
++    try t.expectEqual(@as(?dr.Run, null), try dr.promptRun(1000, 2000, 0, 2048, 5000, 0, dr.TAP_ROW));
++    try t.expectError(error.BadPromptContext, dr.promptRun(0, 0, 9, 2, 10, 0, dr.TAP_ROW));
++    try t.expectError(error.DrafterContextTooWide, dr.promptRun(0, 0, 0, 5, 5, 2044, dr.TAP_ROW));
+ }
+ 
+ test "GLM prompt workflow: both ranks share exact packets and reject malformed batches" {
+diff --git a/zig/glm_snapshot_host.zig b/zig/glm_snapshot_host.zig
+index bb5292b..a959ebe 100644
+--- a/zig/glm_snapshot_host.zig
++++ b/zig/glm_snapshot_host.zig
+@@ -60,8 +60,8 @@ test "GLM snapshots: a short prefix fits 4 GiB even with a 524288-token configur
+     e.drafter = @ptrFromInt(4096); // only its presence is read
+     const drafted = glm.native.snap_bytes(&e, 34816);
+     e.drafter = null;
+-    try t.expect(drafted - glm.dflash.ring_bytes < longer);
+-    try t.expect(drafted > longer - glm.dflash.ring_bytes);
++    try t.expect(drafted - glm.dflash.max_ring_bytes < longer);
++    try t.expect(drafted > longer - glm.dflash.max_ring_bytes);
+     try t.expectEqual(@as(u64, 0), drafted % (2 << 20));
+ }
+ 
+@@ -841,6 +841,7 @@ test "GLM snapshots: a paired step's second chunk leaves DFlash2's context run w
+     const Slot = struct { ring: ?struct { ptr: u64 } = .{ .ptr = 0x7000_0000 }, first: i64 = df.no_rows, end: i64 = 0 };
+     const Mock = struct { // the ingests' runs and where the context input began for each (cuda_prompt_pair's calls)
+         cin: u64 = 0x1000_0000,
++        tap_row: usize = glm.dflash.TAP_ROW,
+         taps_prefill: u64 = 0x4000_0000,
+         s: Slot = .{},
+         taps: [4]u64 = undefined,
+diff --git a/zig/kernels/cuda/glm_dspark.cu b/zig/kernels/cuda/glm_dspark.cu
+new file mode 100644
+index 0000000..1b5e5a1
+--- /dev/null
++++ b/zig/kernels/cuda/glm_dspark.cu
+@@ -0,0 +1,202 @@
++// DSpark drafter kernels (RedHatAI/GLM-5.3-speculator.dspark on glm_moe_dsa): Qwen3 per-head norms and neox RoPE for
++// the context rows (into a stream's ring) and the block rows, and the block's multi-head attention over the ring's
++// window and the block itself. Written for this engine after the owner's 3x recipe patch 0114 (dspark.py, its
++// _block_attn_kernel and DFlash2's _taps_compute; MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold), which adapted the
++// model definition from vllm-project/speculators and vLLM (Apache-2.0); the layout follows glm_dflash.cu (ours).
++#include <cuda_bf16.h>
++#include <stdint.h>
++
++namespace glm_dspark {
++constexpr int HD = 64;          // head dim
++constexpr int H = 64;           // heads (query = KV heads: multi-head)
++constexpr int HW = H * HD;      // 4096: a row of q, k or v
++constexpr int WIN = 2048;       // the sliding window (and a ring's slots)
++constexpr int BLOCK = 8;        // a block's rows
++constexpr int CK = 128;         // keys a chunk of the attention
++constexpr int CH = WIN / CK;    // window chunks (16); chunk CH is the block's own keys
++
++__device__ __forceinline__ float bf(__nv_bfloat16 x) { return __bfloat162float(x); }
++
++// One head of 64 (a warp: dims d and d + 32, the rotate-half pair): RMSNorm with weight w, then neox RoPE at pos.
++__device__ __forceinline__ void norm_rope(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
++                                          long long pos, float eps, float theta, __nv_bfloat16* __restrict__ out) {
++  const int d = threadIdx.x & 31;
++  const float a = bf(x[d]), b = bf(x[d + 32]);
++  float ss = a * a + b * b;
++#pragma unroll
++  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
++  const float r = rsqrtf(ss / HD + eps);
++  // the norm and the rotation in fp32, one bf16 rounding at the end (as the NumPy twin, dspark_twin.py)
++  const float na = a * r * bf(w[d]), nb = b * r * bf(w[d + 32]);
++  const double inv = pow((double)theta, -2.0 * d / HD);
++  const double ang = (double)pos * inv;
++  const float c = (float)cos(ang), s = (float)sin(ang);
++  out[d] = __float2bfloat16_rn(na * c - nb * s);
++  out[d + 32] = __float2bfloat16_rn(nb * c + na * s);
++}
++
++// The ring of one layer: K then V, [WIN][HW] each, layers one after another.
++__device__ __forceinline__ __nv_bfloat16* ring_k(__nv_bfloat16* ring, int layer) { return ring + (size_t)layer * 2 * WIN * HW; }
++__device__ __forceinline__ __nv_bfloat16* ring_v(__nv_bfloat16* ring, int layer) { return ring_k(ring, layer) + (size_t)WIN * HW; }
++}  // namespace glm_dspark
++
++using namespace glm_dspark;
++
++// Context rows' [k | v] (kv [N][2 HW]): k_norm and RoPE at pos[r] into ring rings[r] slot pos % WIN of `layer`, v as it
++// is. grid (N, H), 32 threads.
++extern "C" __global__ void __launch_bounds__(32)
++    ds_ctx_kv(const __nv_bfloat16* __restrict__ kv, const __nv_bfloat16* __restrict__ kn, const long long* __restrict__ pos,
++              const unsigned long long* __restrict__ rings, int layer, float eps, float theta) {
++  const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
++  const long long p = pos[r];
++  __nv_bfloat16* ring = reinterpret_cast<__nv_bfloat16*>(rings[r]);
++  const size_t slot = (size_t)(p % WIN) * HW + (size_t)h * HD;
++  norm_rope(kv + (size_t)r * 2 * HW + h * HD, kn, p, eps, theta, ring_k(ring, layer) + slot);
++  const __nv_bfloat16* v = kv + (size_t)r * 2 * HW + HW + h * HD;
++  ring_v(ring, layer)[slot + d] = v[d];
++  ring_v(ring, layer)[slot + d + 32] = v[d + 32];
++}
++
++// The block rows' fused [q | k | v] (qkv [M][3 HW]): q_norm / k_norm and RoPE at pos[r] into q and kb, v into vb.
++// grid (M, 2 H), 32 threads: y < H a query head, else a key head (and its value).
++extern "C" __global__ void __launch_bounds__(32)
++    ds_block_qkv(const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ qn,
++                 const __nv_bfloat16* __restrict__ kn, const int* __restrict__ pos, float eps, float theta,
++                 __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ kb, __nv_bfloat16* __restrict__ vb) {
++  const int r = blockIdx.x, y = blockIdx.y, d = threadIdx.x;
++  const __nv_bfloat16* row = qkv + (size_t)r * 3 * HW;
++  if (y < H) {
++    norm_rope(row + y * HD, qn, pos[r], eps, theta, q + (size_t)r * HW + y * HD);
++    return;
++  }
++  const int h = y - H;
++  norm_rope(row + HW + h * HD, kn, pos[r], eps, theta, kb + (size_t)r * HW + h * HD);
++  vb[(size_t)r * HW + h * HD + d] = row[2 * HW + h * HD + d];
++  vb[(size_t)r * HW + h * HD + d + 32] = row[2 * HW + h * HD + d + 32];
++}
++
++// The block attention, split: stream s, head h, chunk c (grid (S, H, CH + 1), 128 threads, a thread a key). The block's
++// 8 queries (q [S BLOCK][HW]) see the ring's window positions lo .. start - 1, lo = max(from, start - WIN) (chunk c: its
++// keys lo + c CK ..), and chunk CH the block's own keys kb / vb, causal (query m: keys 0 .. m). Per chunk and query: the
++// running max pm, sum pl and unnormalized output pacc [S BLOCK][H][CH + 1][HD] (fp32), merged by ds_attn_merge.
++extern "C" __global__ void __launch_bounds__(128)
++    ds_attn_part(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kb,
++                 const __nv_bfloat16* __restrict__ vb, const unsigned long long* __restrict__ rings,
++                 const long long* __restrict__ starts, const long long* __restrict__ froms, int layer, float scale,
++                 float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pacc) {
++  const int s = blockIdx.x, h = blockIdx.y, c = blockIdx.z, t = threadIdx.x;
++  __shared__ float qs[BLOCK][HD];
++  __shared__ float ps[BLOCK][CK];
++  __shared__ float vs[CK][HD + 1];
++  __shared__ float red[BLOCK][4];
++  for (int i = t; i < BLOCK * HD; i += 128) qs[i / HD][i % HD] = bf(q[((size_t)s * BLOCK + i / HD) * HW + h * HD + i % HD]);
++  const long long start = starts[s];
++  const long long lo = max(froms[s], start - (long long)WIN);
++  const bool own = c == CH;
++  const long long key = own ? (long long)t : lo + (long long)c * CK + t;  // own: block slot t (< BLOCK)
++  const bool live = own ? t < BLOCK : key < start;
++  const __nv_bfloat16* krow = nullptr;
++  const __nv_bfloat16* vrow = nullptr;
++  if (live) {
++    if (own) {
++      krow = kb + ((size_t)s * BLOCK + t) * HW + h * HD;
++      vrow = vb + ((size_t)s * BLOCK + t) * HW + h * HD;
++    } else {
++      __nv_bfloat16* ring = reinterpret_cast<__nv_bfloat16*>(rings[s]);
++      const size_t slot = (size_t)(key % WIN) * HW + (size_t)h * HD;
++      krow = ring_k(ring, layer) + slot;
++      vrow = ring_v(ring, layer) + slot;
++    }
++  }
++  __syncthreads();
++  float sc[BLOCK];
++#pragma unroll
++  for (int m = 0; m < BLOCK; ++m) sc[m] = -INFINITY;
++  if (live) {
++    float kr[HD];
++#pragma unroll
++    for (int d = 0; d < HD; ++d) kr[d] = bf(krow[d]);
++#pragma unroll
++    for (int m = 0; m < BLOCK; ++m) {
++      if (own && t > m) continue;  // causal inside the block
++      float acc = 0.f;
++#pragma unroll
++      for (int d = 0; d < HD; ++d) acc = fmaf(qs[m][d], kr[d], acc);
++      sc[m] = acc * scale;
++    }
++#pragma unroll
++    for (int d = 0; d < HD; ++d) vs[t][d] = bf(vrow[d]);
++  } else {
++#pragma unroll
++    for (int d = 0; d < HD; ++d) vs[t][d] = 0.f;
++  }
++  // per query: the chunk's max over its 128 keys (warp, then the 4 warps)
++  const int lane = t & 31, w = t >> 5;
++#pragma unroll
++  for (int m = 0; m < BLOCK; ++m) {
++    float v = sc[m];
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
++    if (lane == 0) red[m][w] = v;
++  }
++  __syncthreads();
++  float mx[BLOCK];
++#pragma unroll
++  for (int m = 0; m < BLOCK; ++m) mx[m] = fmaxf(fmaxf(red[m][0], red[m][1]), fmaxf(red[m][2], red[m][3]));
++  __syncthreads();
++#pragma unroll
++  for (int m = 0; m < BLOCK; ++m) {
++    const float p = sc[m] == -INFINITY ? 0.f : __expf(sc[m] - mx[m]);
++    ps[m][t] = p;
++    float v = p;
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
++    if (lane == 0) red[m][w] = v;
++  }
++  __syncthreads();
++  const size_t base = ((size_t)s * BLOCK) * H * (CH + 1);
++  if (t < BLOCK) {
++    const size_t at = base + ((size_t)t * H + h) * (CH + 1) + c;
++    pm[at] = mx[t];
++    pl[at] = red[t][0] + red[t][1] + red[t][2] + red[t][3];
++  }
++  // unnormalized output: thread t -> query t / 16, dims (t % 16) * 4 .. + 3
++  const int m = t / 16, d0 = (t % 16) * 4;
++  float o[4] = {0.f, 0.f, 0.f, 0.f};
++  for (int k = 0; k < CK; ++k) {
++    const float p = ps[m][k];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) o[j] = fmaf(p, vs[k][d0 + j], o[j]);
++  }
++  float* out = pacc + ((base + ((size_t)m * H + h) * (CH + 1) + c) * HD) + d0;
++#pragma unroll
++  for (int j = 0; j < 4; ++j) out[j] = o[j];
++}
++
++// The chunks of row r (stream r / BLOCK, query r % BLOCK), head h into out[r][h] (bf16). grid (S BLOCK, H), 64 threads.
++extern "C" __global__ void __launch_bounds__(64)
++    ds_attn_merge(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
++                  __nv_bfloat16* __restrict__ out) {
++  const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
++  const size_t at = ((size_t)r * H + h) * (CH + 1);
++  float m = -INFINITY;
++  for (int c = 0; c <= CH; ++c) m = fmaxf(m, pm[at + c]);
++  float l = 0.f, o = 0.f;
++  for (int c = 0; c <= CH; ++c) {
++    const float cm = pm[at + c];
++    if (cm == -INFINITY) continue;
++    const float f = __expf(cm - m);
++    l = fmaf(pl[at + c], f, l);
++    o = fmaf(pacc[(at + c) * HD + d], f, o);
++  }
++  out[(size_t)r * HW + h * HD + d] = __float2bfloat16_rn(o / l);
++}
++
++// x += y, bf16 rows of n (grid (R, n / 1024), 256 threads: 4 a thread).
++extern "C" __global__ void __launch_bounds__(256) ds_add(__nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ y, int n) {
++  const size_t r = blockIdx.x;
++  const int c = blockIdx.y * 1024 + threadIdx.x * 4;
++  if (c >= n) return;
++#pragma unroll
++  for (int j = 0; j < 4; ++j) x[r * n + c + j] = __float2bfloat16_rn(bf(x[r * n + c + j]) + bf(y[r * n + c + j]));
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 92ef647..4e6338c 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -73,6 +73,7 @@ pub const glm_quant: []const u8 = if (available) &Blob("fatbin_glm_quant").bytes
+ pub const glm_vision: []const u8 = if (available) &Blob("fatbin_glm_vision").bytes else &.{};
+ pub const glm_mm: []const u8 = if (available) &Blob("fatbin_glm_mm").bytes else &.{};
+ pub const glm_dflash: []const u8 = if (available) &Blob("fatbin_glm_dflash").bytes else &.{};
++pub const glm_dspark: []const u8 = if (available) &Blob("fatbin_glm_dspark").bytes else &.{};
+ pub const glm_kda: []const u8 = if (available) &Blob("fatbin_glm_kda").bytes else &.{};
+ pub const exl3_linear: []const u8 = if (available) &Blob("fatbin_exl3_linear").bytes else &.{};
+ pub const exl3_experts: []const u8 = if (available) &Blob("fatbin_exl3_experts").bytes else &.{};
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 5736d51..62637ff 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -543,7 +543,8 @@ pub const Engine = struct {
+             f.ce = null;
+             if (e.kv_ctx.counts) |c| c.owner_prompts += 1;
+         }
+-        if (e.tap_dump == null and (e.c.dsa or start + rows <= len -| @as(usize, @intCast(dflash.WIN)))) f.taps = null; // none read (dflash.promptRun); glm_moe_dsa can't tap its one stream
++        const spark = if (e.drafter) |dr| dr.spark != null else false; // DSpark taps glm_moe_dsa's one stream (dflash2 can't)
++        if (e.tap_dump == null and ((e.c.dsa and !spark) or start + rows <= len -| @as(usize, @intCast(dflash.WIN)))) f.taps = null; // none read (dflash.promptRun)
+         const as_i32: []const i32 = @ptrCast(part);
+         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
+         f.prof = e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
+@@ -573,7 +574,7 @@ pub const Engine = struct {
+         if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..]);
+         stamp.end();
+         stamp = prof_mod.span(f.prof, e.stream, .drafter);
+-        if (e.drafter) |dr| if (!e.c.dsa) try dr.prompt(e, e.slot, start, rows, len); // glm_moe_dsa taps nothing: its one stream can't feed df_tap's 4-stream rows
++        if (e.drafter) |dr| if (!e.c.dsa or dr.spark != null) try dr.prompt(e, e.slot, start, rows, len); // DFlash2 can't tap glm_moe_dsa's one stream; DSpark does
+         if (e.drafter) |dr| if (start + rows == len) try dr.ringDigest(e, e.slot, len);
+         stamp.end();
+         stamp = prof_mod.span(f.prof, e.stream, .draw);
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 5963e99..cf3e37e 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -282,7 +282,8 @@ fn finishRank(a: OpenArgs) !Loaded {
+     const roce_bytes = a.roce_bytes;
+     if (o.drafter) |dd| { // before the rooms: its weights and scratch count against every rank's
+         if (!o.drafts) return error.DrafterNeedsDrafts;
+-        own.e.drafter = try dflash_load.load(gpa, io, own.e, dd, p.rank, p.world, o.drafter_bits);
++        // a DSpark speculator (speculators_model_type "dspark", glm_moe_dsa) or DFlash2
++        own.e.drafter = if (@import("dspark.zig").isSpark(gpa, io, dd)) try @import("dspark.zig").load(gpa, io, own.e, dd, p.rank, p.world, o.drafter_bits) else try dflash_load.load(gpa, io, own.e, dd, p.rank, p.world, o.drafter_bits);
+     }
+     try own.group.openRoce(gpa, io, ctx.d, own.e.stream, roce_bytes); // both ranks bring it up or neither does
+     errdefer if (own.group.fast) |f| f.deinit();
+@@ -339,7 +340,7 @@ fn finishRank(a: OpenArgs) !Loaded {
+     }.get;
+     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
+     own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .mtp_confidence = o.mtp_confidence };
+-    const extra: u64 = (if (o.drafter != null) dflash.ring_bytes else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
++    const extra: u64 = (if (own.e.drafter) |dr| dr.ringBytes() else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
+     own.layout = if (set.pages) try pages_mod.layout(gpa, own.e, extra) else null;
+     return .{
+         .draft_kind = if (own.e.drafter != null) "DFlash2" else null,
+diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
+index c965eec..6a71d3c 100644
+--- a/zig/src/families/glm/cuda_snapshots.zig
++++ b/zig/src/families/glm/cuda_snapshots.zig
+@@ -87,7 +87,7 @@ pub fn bytes(e: anytype, at: usize) u64 {
+     const head = mtpHead(e, at) catch return std.math.maxInt(u64);
+     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
+     const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head) catch return std.math.maxInt(u64);
+-    const ring: usize = if (e.drafter != null) dflash.ring_bytes else 0; // at most: DFlash2's ring when it holds rows
++    const ring: usize = if (e.drafter != null) dflash.max_ring_bytes else 0; // the larger of DFlash2's and DSpark's // at most: DFlash2's ring when it holds rows
+     return pages.rounded(n + ring) catch std.math.maxInt(u64);
+ }
+ 
+@@ -97,7 +97,7 @@ fn drafterPart(e: anytype, plan: *layout.Plan, at: usize) !?i64 {
+     const dr = e.drafter orelse return null;
+     if (std.c.getenv("TF_GLM_SNAP_DRAFTER")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return null; // A/B: resume from the mark
+     const from = dr.keptFrom(e.slot, at) orelse return null;
+-    try plan.outside(try dr.ringPtr(e.slot), dflash.ring_bytes);
++    try plan.outside(try dr.ringPtr(e.slot), dr.ringBytes());
+     return from;
+ }
+ 
+@@ -197,7 +197,7 @@ pub fn restore(e: anytype, id: u64) !void {
+     const home: ?u8 = if (e.settings.kv_shard.on) s.home else null;
+     const own = if (home) |h| h == e.share.rank else true; // this rank's copy holds the latent rows
+     var plan = try layout.Plan.initFor(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, own);
+-    if (s.ring_from != null) try plan.outside(try (e.drafter orelse return error.SnapshotSize).ringPtr(e.slot), dflash.ring_bytes);
++    if (s.ring_from != null) try plan.outside(try (e.drafter orelse return error.SnapshotSize).ringPtr(e.slot), (e.drafter orelse return error.SnapshotSize).ringBytes());
+     if (plan.len != s.len) return error.SnapshotSize;
+     errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
+     const t0 = now();
+diff --git a/zig/src/families/glm/dflash.zig b/zig/src/families/glm/dflash.zig
+index d4b97cc..92177c7 100644
+--- a/zig/src/families/glm/dflash.zig
++++ b/zig/src/families/glm/dflash.zig
+@@ -6,6 +6,7 @@ const q4 = @import("cuda_q4.zig");
+ const taps_mod = @import("cuda_taps.zig");
+ const select = @import("dflash_select.zig");
+ const block = @import("dflash_block.zig");
++const dspark = @import("dspark.zig");
+ 
+ pub const BLOCK: usize = 8;
+ pub const MASK: u32 = 154856;
+@@ -33,6 +34,8 @@ pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's ta
+ 
+ /// Device bytes a stream's context ring takes (K and V of every layer).
+ pub const ring_bytes: u64 = LAYERS * 2 * @as(u64, @intCast(WIN)) * KVW * 2;
++/// The larger ring of the two block drafters (DSpark's on glm_moe_dsa), for sizes taken before a drafter is read.
++pub const max_ring_bytes: u64 = @max(ring_bytes, dspark.ring_bytes);
+ 
+ /// The drafter MLP across the ranks: gate and up by rows, down by K, each rank `ff` of FF wide (rank r's slice at
+ /// r * ff), the fp32 partials of down gathered and summed in rank order (df_sumn), so the sum is the same on every
+@@ -179,10 +182,19 @@ pub const Drafter = struct {
+     h_crings: []u64 = &.{},
+     cand: []i32 = &.{}, // all ranks' gathered candidates, [world][MAX_M][CW]
+     gh: []f32 = &.{}, // the selector's hidden projections [MAX_M][RANK]
++    // DSpark (dspark.zig) on glm_moe_dsa: its own weights and passes; the slots, rings, taps and requests stay these
++    spark: ?*dspark.Spark = null,
++    tap_row: usize = TAP_ROW, // bytes of one row's taps (DSpark: 5 x 6144 bf16)
++    ring_size: u64 = ring_bytes, // a stream's context ring (DSpark: 3 layers x K, V x 2048 x 4096 bf16)
++
++    pub fn ringBytes(dr: *const Drafter) u64 {
++        return dr.ring_size;
++    }
+ 
+     pub fn deinit(dr: *Drafter) void {
+         for (dr.slots.items) |*s| if (s.ring) |*r| r.free();
+         dr.slots.deinit(dr.gpa);
++        if (dr.spark) |s| s.deinit(dr.gpa);
+         dr.scratch.free();
+         dr.weights.free();
+         dr.module.unload();
+@@ -206,13 +218,13 @@ pub const Drafter = struct {
+ 
+     /// Where a forward's taps go: a prompt chunk's rows or a verify's.
+     pub fn taps(dr: *const Drafter, chunk: bool) taps_mod.Taps {
+-        return .{ .f = dr.k.tap, .out = if (chunk) dr.taps_prefill else dr.taps_step };
++        return .{ .f = dr.k.tap, .out = if (chunk) dr.taps_prefill else dr.taps_step, .dsa = if (dr.spark != null) dspark.D else 0 };
+     }
+ 
+     fn slot(dr: *Drafter, i: u32) !*Slot {
+         if (i >= dr.slots.items.len) try dr.slots.appendNTimes(dr.gpa, .{}, i + 1 - dr.slots.items.len);
+         const s = &dr.slots.items[i];
+-        if (s.ring == null) s.ring = try cuda.DeviceBuffer.alloc(dr.d, ring_bytes);
++        if (s.ring == null) s.ring = try cuda.DeviceBuffer.alloc(dr.d, dr.ring_size);
+         return s;
+     }
+ 
+@@ -263,7 +275,7 @@ pub const Drafter = struct {
+         if (!std.mem.eql(u8, std.mem.span(v), "1") or len < 8192) return; // long prompts only: a short one's time stays clean
+         const s = try dr.slot(i);
+         try e.stream.synchronize();
+-        const host = try dr.gpa.alloc(u8, ring_bytes);
++        const host = try dr.gpa.alloc(u8, dr.ring_size);
+         defer dr.gpa.free(host);
+         try s.ring.?.download(0, host);
+         std.log.info("dflash2: ring digest slot {d} after a {d}-id prompt: {x:0>16}", .{ i, len, std.hash.Wyhash.hash(0, host) });
+@@ -284,7 +296,7 @@ pub const Drafter = struct {
+     /// the context input past them, idle through the pass. The first's ingest copies its rows in before them, then the
+     /// second's reads its own in place (promptIn), so a pair needs no tap rows of its own.
+     pub fn pairTaps(dr: *const Drafter, first_rows: usize) taps_mod.Taps {
+-        return .{ .f = dr.k.tap, .out = dr.cin + first_rows * TAP_ROW };
++        return .{ .f = dr.k.tap, .out = dr.cin + first_rows * dr.tap_row, .dsa = if (dr.spark != null) dspark.D else 0 };
+     }
+ 
+     /// The runs' rows through fc, the hidden norm and each layer's k, v into their rings.
+@@ -295,7 +307,7 @@ pub const Drafter = struct {
+         if (N > MAX_CTX) return error.DrafterContextTooWide;
+         var row: usize = 0;
+         for (runs) |r| {
+-            if (r.taps != dr.cin + row * TAP_ROW) try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW); // in place: promptIn
++            if (r.taps != dr.cin + row * dr.tap_row) try block.copy(e, dr.cin + row * dr.tap_row, r.taps, r.n * dr.tap_row); // in place: promptIn
+             for (0..r.n) |j| {
+                 dr.h_cpos[row + j] = r.pos0 + @as(i64, @intCast(j));
+                 dr.h_crings[row + j] = r.ring;
+@@ -304,7 +316,7 @@ pub const Drafter = struct {
+         }
+         try block.upload(dr, e, dr.cpos, std.mem.sliceAsBytes(dr.h_cpos[0..N]));
+         try block.upload(dr, e, dr.crings, std.mem.sliceAsBytes(dr.h_crings[0..N]));
+-        try block.ingestPass(dr, e, N);
++        if (dr.spark != null) try dspark.ingestPass(dr, e, N) else try block.ingestPass(dr, e, N);
+     }
+ 
+     /// Kept rows into each context and no block pass (a copy takes these streams' next windows): every rank.
+@@ -325,7 +337,7 @@ pub const Drafter = struct {
+                 dr.lost += 1;
+                 continue;
+             }
+-            runs[nr] = .{ .ring = s.ring.?.ptr, .taps = dr.taps_step + s.v_row0 * TAP_ROW, .n = q.n, .pos0 = s.v_pos0 };
++            runs[nr] = .{ .ring = s.ring.?.ptr, .taps = dr.taps_step + s.v_row0 * dr.tap_row, .n = q.n, .pos0 = s.v_pos0 };
+             nr += 1;
+         }
+         return nr;
+@@ -358,6 +370,20 @@ pub const Drafter = struct {
+         try block.upload(dr, e, dr.froms, std.mem.sliceAsBytes(dr.h_froms[0..S]));
+         const rank0 = reqs[0].out != null;
+         tm = try dr.mark(e, .{ tm, 1 });
++        if (dr.spark) |sp| {
++            try dspark.pass(dr, e, S);
++            tm = try dr.mark(e, .{ tm, 2 });
++            if (rank0) {
++                try block.download(dr, e, std.mem.sliceAsBytes(dr.cand[0..@import("dflash_candidates.zig").Layout.init(dr.world, M, CW).read]), dr.gtk);
++                try block.download(dr, e, std.mem.sliceAsBytes(sp.h_hn[0 .. M * dspark.D]), sp.hn);
++                for (reqs, 0..) |q, i| dspark.select(dr, i, M, q);
++                if (dr.log > dr.calls) for (reqs) |q| std.log.info("dspark round {d}: slot {d} pos {d} kept {d} anchor {d} drafts {any} chances {any}", .{ dr.calls, q.slot, q.pos, q.n, q.anchor, q.out.?[0 .. BLOCK - 1], if (q.probs) |p| p[0 .. BLOCK - 1] else &[_]f64{} });
++                if (dr.calls % 256 == 255) std.log.info("dspark: {d} rounds, {d} contexts restarted", .{ dr.calls + 1, dr.lost });
++            }
++            _ = try dr.mark(e, .{ tm, 3 });
++            dr.calls += 1;
++            return;
++        }
+         try block.pass(dr, e, S, rank0);
+         tm = try dr.mark(e, .{ tm, 2 });
+         if (rank0) {
+@@ -378,13 +404,13 @@ pub const Drafter = struct {
+ };
+ 
+ /// Prompt context retained in the window; row0 is only a tap-buffer offset, never a sequence position.
+-pub fn promptRun(ring: u64, taps: u64, start: usize, rows: usize, len: usize, row0: usize) !?Run {
++pub fn promptRun(ring: u64, taps: u64, start: usize, rows: usize, len: usize, row0: usize, tap_row: usize) !?Run {
+     if (start > len or rows > len - start) return error.BadPromptContext;
+     if (rows > MAX_CTX or row0 > MAX_CTX - rows) return error.DrafterContextTooWide;
+     const keep_from = len -| @as(usize, @intCast(WIN));
+     if (start + rows <= keep_from) return null;
+     const lo = keep_from -| start;
+-    return .{ .ring = ring, .taps = taps + (row0 + lo) * TAP_ROW, .n = rows - lo, .pos0 = @intCast(start + lo) };
++    return .{ .ring = ring, .taps = taps + (row0 + lo) * tap_row, .n = rows - lo, .pos0 = @intCast(start + lo) };
+ }
+ 
+ pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, row0: usize) !void {
+@@ -398,7 +424,7 @@ pub fn ingestPromptIn(dr: anytype, e: anytype, i: u32, start: usize, rows: usize
+     if (start < len -| @as(usize, @intCast(WIN)) or row0 > MAX_CTX or rows > MAX_CTX - row0) return error.BadPromptContext;
+     const cin = dr.cin;
+     defer dr.cin = cin;
+-    dr.cin = cin + row0 * TAP_ROW;
++    dr.cin = cin + row0 * dr.tap_row;
+     return ingestFrom(dr, e, i, start, rows, len, dr.cin, 0);
+ }
+ 
+@@ -406,7 +432,7 @@ pub fn ingestPromptIn(dr: anytype, e: anytype, i: u32, start: usize, rows: usize
+ /// the ring then holds (keptFrom's), whichever buffer they were tapped into.
+ fn ingestFrom(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, taps: u64, row0: usize) !void {
+     const s = try dr.slot(i);
+-    const run = (try promptRun(s.ring.?.ptr, taps, start, rows, len, row0)) orelse return;
++    const run = (try promptRun(s.ring.?.ptr, taps, start, rows, len, row0, dr.tap_row)) orelse return;
+     try dr.ingest(e, &.{run});
+     noteRun(s, run);
+ }
+diff --git a/zig/src/families/glm/dflash_load.zig b/zig/src/families/glm/dflash_load.zig
+index ccb8b56..31f75e1 100644
+--- a/zig/src/families/glm/dflash_load.zig
++++ b/zig/src/families/glm/dflash_load.zig
+@@ -11,9 +11,9 @@ const KVW = df.KVW;
+ const FF = df.FF;
+ const Drafter = df.Drafter;
+ 
+-const Ent = struct { off: u64, n: u64 };
++pub const Ent = struct { off: u64, n: u64 };
+ 
+-const Loader = struct {
++pub const Loader = struct {
+     gpa: std.mem.Allocator,
+     io: std.Io,
+     file: std.Io.File,
+@@ -31,14 +31,14 @@ const Loader = struct {
+     stream: cuda.Stream,
+     at: u64 = 0,
+ 
+-    fn take(l: *Loader, n: u64) !u64 {
++    pub fn take(l: *Loader, n: u64) !u64 {
+         if (l.at + n > l.w.len) return error.DrafterLayout; // the size estimate is short: never write past it
+         const p = l.at;
+         l.at += std.mem.alignForward(u64, n, 256);
+         return l.w.ptr + p;
+     }
+ 
+-    fn read(l: *Loader, name: []const u8, want: u64) ![]u8 {
++    pub fn read(l: *Loader, name: []const u8, want: u64) ![]u8 {
+         const e = l.ents.get(name) orelse {
+             std.log.err("dflash2: no {s} in the drafter's checkpoint", .{name});
+             return error.DrafterTensorMissing;
+@@ -53,7 +53,7 @@ const Loader = struct {
+     }
+ 
+     /// A small bf16 tensor as stored.
+-    fn raw(l: *Loader, name: []const u8, n: u64) !u64 {
++    pub fn raw(l: *Loader, name: []const u8, n: u64) !u64 {
+         const p = try l.take(n);
+         try l.w.upload(p - l.w.ptr, try l.read(name, n));
+         return p;
+@@ -61,7 +61,7 @@ const Loader = struct {
+ 
+     /// `names` stacked as linear(), at the drafter's bits: quantize4 then q4's tiling, or glm_mm's; at 32
+     /// groups with TF_GLM_DFLASH2_Q32=1 (the reference engine's granularity; the GS 32 pack and kernel).
+-    fn linear(l: *Loader, names: []const []const u8, rows: []const usize, kk: usize, part: ?[4]usize) !df.Lin {
++    pub fn linear(l: *Loader, names: []const []const u8, rows: []const usize, kk: usize, part: ?[4]usize) !df.Lin {
+         if (l.bits == 0) return .{ .bf16 = try l.linearB(names, rows, kk, part) };
+         const n = try l.stack(names, rows, kk, part);
+         const k = if (part) |p| p[3] else kk;
+@@ -88,7 +88,7 @@ const Loader = struct {
+     }
+ 
+     /// Rows row0.. (rn of each tensor's `rows`) and columns col0.. (cn of `kk`) of `names`, stacked and tiled bf16.
+-    fn linearB(l: *Loader, names: []const []const u8, rows: []const usize, kk: usize, part: ?[4]usize) !mm.Tiled {
++    pub fn linearB(l: *Loader, names: []const []const u8, rows: []const usize, kk: usize, part: ?[4]usize) !mm.Tiled {
+         const n = try l.stack(names, rows, kk, part);
+         const cn = if (part) |p| p[3] else kk;
+         const dst = try l.take(n * cn * 2);
+@@ -98,7 +98,7 @@ const Loader = struct {
+     }
+ 
+     /// `names` (their `rows` rows of `kk`, or `part`'s rows and columns) stacked bf16 into tmp; the rows.
+-    fn stack(l: *Loader, names: []const []const u8, rows: []const usize, kk: usize, part: ?[4]usize) !usize {
++    pub fn stack(l: *Loader, names: []const []const u8, rows: []const usize, kk: usize, part: ?[4]usize) !usize {
+         const p: [4]usize = part orelse .{ 0, 0, 0, kk };
+         const cn = p[3];
+         var n: usize = 0;
+diff --git a/zig/src/families/glm/dspark.zig b/zig/src/families/glm/dspark.zig
+new file mode 100644
+index 0000000..2401264
+--- /dev/null
++++ b/zig/src/families/glm/dspark.zig
+@@ -0,0 +1,504 @@
++//! DSpark drafts on glm_moe_dsa (--drafter <folder of RedHatAI/GLM-5.3-speculator.dspark>): a DFlash-style parallel
++//! block pass over the target's taps, then a sequential low-rank Markov bias and a learned confidence a draft, on rank 0.
++//! Ported to Zig from the owner's 3x recipe patches 0114 / 0125 (dspark.py; MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-
++//! TensorFold), which adapted the model definition (MarkovHead, ConfidenceHead, the anchored-block forward and mask)
++//! from vllm-project/speculators @ 36a19ca and the sequential top-k Markov sampling from vLLM @ 5f30fc7 (Apache-2.0).
++//! The engine side is DFlash2's (dflash.zig, TensorFold): the same slots, rings, taps, requests and lanes; a Drafter
++//! with `spark` set runs these passes instead of DFlash2's.
++//!
++//! The model: context row j = hidden_norm(fc(concat taps_j)) (taps: the residual after layers 1, 19, 38, 57, 74);
++//! per layer K_j = RoPE(k_norm(k_proj c_j), j), V_j = v_proj c_j into the stream's ring; the block [anchor, mask x 7]
++//! at p .. p + 7 through 3 Qwen3 layers (64 heads of 64, neox RoPE theta 8e6), each slot over the context rows
++//! [p - 2048, p) and block slots 0..itself; h = norm(x); the verifier's head (its 4-bit draft head) gives each rank's
++//! 16 best a slot; rank 0 chains them: score = base + W2[c] . W1[prev] (prev_0 = anchor), confidence
++//! sigmoid(w_h . h + w_m . W1[prev] + b). Slot k predicts p + k + 1; the first 7 slots are drafts.
++const std = @import("std");
++const cuda = @import("cuda");
++const mm = @import("cuda_mm.zig");
++const q4 = @import("cuda_q4.zig");
++const glue = @import("cuda_glue.zig");
++const df = @import("dflash.zig");
++const dl = @import("dflash_load.zig");
++
++pub const D: usize = 6144;
++pub const H: usize = 64;
++pub const HD: usize = 64;
++pub const HW: usize = H * HD; // 4096
++pub const FF: usize = 12288;
++pub const LAYERS: usize = 3;
++pub const AUX: usize = 5;
++pub const RANK: usize = 256;
++pub const THETA: f32 = 8e6;
++pub const EPS: f32 = 1e-5;
++pub const SCALE: f32 = 0.125; // 64^-0.5
++pub const CH: usize = 16; // the window's 128-key chunks (glm_dspark.cu: ds_attn_part's chunk CH is the block's own keys)
++pub const TAP_ROW: usize = AUX * D * 2;
++pub const CTX: usize = df.MAX_CTX; // context rows one ingest takes (a prompt chunk's)
++pub const DRAFTS: usize = df.BLOCK - 1; // slots 0..6: 7 drafts a pass (the lanes' max_held)
++
++/// Device bytes a stream's context ring takes (K and V of every layer, WIN slots).
++pub const ring_bytes: u64 = LAYERS * 2 * @as(u64, @intCast(df.WIN)) * HW * 2;
++
++/// glm_dspark's functions.
++pub const Kernels = struct {
++    ctx_kv: cuda.Function,
++    block_qkv: cuda.Function,
++    attn_part: cuda.Function,
++    attn_merge: cuda.Function,
++    add: cuda.Function,
++
++    pub fn load(m: cuda.Module) !Kernels {
++        var k: Kernels = undefined;
++        inline for (@typeInfo(Kernels).@"struct".field_names) |n| @field(k, n) = try m.function("ds_" ++ n);
++        return k;
++    }
++};
++
++pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, qkv: df.Lin, kv: df.Lin, o: df.Lin, gu: df.Lin, down: mm.Tiled };
++
++/// DSpark's own half of a Drafter: weights, kernels, the host chain's tables, its scratch.
++pub const Spark = struct {
++    module: cuda.Module,
++    k: Kernels,
++    weights: cuda.DeviceBuffer,
++    layers: [LAYERS]LayerW = undefined,
++    fc: df.Lin = undefined,
++    hnorm: u64 = 0,
++    norm: u64 = 0,
++    w1: []u16 = &.{}, // the Markov head's bf16 [vocab][RANK] tables (host, rank 0)
++    w2: []u16 = &.{},
++    conf_h: []f32 = &.{}, // the confidence head: hidden part [D], Markov part [RANK], bias
++    conf_m: [RANK]f64 = undefined,
++    conf_b: f64 = 0,
++    vocab: usize = 0,
++    scratch: cuda.DeviceBuffer = undefined,
++    x: u64 = 0,
++    y: u64 = 0,
++    qkv: u64 = 0,
++    q: u64 = 0,
++    kb: u64 = 0,
++    vb: u64 = 0,
++    att: u64 = 0,
++    a: u64 = 0,
++    gu: u64 = 0,
++    act: u64 = 0,
++    hn: u64 = 0,
++    xs: u64 = 0,
++    logits: u64 = 0,
++    c1: u64 = 0,
++    ctx: u64 = 0,
++    ckv: u64 = 0,
++    pm: u64 = 0,
++    pl: u64 = 0,
++    pacc: u64 = 0,
++    h_hn: []u16 = &.{}, // the block rows' normed h (rank 0 reads it back for the confidences)
++    last_conf: [DRAFTS]f64 = @splat(0),
++
++    pub fn deinit(s: *Spark, gpa: std.mem.Allocator) void {
++        s.scratch.free();
++        s.weights.free();
++        s.module.unload();
++        gpa.free(s.w1);
++        gpa.free(s.w2);
++        gpa.free(s.conf_h);
++        gpa.free(s.h_hn);
++        gpa.destroy(s);
++    }
++};
++
++/// Whether `dir` holds a DSpark speculator (config.json's speculators_model_type).
++pub fn isSpark(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
++    const path = std.fs.path.join(gpa, &.{ dir, "config.json" }) catch return false;
++    defer gpa.free(path);
++    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return false;
++    defer gpa.free(text);
++    const p = std.json.parseFromSlice(std.json.Value, gpa, text, .{}) catch return false;
++    defer p.deinit();
++    const t = p.value.object.get("speculators_model_type") orelse return false;
++    return t == .string and std.mem.eql(u8, t.string, "dspark");
++}
++
++/// The checkpoint is the one this port reads (G0's checks).
++pub fn checkConfig(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
++    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++    defer gpa.free(path);
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
++    defer gpa.free(text);
++    const p = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
++    defer p.deinit();
++    const o = p.value.object;
++    const t = (o.get("transformer_layer_config") orelse return error.NotDSpark).object;
++    const int = struct {
++        fn f(x: ?std.json.Value) i64 {
++            return if (x) |v| (if (v == .integer) v.integer else -1) else -1;
++        }
++    }.f;
++    const ok = int(t.get("hidden_size")) == D and int(t.get("num_hidden_layers")) == LAYERS and
++        int(t.get("num_attention_heads")) == H and int(t.get("num_key_value_heads")) == H and int(t.get("head_dim")) == HD and
++        int(t.get("intermediate_size")) == FF and int(t.get("sliding_window")) == df.WIN and
++        int(o.get("block_size")) == df.BLOCK and int(o.get("mask_token_id")) == df.MASK and int(o.get("markov_rank")) == RANK;
++    if (!ok) return error.DrafterConfigUnexpected;
++    const aux = (o.get("aux_hidden_state_layer_ids") orelse return error.DrafterConfigUnexpected).array.items;
++    const want = [_]i64{ 2, 20, 39, 58, 75 };
++    if (aux.len != want.len) return error.DrafterConfigUnexpected;
++    for (aux, want) |a, w| if (a.integer != w) return error.DrafterConfigUnexpected;
++    const sfa = o.get("sample_from_anchor") orelse return error.DrafterConfigUnexpected;
++    if (sfa != .bool or !sfa.bool) return error.DrafterConfigUnexpected;
++}
++
++fn layerName(b: *[96]u8, li: usize, s: []const u8) ![]const u8 {
++    return std.fmt.bufPrint(b, "layers.{d}.{s}", .{ li, s });
++}
++
++fn bf(x: u16) f32 {
++    return @bitCast(@as(u32, x) << 16);
++}
++
++/// The DSpark drafter from `dir` for rank `rank` of `world` on engine `e`: a Drafter whose `spark` is set. Every
++/// rank holds the whole body (4 bits, fc bf16) and its own slice of the verifier's draft head; rank 0 the chain's tables.
++pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, rank: usize, world: usize, bits: u8) !*df.Drafter {
++    if (bits != 0 and bits != 4) return error.BadDrafterBits;
++    try checkConfig(gpa, io, dir);
++    const d = e.d;
++    const head = e.w.draft_head orelse return error.DrafterNeedsDraftHead;
++    const path = try std.fs.path.join(gpa, &.{ dir, "model.safetensors" });
++    defer gpa.free(path);
++    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
++    defer file.close(io);
++    var lenb: [8]u8 = undefined;
++    _ = try file.readPositionalAll(io, &lenb, 0);
++    const hlen = std.mem.readInt(u64, &lenb, .little);
++    if (hlen > 1 << 20) return error.BadDrafterHeader;
++    const text = try gpa.alloc(u8, hlen);
++    defer gpa.free(text);
++    _ = try file.readPositionalAll(io, text, 8);
++    const hdr = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
++    defer hdr.deinit();
++    var ents = std.StringHashMap(dl.Ent).init(gpa);
++    defer ents.deinit();
++    var it = hdr.value.object.iterator();
++    while (it.next()) |x| {
++        if (std.mem.eql(u8, x.key_ptr.*, "__metadata__")) continue;
++        if (!std.mem.eql(u8, x.value_ptr.object.get("dtype").?.string, "BF16")) return error.DrafterNotBf16;
++        const offs = x.value_ptr.object.get("data_offsets").?.array.items;
++        try ents.put(x.key_ptr.*, .{ .off = 8 + hlen + @as(u64, @intCast(offs[0].integer)), .n = @intCast(offs[1].integer - offs[0].integer) });
++    }
++    // weights: per layer [q | k | v], [k | v] again (the context rows'), o, [gate | up] at `bits`, down bf16; fc bf16
++    const per: u64 = if (bits == 4) 1 else 4; // quarter-bytes a weight
++    const lin_elems: u64 = 3 * HW * D + 2 * HW * D + D * HW + 2 * FF * D;
++    const total: u64 = LAYERS * (lin_elems * per / 2 + lin_elems / 16 + D * FF * 2 + 2 * D * 2 + 2 * HD * 2 + 16 * 256) + AUX * D * D * 2 + 2 * D * 2 + 64 * 256;
++    var wbuf = try cuda.DeviceBuffer.alloc(d, total);
++    errdefer wbuf.free();
++    var tmp = try cuda.DeviceBuffer.alloc(d, AUX * D * D * 2); // the largest linear as stored (fc)
++    defer tmp.free();
++    const nk: usize = 2 * FF * D; // the largest 4-bit linear ([gate | up])
++    var raw = try cuda.DeviceBuffer.alloc(d, if (bits == 4) nk / 2 + 2 * nk / 16 + 1024 else 256);
++    defer raw.free();
++    var module = try cuda.Module.load(d, cuda.kernels.glm_dspark);
++    errdefer module.unload();
++    var dfmod = try cuda.Module.load(d, cuda.kernels.glm_dflash);
++    errdefer dfmod.unload();
++    var l: dl.Loader = .{ .gpa = gpa, .io = io, .file = file, .ents = &ents, .w = &wbuf, .tmp = &tmp, .mk = &e.m.mm, .qk = &e.m.quant, .pk = &e.m.q4, .qraw = &raw, .bits = bits, .stream = e.stream };
++    defer {
++        l.buf.deinit(gpa);
++        l.sub.deinit(gpa);
++    }
++    const sp = try gpa.create(Spark);
++    errdefer gpa.destroy(sp);
++    sp.* = .{ .module = module, .k = try Kernels.load(module), .weights = wbuf, .vocab = head.n * world };
++    defer @import("cuda_load_owner.zig").drain(e.stream, d);
++    var nb: [4][96]u8 = undefined;
++    for (&sp.layers, 0..) |*lw, i| {
++        lw.in_norm = try l.raw(try layerName(&nb[0], i, "input_layernorm.weight"), D * 2);
++        lw.post_norm = try l.raw(try layerName(&nb[0], i, "post_attention_layernorm.weight"), D * 2);
++        lw.qn = try l.raw(try layerName(&nb[0], i, "self_attn.q_norm.weight"), HD * 2);
++        lw.kn = try l.raw(try layerName(&nb[0], i, "self_attn.k_norm.weight"), HD * 2);
++        const q = try layerName(&nb[1], i, "self_attn.q_proj.weight");
++        const kq = try layerName(&nb[2], i, "self_attn.k_proj.weight");
++        const v = try layerName(&nb[3], i, "self_attn.v_proj.weight");
++        lw.qkv = try l.linear(&.{ q, kq, v }, &.{ HW, HW, HW }, D, null);
++        lw.kv = try l.linear(&.{ kq, v }, &.{ HW, HW }, D, null);
++        lw.o = try l.linear(&.{try layerName(&nb[1], i, "self_attn.o_proj.weight")}, &.{D}, HW, null);
++        const gate = try layerName(&nb[1], i, "mlp.gate_proj.weight");
++        const up = try layerName(&nb[2], i, "mlp.up_proj.weight");
++        lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, null);
++        lw.down = try l.linearB(&.{try layerName(&nb[3], i, "mlp.down_proj.weight")}, &.{D}, FF, null);
++    }
++    sp.fc = .{ .bf16 = try l.linearB(&.{"fc.weight"}, &.{D}, AUX * D, null) };
++    sp.hnorm = try l.raw("hidden_norm.weight", D * 2);
++    sp.norm = try l.raw("norm.weight", D * 2);
++    if (l.at > total) return error.DrafterLayout;
++    // rank 0's chain: the Markov tables and the confidence head on the host
++    const V = sp.vocab;
++    if (rank == 0) {
++        sp.w1 = try gpa.alloc(u16, V * RANK);
++        sp.w2 = try gpa.alloc(u16, V * RANK);
++        @memcpy(std.mem.sliceAsBytes(sp.w1), try l.read("markov_head.markov_w1.weight", V * RANK * 2));
++        @memcpy(std.mem.sliceAsBytes(sp.w2), try l.read("markov_head.markov_w2.weight", V * RANK * 2));
++        const cw: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, try l.read("confidence_head.proj.weight", (D + RANK) * 2)));
++        sp.conf_h = try gpa.alloc(f32, D);
++        for (sp.conf_h, cw[0..D]) |*o, x| o.* = bf(x);
++        for (&sp.conf_m, cw[D..][0..RANK]) |*o, x| o.* = bf(x);
++        const cb: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, try l.read("confidence_head.proj.bias", 2)));
++        sp.conf_b = bf(cb[0]);
++    }
++    sp.h_hn = try gpa.alloc(u16, df.MAX_M * D);
++    try carve(sp, d, head.n);
++    // the Drafter: DFlash2's bookkeeping (slots, rings, taps, candidates) at DSpark's sizes; its own pass is `spark`
++    const dr = try gpa.create(df.Drafter);
++    errdefer gpa.destroy(dr);
++    dr.* = .{ .gpa = gpa, .d = d, .module = dfmod, .k = try df.Kernels.load(dfmod), .weights = try cuda.DeviceBuffer.alloc(d, 0), .split = false, .ff = FF, .rank = rank, .world = world, .spark = sp, .tap_row = TAP_ROW, .ring_size = ring_bytes };
++    try carveCommon(dr, d, head.n);
++    dr.h_cpos = try gpa.alloc(i64, CTX);
++    dr.h_crings = try gpa.alloc(u64, CTX);
++    dr.cand = try gpa.alloc(i32, @import("dflash_candidates.zig").Layout.init(world, df.MAX_M, df.CW).host);
++    if (std.c.getenv("TF_GLM_DFLASH2_LOG")) |v| dr.log = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
++    if (std.c.getenv("TF_GLM_DFLASH2_PROF") != null) dr.prof = io;
++    std.log.info("dspark: drafter from {s} (RedHatAI/GLM-5.3-speculator.dspark), linears at {d} bits, fc bf16, {d:.2} GiB weights + {d:.2} GiB scratch on the device", .{ dir, if (bits == 0) 16 else bits, @as(f64, @floatFromInt(l.at)) / (1 << 30), @as(f64, @floatFromInt(sp.scratch.len + dr.scratch.len)) / (1 << 30) });
++    return dr;
++}
++
++/// DSpark's pass scratch, every field one carved piece of one buffer.
++fn carve(sp: *Spark, d: *const cuda.Driver, head_n: usize) !void {
++    const M: u64 = df.MAX_M;
++    const C: u64 = CTX;
++    const fields = .{
++        .{ "x", M * D * 2 },       .{ "y", M * D * 2 },          .{ "qkv", M * 3 * HW * 2 }, .{ "q", M * HW * 2 },
++        .{ "kb", M * HW * 2 },     .{ "vb", M * HW * 2 },        .{ "att", M * HW * 2 },     .{ "a", M * D * 2 },
++        .{ "gu", M * 2 * FF * 2 }, .{ "act", M * FF * 2 },       .{ "hn", M * D * 2 },       .{ "xs", C * (AUX * D / 64) * 4 },
++        .{ "logits", M * head_n * 2 }, .{ "c1", C * D * 2 },      .{ "ctx", C * D * 2 },      .{ "ckv", C * 2 * HW * 2 },
++        .{ "pm", M * H * (CH + 1) * 4 }, .{ "pl", M * H * (CH + 1) * 4 }, .{ "pacc", M * H * (CH + 1) * HD * 4 },
++    };
++    var at: u64 = 0;
++    inline for (fields) |f| {
++        @field(sp, f[0]) = at;
++        at += std.mem.alignForward(u64, f[1], 256);
++    }
++    sp.scratch = try cuda.DeviceBuffer.alloc(d, at);
++    errdefer sp.scratch.free();
++    inline for (fields) |f| @field(sp, f[0]) += sp.scratch.ptr;
++    try d.check(d.api.cuMemsetD8_v2(sp.scratch.ptr, 0, at), "cuMemsetD8");
++}
++
++/// The Drafter's shared scratch at DSpark's sizes (taps, context tables, block tables, candidates, the linears' partials).
++fn carveCommon(dr: *df.Drafter, d: *const cuda.Driver, head_n: usize) !void {
++    const M: u64 = df.MAX_M;
++    const C: u64 = CTX;
++    const chunks: u64 = (head_n + 4095) / 4096;
++    var part: u64 = 16;
++    const sp = dr.spark.?;
++    for (sp.layers) |l| {
++        for ([_]df.Lin{ l.qkv, l.kv, l.o, l.gu }) |w| if (w == .bf16) {
++            part = @max(part, mm.partBytes(64, w.bf16));
++        };
++        part = @max(part, mm.partBytes(64, l.down));
++    }
++    part = @max(part, mm.partBytes(64, sp.fc.bf16));
++    const fields = .{
++        .{ "part", part },                   .{ "gs", C * (AUX * D / 64) * 4 }, .{ "cin", C * TAP_ROW },         .{ "taps_step", df.STEP_ROWS * TAP_ROW },
++        .{ "taps_prefill", C * TAP_ROW },    .{ "ids", M * 4 },                 .{ "bpos", M * 4 },              .{ "rings", df.MAX_S * 8 },
++        .{ "starts", df.MAX_S * 8 },         .{ "froms", df.MAX_S * 8 },        .{ "cpos", C * 8 },              .{ "crings", C * 8 },
++        .{ "gtk", @import("dflash_candidates.zig").Layout.init(dr.world, M, df.CW).device * 4 }, .{ "pv", M * chunks * df.TOPK * 4 }, .{ "pi", M * chunks * df.TOPK * 4 },
++    };
++    var at: u64 = 0;
++    inline for (fields) |f| {
++        @field(dr, f[0]) = at;
++        at += std.mem.alignForward(u64, f[1], 256);
++    }
++    dr.scratch = try cuda.DeviceBuffer.alloc(d, at);
++    errdefer dr.scratch.free();
++    inline for (fields) |f| @field(dr, f[0]) += dr.scratch.ptr;
++    try d.check(d.api.cuMemsetD8_v2(dr.scratch.ptr, 0, at), "cuMemsetD8");
++}
++
++fn go(f: cuda.Function, grid: cuda.Dim3, threads: u32, e: anytype, a: *cuda.Args) !void {
++    try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = threads } }, e.stream, a);
++}
++
++fn set(e: anytype) glue.Set {
++    return .{ .glue = &e.m.glue, .mm = &e.m.mm };
++}
++
++/// out[m, n] = x[m, k] . w^T (bf16): 4 bits 16 rows a launch (the input's 64-group sums first), or glm_mm.
++fn lin(dr: *const df.Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize) !void {
++    switch (w) {
++        .bf16 => |t| try mm.matmul(&e.m.mm, e.stream, x, t.k, t, out, dr.part, m, false, false),
++        .q4 => |q| {
++            var a: cuda.Args = .{};
++            a.add(x);
++            a.add(@as(i32, @intCast(q.k)));
++            a.add(@as(i32, @intCast(q.k)));
++            a.add(dr.gs);
++            try go(dr.k.gsum, .{ .x = @intCast(m) }, 128, e, &a);
++            var r0: usize = 0;
++            while (r0 < m) : (r0 += 16) {
++                const rows = @min(16, m - r0);
++                try q4.matmul(&e.m.q4, e.stream, x + r0 * q.k * 2, q.k, dr.gs + r0 * (q.k / 64) * 4, q, out + r0 * q.n * 2, rows);
++            }
++        },
++        .q4g32 => return error.DrafterLayout,
++    }
++}
++
++fn add(sp: *const Spark, e: anytype, x: u64, y: u64, m: usize, n: usize) !void {
++    var a: cuda.Args = .{};
++    a.add(x);
++    a.add(y);
++    a.add(@as(i32, @intCast(n)));
++    try go(sp.k.add, .{ .x = @intCast(m), .y = @intCast((n + 1023) / 1024) }, 256, e, &a);
++}
++
++/// `N` context rows (cin, cpos, crings uploaded) through fc, the hidden norm and each layer's [k | v] into the rings.
++pub fn ingestPass(dr: *df.Drafter, e: anytype, N: usize) !void {
++    const sp = dr.spark.?;
++    try lin(dr, e, dr.cin, sp.fc, sp.c1, N);
++    try glue.rmsnorm(set(e), e.stream, sp.c1, D, sp.hnorm, sp.ctx, D, null, EPS, N, D);
++    for (sp.layers, 0..) |l, li| {
++        try lin(dr, e, sp.ctx, l.kv, sp.ckv, N);
++        var a: cuda.Args = .{};
++        a.add(sp.ckv);
++        a.add(l.kn);
++        a.add(dr.cpos);
++        a.add(dr.crings);
++        a.add(@as(i32, @intCast(li)));
++        a.add(EPS);
++        a.add(THETA);
++        try go(sp.k.ctx_kv, .{ .x = @intCast(N), .y = H }, 32, e, &a);
++    }
++}
++
++/// Every rank's `bytes` at buf + rank * bytes into every rank's buf, rank order (the engine's gathers' route).
++fn gather(e: anytype, buf: u64, bytes: usize) !void {
++    if (e.spans.len == 1) return;
++    if (e.group) |g| return g.allGather(e.stream, buf + e.share.rank * bytes, buf, bytes);
++    try e.lib.check(e.lib.api.ncclAllGather(buf + e.share.rank * bytes, buf, bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
++}
++
++/// The block pass for `S` streams (tables uploaded): embed, 3 layers, norm, each rank's 16 best a row, gathered.
++pub fn pass(dr: *df.Drafter, e: anytype, S: usize) !void {
++    const sp = dr.spark.?;
++    const M = S * df.BLOCK;
++    try glue.embedB16(set(e), e.stream, dr.ids, e.w.embed, sp.x, M, D, 1);
++    for (sp.layers, 0..) |l, li| {
++        try glue.rmsnorm(set(e), e.stream, sp.x, D, l.in_norm, sp.y, D, null, EPS, M, D);
++        try lin(dr, e, sp.y, l.qkv, sp.qkv, M);
++        {
++            var a: cuda.Args = .{};
++            for ([_]u64{ sp.qkv, l.qn, l.kn, dr.bpos }) |p| a.add(p);
++            a.add(EPS);
++            a.add(THETA);
++            for ([_]u64{ sp.q, sp.kb, sp.vb }) |p| a.add(p);
++            try go(sp.k.block_qkv, .{ .x = @intCast(M), .y = 2 * H }, 32, e, &a);
++        }
++        {
++            var a: cuda.Args = .{};
++            for ([_]u64{ sp.q, sp.kb, sp.vb, dr.rings, dr.starts, dr.froms }) |p| a.add(p);
++            a.add(@as(i32, @intCast(li)));
++            a.add(SCALE);
++            for ([_]u64{ sp.pm, sp.pl, sp.pacc }) |p| a.add(p);
++            try go(sp.k.attn_part, .{ .x = @intCast(S), .y = H, .z = CH + 1 }, 128, e, &a);
++            var b: cuda.Args = .{};
++            for ([_]u64{ sp.pm, sp.pl, sp.pacc, sp.att }) |p| b.add(p);
++            try go(sp.k.attn_merge, .{ .x = @intCast(M), .y = H }, HD, e, &b);
++        }
++        try lin(dr, e, sp.att, l.o, sp.a, M);
++        try add(sp, e, sp.x, sp.a, M, D);
++        try glue.rmsnorm(set(e), e.stream, sp.x, D, l.post_norm, sp.y, D, null, EPS, M, D);
++        try lin(dr, e, sp.y, l.gu, sp.gu, M);
++        {
++            var a: cuda.Args = .{};
++            a.add(sp.gu);
++            a.add(sp.act);
++            a.add(@as(i32, @intCast(FF)));
++            try go(dr.k.swiglu, .{ .x = @intCast(M), .y = @intCast((FF + 1023) / 1024) }, 256, e, &a);
++        }
++        try lin(dr, e, sp.act, .{ .bf16 = l.down }, sp.a, M);
++        try add(sp, e, sp.x, sp.a, M, D);
++    }
++    // h = norm(x) through the verifier's 4-bit draft head (this rank's vocabulary), its 16 best a row, gathered
++    try glue.rmsnorm(set(e), e.stream, sp.x, D, sp.norm, sp.hn, D, sp.xs, EPS, M, D);
++    const head = e.w.draft_head.?;
++    var r0: usize = 0;
++    while (r0 < M) : (r0 += 16) {
++        const rows = @min(16, M - r0);
++        try q4.matmul(&e.m.q4, e.stream, sp.hn + r0 * D * 2, D, sp.xs + r0 * (D / 64) * 4, head, sp.logits + r0 * head.n * 2, rows);
++    }
++    const chunks = (head.n + 4095) / 4096;
++    const nw = M * df.CW;
++    {
++        var a: cuda.Args = .{};
++        a.add(sp.logits);
++        a.add(@as(i32, @intCast(head.n)));
++        a.add(@as(i32, @intCast(e.share.vocab.lo)));
++        a.add(dr.pv);
++        a.add(dr.pi);
++        try go(dr.k.top16_part, .{ .x = @intCast(M), .y = @intCast(chunks) }, 256, e, &a);
++        var b: cuda.Args = .{};
++        b.add(dr.pv);
++        b.add(dr.pi);
++        b.add(@as(i32, @intCast(chunks)));
++        b.add(dr.gtk + e.share.rank * nw * 4);
++        try go(dr.k.top16_merge, .{ .x = @intCast(M) }, 256, e, &b);
++    }
++    try gather(e, dr.gtk, nw * 4);
++}
++
++const Cand = struct { v: f32, id: u32 };
++
++fn better(_: void, a: Cand, b: Cand) bool {
++    return if (a.v != b.v) a.v > b.v else a.id < b.id;
++}
++
++/// Stream i's drafts (rank 0, after the pass's candidates and h are read back): every rank's 16 best of slots 0..6
++/// merged (value descending, id ascending), then left to right from the anchor the Markov score and confidence.
++pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
++    const sp = dr.spark.?;
++    const out = q.out.?;
++    var prev: usize = q.anchor;
++    var alive: f64 = 1;
++    _ = &alive;
++    for (0..DRAFTS) |t| {
++        const r = i * df.BLOCK + t;
++        var c: [df.TOPK * 8]Cand = undefined;
++        var n: usize = 0;
++        for (0..dr.world) |rk| {
++            const blk = dr.cand[rk * M * df.CW + r * df.CW ..][0..df.CW];
++            for (0..df.TOPK) |j| {
++                if (blk[j] < 0 or n == c.len) continue;
++                c[n] = .{ .v = @bitCast(blk[df.TOPK + j]), .id = @intCast(blk[j]) };
++                n += 1;
++            }
++        }
++        std.mem.sort(Cand, c[0..n], {}, better);
++        n = @min(n, df.TOPK);
++        // the Markov embedding of prev, in f64 (0125: bf16 rows kept, products in f64)
++        var emb: [RANK]f64 = undefined;
++        for (&emb, sp.w1[prev * RANK ..][0..RANK]) |*o, x| o.* = bf(x);
++        var best: usize = 0;
++        var best_s: f64 = -std.math.inf(f64);
++        for (0..n) |m| {
++            var dot: f64 = 0;
++            for (sp.w2[@as(usize, c[m].id) * RANK ..][0..RANK], emb) |w, x| dot += @as(f64, bf(w)) * x;
++            const s = @as(f64, c[m].v) + dot;
++            if (s > best_s) {
++                best_s = s;
++                best = m;
++            }
++        }
++        // the confidence: sigmoid(w_h . h + w_m . W1[prev] + b)
++        var z: f64 = sp.conf_b;
++        for (sp.conf_h, sp.h_hn[r * D ..][0..D]) |w, h| z += @as(f64, w) * bf(h);
++        for (sp.conf_m, emb) |w, x| z += w * x;
++        const conf = 1.0 / (1.0 + @exp(-z));
++        if (n == 0) { // no candidate (cannot happen with a whole vocabulary): the anchor repeated, chance 0
++            for (t..DRAFTS) |k| {
++                out[k] = @intCast(prev);
++                if (q.probs) |p| p[k] = 0;
++            }
++            return;
++        }
++        prev = c[best].id;
++        out[t] = @intCast(prev);
++        if (q.probs) |p| p[t] = conf;
++    }
++}
+-- 
+2.43.0
+

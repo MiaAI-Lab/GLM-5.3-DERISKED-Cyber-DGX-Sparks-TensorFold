@@ -1,0 +1,45 @@
+From 0b23ac8c0e15ac1381765d27ad39ffeb3bc40cef Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:25:52 +0200
+Subject: [PATCH] 0309: glm_moe_dsa prompts tap nothing and skip the drafter
+ ingest
+
+df_tap reads b.x rows at a hardwired 4*hidden stride (the mHC streams'
+mean): glm_moe_dsa's residual lives in b.hidden as a single stream, so
+its last-window prompt chunks (f.taps set when a chunk reaches into the
+drafter's window) died with DsaTaps. prefillChunk now clears f.taps for
+DSA and skips dr.prompt: there is nothing to ingest, the decode-side
+verify taps (mixer's out rows) are untouched.
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+---
+ zig/src/families/glm/cuda_engine.zig | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 53764bf..217db15 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -526,7 +526,7 @@ pub const Engine = struct {
+             f.ce = null;
+             if (e.kv_ctx.counts) |c| c.owner_prompts += 1;
+         }
+-        if (start + rows <= len -| @as(usize, @intCast(dflash.WIN))) f.taps = null; // none read (dflash.promptRun)
++        if (e.c.dsa or start + rows <= len -| @as(usize, @intCast(dflash.WIN))) f.taps = null; // none read (dflash.promptRun); glm_moe_dsa can't tap its one stream
+         const as_i32: []const i32 = @ptrCast(part);
+         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
+         f.prof = e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
+@@ -555,7 +555,7 @@ pub const Engine = struct {
+         if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..]);
+         stamp.end();
+         stamp = prof_mod.span(f.prof, e.stream, .drafter);
+-        if (e.drafter) |dr| try dr.prompt(e, e.slot, start, rows, len);
++        if (e.drafter) |dr| if (!e.c.dsa) try dr.prompt(e, e.slot, start, rows, len); // glm_moe_dsa taps nothing: its one stream can't feed df_tap's 4-stream rows
+         if (e.drafter) |dr| if (start + rows == len) try dr.ringDigest(e, e.slot, len);
+         stamp.end();
+         stamp = prof_mod.span(f.prof, e.stream, .draw);
+-- 
+2.43.0
+

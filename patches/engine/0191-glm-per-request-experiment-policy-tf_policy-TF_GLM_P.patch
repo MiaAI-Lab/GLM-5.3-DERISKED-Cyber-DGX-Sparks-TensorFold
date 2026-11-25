@@ -1,0 +1,1607 @@
+From fc702510314bfd8270adb066218fa6535ca0ea11 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 17:10:44 +0200
+Subject: [PATCH 191/194] glm: per-request experiment policy (tf_policy,
+ TF_GLM_POLICY_REQUESTS=1)
+
+One boot can A/B exact kernels request by request. With
+TF_GLM_POLICY_REQUESTS=1, rank 0 takes the request body's "tf_policy" mask
+(default TF_GLM_POLICY_DEFAULT, else bit 0 from TF_GLM_DFLASH2_COUPLED),
+keeps only the bits this boot offers, and sends it in the request's begin
+step (Header.a, 0 before). Every rank holds it on the sequence until the
+slot's next begin, so it cannot change mid-request. Forwards read it
+through Forward.wants / policy.on (glue.Set.policy too). Shared windows
+and batched prompts run the bits common to all their sequences, and count
+forwards with mixed kernel bits (policy_mixed). The done line ends with
+" policy=0x.." only when an engine ran a policy.
+
+Bits (policy.zig, night/swift/POLICY.md): 0 DFlash2 coupled drafts and
+5 split-QKVA bypass are wired. 1-4 (small-row router, indexer RoPE
+hoist, multi-CTA top-2048, prefill owner rows) are reserved for their
+packages.
+- Bit 0: coupled mode per lane (Lanes.coupledOf). Coupled sampled
+  streams get their own calibration (cal[2], same prior), so a
+  single-arm boot behaves as before.
+- Bit 5: splitWanted keeps a decode window on the replicated
+  [q_a | kv_a], which is loaded beside the slices. The loader's cut
+  becomes cuda_weights.qkvaSlice; its logic is unchanged.
+
+Off (no env): the wire carries 0 and every switch and log line is as
+before. Tests: test-glm-policy-host (12), test-request-policy-host (2),
+GPU tf-cuda-test glm-qkva-split-bits (real K4 layers 3/40/77, TP3/4/6,
+rows 1-32: every split output equals the replicated projection's bits).
+
+The per-request policy broadcast follows Codex's analysis
+(docs/gpt-sol-new.md, "one immutable request policy"). Split QKVA itself
+is knapcio's gr8 PR #84 idea (patch 0149).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/build/cuda.zig                         |   1 +
+ zig/build/glm_family_host.zig              |   1 +
+ zig/src/core/engine_api.zig                |   6 +
+ zig/src/core/lane_host.zig                 |   2 +-
+ zig/src/core/lane_stream.zig               |   1 +
+ zig/src/core/lanes/stream.zig              |   5 +
+ zig/src/families/glm/cuda.zig              |   2 +
+ zig/src/families/glm/cuda_engine.zig       |  16 +-
+ zig/src/families/glm/cuda_engine_types.zig |   1 +
+ zig/src/families/glm/cuda_follow.zig       |  50 ++-
+ zig/src/families/glm/cuda_forward.zig      |  18 +-
+ zig/src/families/glm/cuda_glue.zig         |   2 +-
+ zig/src/families/glm/cuda_lanes.zig        |  63 +++-
+ zig/src/families/glm/cuda_native.zig       |  23 +-
+ zig/src/families/glm/cuda_prompts.zig      |   6 +
+ zig/src/families/glm/cuda_weights.zig      |  49 +--
+ zig/src/families/glm/policy.zig            | 116 +++++++
+ zig/src/families/glm/policy_test.zig       | 373 +++++++++++++++++++++
+ zig/src/server/chat.zig                    |  21 +-
+ zig/src/server/done_times_test.zig         |  71 +++-
+ zig/src/server/openai.zig                  |   2 +-
+ zig/src/server/responses_translate.zig     |   2 +-
+ zig/tests/cuda/glm_kv_shard_check.zig      |   6 +-
+ zig/tests/cuda/glm_lanes_tests.zig         |   2 +-
+ zig/tests/cuda/glm_paged_tests.zig         |   2 +-
+ zig/tests/cuda/glm_pair_tests.zig          |   2 +-
+ zig/tests/cuda/glm_qkva_split_bits.zig     | 129 +++++++
+ zig/tests/cuda/main.zig                    |   3 +
+ 28 files changed, 903 insertions(+), 72 deletions(-)
+ create mode 100644 zig/src/families/glm/policy.zig
+ create mode 100644 zig/src/families/glm/policy_test.zig
+ create mode 100644 zig/tests/cuda/glm_qkva_split_bits.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index e2ba56e87..3365227ed 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -416,6 +416,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     b.step("test-prompt-interior-host", "Last-user metadata excludes later messages without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"interior prompt:"} })).step);
+     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+     b.step("test-done-times-host", "Request-local done line times and lane admission on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"done times:"} })).step);
++    b.step("test-request-policy-host", "The request's tf_policy field and the done line's policy fields without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"tf_policy:"} })).step);
+     b.step("test-request-seeds-host", "Fresh and explicit request seeds and completion logs without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request seed:"} })).step);
+     const json_test = b.addRunArtifact(b.addTest(.{ .root_module = server_json }));
+     const publication = b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"benchmark publication:"} }));
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 000eec308..599d6493e 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -23,6 +23,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     const kv8_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "GLM FP8 KV:", "GLM heads:" } }));
+     b.step("test-glm-tools-host", "A request's tool list as drafts: the prompt's <tools> block, the call cursor and its forced tokens, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM tool drafts:"} })).step);
+     b.step("test-glm-kv-split-host", "TF_GLM_KV_SPLIT's ownership, head tables and switch, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"KV split:"} })).step);
++    b.step("test-glm-policy-host", "Request policies: the begin step's mask on every rank, the off state as before, bit 5's projection, DFlash2 coupled exactness, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM policy:"} })).step);
+     b.step("test-glm-dspark-host", "DSpark's host chain (candidate merge, Markov alignment, confidence) without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM DSpark:"} })).step);
+     b.step("test-glm-fp8-kv-host", "GLM latent cache layout, mode agreement and recorded CUDA launches without devices").dependOn(&kv8_run.step);
+     step.dependOn(&kv8_run.step);
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 0f0905212..aad8565ed 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -117,6 +117,8 @@ pub const Request = struct {
+     images: []const Image = &.{},
+     /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
+     cache_key: []const u32 = &.{},
++    /// The request's "tf_policy" experiment mask, as sent (null: no field); an engine takes it only when it opts in.
++    policy: ?u32 = null,
+ 
+     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
+     pub fn cacheKey(r: *const Request) []const u32 {
+@@ -167,6 +169,10 @@ pub const Stats = struct {
+     queued_seconds: f64 = 0,
+     /// The drafter's own counters as a JSON object, or empty.
+     telemetry_json: []const u8 = "",
++    /// The experiment mask the reply ran with, where the engine takes request policies (null: it does not).
++    policy: ?u32 = null,
++    /// Of its forwards, those shared with a stream of another mask (their kernel bits are the common ones).
++    policy_mixed: u32 = 0,
+ };
+ 
+ pub const Event = union(enum) {
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 5ca02b978..fc82074a7 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -276,7 +276,7 @@ pub const LaneHost = struct {
+         h.gpa.free(job.marks);
+         h.gpa.free(job.key);
+         const s = &job.stream;
+-        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .gpu_seconds = s.gpu_seconds, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
++        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .gpu_seconds = s.gpu_seconds, .policy = s.policy_used, .policy_mixed = s.policy_mixed, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
+         var told = if (job.started) recalls.finished(h, job, reason, stats) else stats;
+         told.queued_seconds = if (job.admitted_ns) |at| @as(f64, @floatFromInt(@max(0, at - job.submitted))) / 1e9 else 0;
+         emit(job, .{ .finished = .{ .reason = reason, .stats = told, .message = message } });
+diff --git a/zig/src/core/lane_stream.zig b/zig/src/core/lane_stream.zig
+index cb2b881ba..5f4a85d39 100644
+--- a/zig/src/core/lane_stream.zig
++++ b/zig/src/core/lane_stream.zig
+@@ -72,6 +72,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
+         .untaught = r.untaught,
+         .images = r.images,
+         .key = r.cache_key,
++        .policy = r.policy,
+     }) catch {
+         freeProposer(h, job);
+         recalls.release(job);
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index c3e22e786..ed3844ee9 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -144,6 +144,7 @@ pub const Spec = struct {
+     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
+     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
+     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
++    policy: ?u32 = null, // the request's experiment mask as sent (Request.policy); the backend decides what it runs
+ };
+ 
+ pub const Stream = struct {
+@@ -185,6 +186,9 @@ pub const Stream = struct {
+     untaught: bool = false,
+     images: []const Image = &.{},
+     key: []const u32 = &.{},
++    policy: ?u32 = null, // Spec.policy
++    policy_used: ?u32 = null, // the mask the backend ran the stream with (null: it takes no request policies)
++    policy_mixed: u32 = 0, // forwards it shared with a stream of another mask
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+     fill_at: std.atomic.Value(u32) = .init(0), // prompt tokens the pass has prefilled; the engine thread writes
+     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
+@@ -271,6 +275,7 @@ pub const Stream = struct {
+             .decode_spans = spec.decode_spans,
+             .images = spec.images,
+             .key = spec.key,
++            .policy = spec.policy,
+         };
+         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
+         if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index f51210c17..14a500192 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -65,6 +65,8 @@ test {
+     _ = @import("cuda_p2p.zig");
+     _ = @import("cuda_ce.zig");
+     _ = @import("cuda_lanes_test.zig");
++    _ = @import("policy.zig");
++    _ = @import("policy_test.zig");
+     _ = prompt_pair;
+     _ = prompt_solo;
+     _ = @import("cuda_disk_image.zig");
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 0d9754673..9729c4e67 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -435,7 +435,7 @@ pub const Engine = struct {
+         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
+         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
+         const twin = if (e.pair) |*p| (if (b == &p.bp) &p.pieces else null) else null;
+-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else if (e.tap_dump) |x| x.taps() else null, .side = if (b.prefill) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null, .kv = e.kvCtx(), .kvs = e.kvs, .l2pf = if (e.l2pf) |*p| p else null }; // prompt buffers (the pair's twin too) keep the shared expert on their stream; the twin's exchanges stay on NCCL (its rows are not registered)
++        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else if (e.tap_dump) |x| x.taps() else null, .side = if (b.prefill) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null, .kv = e.kvCtx(), .kvs = e.kvs, .l2pf = if (e.l2pf) |*p| p else null, .policy = e.cur.policy }; // prompt buffers (the pair's twin too) keep the shared expert on their stream; the twin's exchanges stay on NCCL (its rows are not registered)
+     }
+ 
+     /// An on-by-default switch: off only when `name` is "0".
+@@ -513,14 +513,16 @@ pub const Engine = struct {
+     }
+ 
+     /// A follower's begin: rank 0's next request; no image rows from an earlier one splice into it.
+-    pub fn beginFollowing(e: *Engine, sampling: ?sampler.Sampling) !void {
++    pub fn beginFollowing(e: *Engine, sampling: ?sampler.Sampling, policy: u32) !void {
+         if (e.images) |v| v.clear();
+-        return e.begin(sampling);
++        return e.begin(sampling, policy);
+     }
+ 
+-    /// A fresh sequence with `sampling` (null or temperature 0: greedy).
+-    pub fn begin(e: *Engine, sampling: ?sampler.Sampling) !void {
++    /// A fresh sequence with `sampling` (null or temperature 0: greedy) and the request's policy mask (policy.zig),
++    /// which its forwards run with until the next begin on the slot.
++    pub fn begin(e: *Engine, sampling: ?sampler.Sampling, policy: u32) !void {
+         e.cur.sampling = sampler.check(sampling);
++        e.cur.policy = policy;
+         e.cur.in_head = 0;
+         try e.cur.st.reset(e.stream);
+         if (e.drafter) |dr| try dr.restart(e.slot, 0);
+@@ -735,8 +737,10 @@ pub const Engine = struct {
+             @memcpy(ids[rows..][0..p.ids.len], p.ids);
+             rows += p.ids.len;
+         }
++        var masks: [max_shared]u32 = undefined;
++        for (parts, masks[0..parts.len]) |p, *m| m.* = e.seqs.items[p.slot].?.policy;
+         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
+-        var f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else if (e.tap_dump) |x| x.taps() else null, .side = e.side, .moe_fuse = e.moe_fuse, .kv = e.kvCtx(), .l2pf = if (e.l2pf) |*p| p else null };
++        var f: fw.Forward = .{ .policy = @import("policy.zig").common(masks[0..parts.len]), .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else if (e.tap_dump) |x| x.taps() else null, .side = e.side, .moe_fuse = e.moe_fuse, .kv = e.kvCtx(), .l2pf = if (e.l2pf) |*p| p else null };
+         f.prof = e.shared_profs[rows - 1];
+         if (f.prof) |p| try p.begin(e.stream, sharedLabel(rows));
+         defer if (f.prof) |p| p.end();
+diff --git a/zig/src/families/glm/cuda_engine_types.zig b/zig/src/families/glm/cuda_engine_types.zig
+index 1b9c19ab3..15746c858 100644
+--- a/zig/src/families/glm/cuda_engine_types.zig
++++ b/zig/src/families/glm/cuda_engine_types.zig
+@@ -15,6 +15,7 @@ pub const Seq = struct {
+     sampling: ?sampler.Sampling = null, // null: greedy
+     in_head: usize = 0, // drafted rows the MTP caches hold past the kept ones (st.mtp_drafted)
+     rows_at: u64 = 0, // its last verify's final-norm rows (bf16 [rows][hidden]), which the next draft reads
++    policy: u32 = 0, // the request's experiment mask (policy.zig), set at its begin on every rank
+ };
+ 
+ /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index 3cbd0e6d8..5de5d7a72 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -11,6 +11,7 @@ const dflash = @import("dflash.zig");
+ const pages_mod = @import("cuda_pages.zig");
+ const sparse = @import("cuda_sparse.zig");
+ const prompt_solo = @import("cuda_prompt_solo.zig");
++const policy_mod = @import("policy.zig");
+ const Engine = engine.Engine;
+ 
+ pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, layout };
+@@ -21,7 +22,7 @@ pub const Header = extern struct {
+     n: u32 = 0, // ids that follow
+     depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts; begin: its twin's ids (KV shard)
+     flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2), a busy step of TF_GLM_CHUNK rows (4); verify, shared: whole rows
+-    a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
++    a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length; begin: the request's policy mask (policy.zig; 0 unless TF_GLM_POLICY_REQUESTS=1)
+     seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; snapshots: the host tier asked
+     temperature: f64 = 0,
+     top_p: f64 = 0,
+@@ -140,6 +141,28 @@ pub const Link = struct {
+     }
+ };
+ 
++/// A begin step's header: sampling (flags 1), the KV shard's twin ids, and the request's policy mask in `a`.
++pub fn beginHeader(c: ?sampler.Sampling, twins: u32, policy: policy_mod.Mask) Header {
++    var h: Header = .{ .kind = @backingInt(Kind.begin), .depth = twins, .a = policy };
++    if (c) |v| {
++        h.flags = 1;
++        h.seed = v.seed;
++        h.temperature = v.temperature;
++        h.top_p = v.top_p;
++        h.min_p = v.min_p;
++        h.top_k = v.top_k;
++    }
++    return h;
++}
++
++/// What a rank begins from a begin step's header: its sampling and its policy mask.
++pub fn beginOf(h: Header) struct { sampling: ?sampler.Sampling, policy: policy_mod.Mask } {
++    return .{
++        .sampling = if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null,
++        .policy = @truncate(h.a),
++    };
++}
++
+ /// A prompt step's outcome (Leader.chunk): the first token once it ends the prompt, and the rows it took.
+ pub const Chunk = struct { first: ?u32, rows: usize };
+ 
+@@ -202,29 +225,19 @@ pub const Leader = struct {
+     }
+ 
+     pub fn begin(x: Leader, s: ?sampler.Sampling) !void {
+-        return x.beginOn(s, &.{});
++        return x.beginOn(s, &.{}, 0);
+     }
+ 
+     /// `begin` on a paged sequence: the page ids it maps (rank 0's lease) go with the step, to every rank's table.
+     /// Rank 0's own begin failing after the step went out sends a release step: the other ranks began the slot (and
+     /// mapped its pages), so they free it as the caller frees it here, and its next begin maps there again.
+-    pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32) !void {
++    /// `policy`: the request's experiment mask (policy.zig), the same on every rank for the whole request.
++    pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32, policy: policy_mod.Mask) !void {
+         try x.flush();
+         const c = sampler.check(s);
+-        var h: Header = .{ .kind = @backingInt(Kind.begin) };
+-        if (x.e.settings.kv_shard.on) if (x.e.pages) |p| { // TF_GLM_KV_SHARD: the last ids are its twin's
+-            h.depth = @intCast(p.twinCount(x.e.slot));
+-        };
+-        if (c) |v| {
+-            h.flags = 1;
+-            h.seed = v.seed;
+-            h.temperature = v.temperature;
+-            h.top_p = v.top_p;
+-            h.min_p = v.min_p;
+-            h.top_k = v.top_k;
+-        }
+-        try x.send(h, pages);
+-        x.e.begin(c) catch |err| {
++        const twins: u32 = if (x.e.settings.kv_shard.on) if (x.e.pages) |p| @intCast(p.twinCount(x.e.slot)) else 0 else 0; // TF_GLM_KV_SHARD: the last ids are its twin's
++        try x.send(beginHeader(c, twins, policy), pages);
++        x.e.begin(c, policy) catch |err| {
+             x.send(.{ .kind = @backingInt(Kind.release) }, &.{}) catch |why| std.log.err("slot {d}: the other ranks' release after rank 0's begin failed ({s}): {s}", .{ x.e.slot, @errorName(err), @errorName(why) });
+             return err;
+         };
+@@ -434,7 +447,8 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+     switch (kind) {
+         .begin => {
+             if (ids_in.len > 0) try (e.pages orelse return error.BadStep).mapWith(h.slot, ids_in, h.depth);
+-            try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
++            const b = beginOf(h);
++            try e.beginFollowing(b.sampling, b.policy);
+         },
+         .pool => {
+             if (e.pages != null) return error.BadStep;
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 084dde45e..f0204cf0e 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -27,6 +27,7 @@ const shared = @import("cuda_shared.zig");
+ const index_mod = @import("cuda_index.zig");
+ const kv_attn = @import("cuda_kv_shard_attn.zig");
+ const l2pf_mod = @import("cuda_l2pf.zig");
++const policy_mod = @import("policy.zig");
+ 
+ pub const prefill_rows = state.prefill_rows;
+ pub const window_rows = state.window_rows;
+@@ -265,6 +266,12 @@ pub const Forward = struct {
+     kv: ?*const kv_attn.Ctx = null, // TF_GLM_KV_SHARD: owner-computed attention's exchange room (null: unsharded)
+     kvs: ?*@import("cuda_kv_split.zig").Ctx = null, // TF_GLM_KV_SPLIT: each token's latent rows on one rank (null: off)
+     l2pf: ?*const l2pf_mod.L2pf = null, // TF_GLM_L2PF: a decode window's sites read their next weights into L2
++    policy: policy_mod.Mask = 0, // the request's experiment mask (policy.zig; several sequences: their common bits)
++
++    /// Whether this forward runs bit `b`'s candidate (policy.on of its mask): the switch every kernel site reads.
++    pub fn wants(f: *const Forward, b: policy_mod.Bit) bool {
++        return policy_mod.on(f.policy, b);
++    }
+ 
+     /// TF_GLM_L2PF on this forward: a decode window of this process's one rank (a prompt chunk reads at full rate).
+     pub fn prefetch(f: *const Forward) ?*const l2pf_mod.L2pf {
+@@ -272,7 +279,7 @@ pub const Forward = struct {
+     }
+ 
+     pub fn set(f: *const Forward) glue.Set {
+-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split, .hc_part = f.m.hc_part, .dscore = if (f.m.dscore) |*x| x else null };
++        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split, .hc_part = f.m.hc_part, .dscore = if (f.m.dscore) |*x| x else null, .policy = f.policy };
+     }
+ 
+     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
+@@ -403,7 +410,7 @@ pub const Forward = struct {
+     /// rank's columns into its slot of the gathered room, every rank's slots gathered by the mesh, then back into the
+     /// rows of s.dp; false (nothing run) where the replicated projection stays (a prompt chunk, no slice, no mesh).
+     fn splitProj(f: *const Forward, r: Rank, a: dsa_block.Layer, rows: usize) !bool {
+-        if (r.b.prefill or a.dec_n == 0 or f.ranks.len != 1) return false;
++        if (!splitWanted(r.b.prefill, a.dec_n, f.ranks.len, f.policy)) return false;
+         const n = switch (f.exchange) {
+             .local => return false,
+             .nccl => |x| x,
+@@ -423,6 +430,13 @@ pub const Forward = struct {
+         return true;
+     }
+ 
++    /// splitProj's own rule: a decode window of this process's one rank whose layer holds its slices, unless the
++    /// request's policy asks for the replicated projection (bit 5, qkva_bypass: the same weights a boot with
++    /// TF_GLM_DSA_SPLIT_QKVA=0 reads, loaded beside the slices).
++    pub fn splitWanted(prefill: bool, dec_n: usize, ranks: usize, mask: policy_mod.Mask) bool {
++        return !prefill and dec_n > 0 and ranks == 1 and !policy_mod.on(mask, .qkva_bypass);
++    }
++
+     /// A prompt chunk's indexer rows split across the ranks (index_split) over NCCL; in-process ranks pick every row.
+     fn indexSplit(f: *const Forward, r: Rank) ?sparse.Split {
+         if (!f.index_split or !r.b.prefill) return null;
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 91d4ec67d..7f7a534b5 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -13,7 +13,7 @@ const index_mod = @import("cuda_index.zig");
+ /// `hc_split`: hc_pre's finish on the split schedule (TF_GLM_HC_SPLIT=0: off), the same bits.
+ /// `hc_part`: hc_pre's decode dots over more blocks by rows (partSplit; TF_GLM_HC_PART), the same bits.
+ /// `dscore`: a decode window's index scores on glm_index_scores (tf_glm_scores' bytes; TF_GLM_DSCORES, default on).
+-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false, hc_split: bool = false, hc_part: PartTable = .{ .n = 0 }, dscore: ?*const index_mod.Kernels = null };
++pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false, hc_split: bool = false, hc_part: PartTable = .{ .n = 0 }, dscore: ?*const index_mod.Kernels = null, policy: @import("policy.zig").Mask = 0 };
+ 
+ /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
+ pub const Norm = union(enum) { bf16: u64, f32: u64 };
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 6b1d46d27..dc654bcae 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -11,6 +11,7 @@ const cuda = @import("cuda");
+ const rule = @import("draft_rule.zig");
+ const tool_draft = @import("tool_draft.zig");
+ const tool_carrier = @import("tool_carrier.zig");
++const policy_mod = @import("policy.zig");
+ 
+ const be = lanes.backend;
+ 
+@@ -37,7 +38,7 @@ fn costTable(comptime n: usize, comptime one: f64, comptime row: f64) [n]lanes.c
+ }
+ 
+ /// A stream's place in the backend: its sequence's slot, the rows its last verify left uncommitted, its held drafts.
+-const Lane = struct {
++pub const Lane = struct {
+     slot: u32,
+     pending_rows: ?usize = null,
+     held: [max_held]u32 = undefined,
+@@ -49,6 +50,7 @@ const Lane = struct {
+     lean: rule.Lean = .{}, // TF_GLM_DRAFT_RULE=tpm: the stream's own lean and tokens a ms
+     windows: u64 = 0, // DFlash2 windows drafted (TF_GLM_DFLASH2_FORCE's turn)
+     draft_ms: f64 = 0, // the drafter's last pass for this stream (shared passes: the whole pass)
++    policy: ?policy_mod.Mask = null, // the request's experiment mask (TF_GLM_POLICY_REQUESTS=1), fixed at its opening
+ };
+ 
+ pub const Lanes = struct {
+@@ -63,7 +65,8 @@ pub const Lanes = struct {
+     bits: ?cuda.HostBuffer = null, // structured output's grammar words (shared_rows rows), device-read, at first use
+     bits_dev: u64 = 0,
+     knobs: ?rule.Knobs = null, // the window rule's environment, read at the first DFlash2 window (rank 0 alone)
+-    cal: [2]rule.Calibration = undefined, // landing by selector chance: greedy streams', sampled streams'
++    cal: [3]rule.Calibration = undefined, // landing by selector chance: greedy streams', sampled ones', coupled sampled ones'
++    policy: policy_mod.Boot = .{}, // request policies (TF_GLM_POLICY_REQUESTS=1), read at startup (cuda_native)
+     costs: rule.Costs = undefined, // verify ms by rows, fit on lone windows
+ 
+     pub fn deinit(self: *Lanes) void {
+@@ -317,7 +320,11 @@ pub const Lanes = struct {
+             _ = self.lanes.remove(s);
+         }
+         if (self.x.e.images) |v| v.clear(); // no earlier request's rows splice into this one
+-        try self.x.beginOn(s.sampling, pages);
++        const mask = self.policy.effective(s.policy); // null: requests off, every path as the boot set it
++        self.lanes.getPtr(s).?.policy = mask;
++        s.policy_used = mask;
++        s.policy_mixed = 0;
++        try self.x.beginOn(s.sampling, pages, mask orelse 0);
+         s.cached = 0;
+         s.prompt_rows.clearRetainingCapacity();
+         return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
+@@ -525,6 +532,7 @@ pub const Lanes = struct {
+         }
+         self.x.e.structured = structured; // one window under a grammar: the whole step draws from whole rows
+         defer self.x.e.structured = false;
++        mixedPolicies(windows, lane[0..windows.len]);
+         const t0 = self.now();
+         try self.x.verifyShared(parts[0..windows.len]);
+         const ms = self.since(t0);
+@@ -538,6 +546,19 @@ pub const Lanes = struct {
+         }
+     }
+ 
++    /// A shared forward runs its streams' common policy bits (Engine.verifyShared): each stream whose mask differs from
++    /// another's in it counts the forward in its done line (policy_mixed), so an A/B can drop or rerun it.
++    pub fn mixedPolicies(windows: []const be.Window, held: []const *Lane) void {
++        const kernels = ~policy_mod.per_stream; // bit 0 is each stream's own drafting: never mixed in a forward
++        const first = (held[0].policy orelse return) & kernels;
++        const same = for (held[1..]) |l| {
++            if ((l.policy orelse 0) & kernels != first) break false;
++        } else true;
++        if (!same) for (windows) |w| {
++            w.stream.policy_mixed += 1;
++        };
++    }
++
+     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
+         const self = of(ptr);
+         for (windows, paths) |w, path| {
+@@ -605,6 +626,26 @@ pub const Lanes = struct {
+         return null;
+     }
+ 
++    /// Whether a stream's DFlash2 drafts race under its keyed noise: its request's policy bit 0 where requests take
++    /// policies (TF_GLM_POLICY_REQUESTS=1), else TF_GLM_DFLASH2_COUPLED as the first window read it (as before).
++    pub fn coupledOf(k: *const rule.Knobs, l: *const Lane) bool {
++        return if (l.policy) |m| policy_mod.on(m, .dflash2_coupled) else k.coupled;
++    }
++
++    /// The keyed race a coupled sampled stream's drafts run (the target's seed, 1 / T and top_p; dflash_select.Keyed),
++    /// null for an uncoupled or greedy one. The position is the stream's own (Engine.draftBlock: its committed length).
++    pub fn keyedOf(s: *const lanes.Stream, coupled: bool) ?@import("dflash_select.zig").Keyed {
++        if (!coupled or !sampledOf(s)) return null;
++        const p = s.sampling.?;
++        return .{ .seed = p.seed, .inv_t = @floatCast(1.0 / @max(p.temperature, 1e-6)), .top_p = @floatCast(p.top_p) };
++    }
++
++    /// The calibration a stream's windows read and feed: greedy, sampled, or sampled with coupled drafts (each arm
++    /// learns its own landing rates; with one arm a boot uses one of the two sampled ones, as before).
++    pub fn armOf(sampled: bool, coupled: bool) usize {
++        return if (!sampled) 0 else if (coupled) 2 else 1;
++    }
++
+     fn draftBlock(self: *Lanes, requests: []const be.DraftRequest) !void {
+         if (requests.len > dflash.MAX_S) return error.TooManyStreams;
+         var reqs: [dflash.MAX_S]dflash.Req = undefined;
+@@ -624,11 +665,7 @@ pub const Lanes = struct {
+                 kept = rows.len;
+                 break :a r.follow[rows.len - 1];
+             } else self.value(r.first orelse return error.NoFirstToken);
+-            const keyed: ?@import("dflash_select.zig").Keyed = if (!k.coupled or !sampledOf(r.stream)) null else .{
+-                .seed = r.stream.sampling.?.seed,
+-                .inv_t = @floatCast(1.0 / @max(r.stream.sampling.?.temperature, 1e-6)),
+-                .top_p = @floatCast(r.stream.sampling.?.top_p),
+-            };
++            const keyed = keyedOf(r.stream, coupledOf(k, l));
+             const tools = toolCursor(r, anchor);
+             const q: dflash.Req = .{ .slot = l.slot, .pos = 0, .n = kept, .anchor = anchor, .out = &l.held, .probs = &l.chances, .keyed = keyed, .tools = tools };
+             if (k.copy_skip and r.depth == 1 and r.stream.draftRoom() > 2) {
+@@ -662,7 +699,7 @@ pub const Lanes = struct {
+             if (k.forced(l.windows)) |rows| { // a diagnostic sweep: this window's rows whatever the chances
+                 for (l.chances[0..l.held_n], 0..) |*c, j| c.* = if (j + 1 < rows) 1 else 0;
+             } else if (k.rule == .tpm) {
+-                self.calibrated(l, sampledOf(r.stream), alone);
++                self.calibrated(l, armOf(sampledOf(r.stream), coupledOf(k, l)), alone);
+             } else {
+                 var chain: f64 = 1; // glm_cuda's rule: past the first, a chain stops where its product falls under the cut
+                 for (l.chances[0..l.held_n], 0..) |*c, j| {
+@@ -677,9 +714,9 @@ pub const Lanes = struct {
+ 
+     /// TF_GLM_DRAFT_RULE=tpm: each held draft's landing chance from the calibration and the stream's lean; a lone
+     /// stream's window then offers the drafts that pay (chance 1, the rest 0), a shared round's the calibrated chances.
+-    fn calibrated(self: *Lanes, l: *Lane, sampled: bool, alone: bool) void {
++    fn calibrated(self: *Lanes, l: *Lane, arm: usize, alone: bool) void {
+         const k = &self.knobs.?;
+-        const cal = &self.cal[@intFromBool(sampled)];
++        const cal = &self.cal[arm];
+         var p: [max_held]f64 = undefined;
+         for (p[0..l.held_n], l.raw[0..l.held_n]) |*o, c| o.* = l.lean.chance(cal.rate(c));
+         if (!alone) {
+@@ -696,7 +733,7 @@ pub const Lanes = struct {
+         if (self.knobs == null) {
+             const k = rule.Knobs.read(&@import("cuda_ranks.zig").environment);
+             self.knobs = k;
+-            self.cal = .{ rule.Calibration.init(k.prior, 8), rule.Calibration.init(k.prior_sampled, 8) };
++            self.cal = .{ rule.Calibration.init(k.prior, 8), rule.Calibration.init(k.prior_sampled, 8), rule.Calibration.init(k.prior_sampled, 8) };
+             self.costs = rule.Costs.init(k.verify_a, k.verify_b, 4, k.draft_ms);
+             if (k.rule == .tpm or k.trace or k.force != null)
+                 std.log.info("dflash2 windows: rule {s}, trace {}, forced {s}, verify seed {d:.2} + {d:.2} ms a row", .{ @tagName(k.rule), k.trace, k.force orelse "-", k.verify_a, k.verify_b });
+@@ -722,7 +759,7 @@ pub const Lanes = struct {
+         const mode = sampledOf(w.stream);
+         const head = w.held > 0;
+         if (head) {
+-            const cal = &self.cal[@intFromBool(mode)];
++            const cal = &self.cal[armOf(mode, coupledOf(k, l))];
+             for (0..@min(drafts.len, landed + 1)) |j| {
+                 const hit = j < landed;
+                 l.lean.observe(cal.rate(l.raw[j]), hit, k.step);
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 446274c92..81327b26e 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -14,6 +14,7 @@ const shard = @import("cuda_shard.zig");
+ const dflash = @import("dflash.zig");
+ const dflash_load = @import("dflash_load.zig");
+ const pages_mod = @import("cuda_pages.zig");
++const policy = @import("policy.zig");
+ const kv = @import("core").kv_pool;
+ 
+ pub const model_type = "glm5_next";
+@@ -339,7 +340,7 @@ fn finishRank(a: OpenArgs) !Loaded {
+         }
+     }.get;
+     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
+-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .mtp_confidence = o.mtp_confidence };
++    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .mtp_confidence = o.mtp_confidence, .policy = policyBoot(own.e) };
+     const extra: u64 = (if (own.e.drafter) |dr| dr.ringBytes() else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
+     own.layout = if (set.pages) try pages_mod.layout(gpa, own.e, extra) else null;
+     return .{
+@@ -454,6 +455,26 @@ fn close(ptr: *anyopaque) void {
+ }
+ 
+ /// What a rank owns, freed by rank 0's close and by a follower before it leaves.
++/// Request policies (policy.zig, TF_GLM_POLICY_REQUESTS=1): the bits this boot loaded what they need for. Bit 0 with
++/// DFlash2 (rank 0's selector alone; not DSpark); bit 5 where the split [q_a | kv_a] slices sit beside the replicated projection
++/// (TF_GLM_DSA_SPLIT_QKVA, the same rule on every rank). A package wiring bits 1-4 adds its bit here once its kernels
++/// and scratch are loaded at startup.
++fn policyBoot(e: *const engine.Engine) policy.Boot {
++    var b = policy.Boot.read(&ranks.environment);
++    if (!b.requests) return b;
++    if (e.drafter) |dr| if (dr.spark == null) { // DFlash2's selector races keyed drafts; DSpark's does not
++        b.offered |= policy.bit(.dflash2_coupled);
++    };
++    for (e.w.layers) |l| switch (l.mixer) {
++        .mla => |a| if (a.dec_n > 0) {
++            b.offered |= policy.bit(.qkva_bypass);
++        },
++        else => {},
++    };
++    std.log.info("request policies on (TF_GLM_POLICY_REQUESTS=1): default 0x{x}, offered 0x{x}", .{ b.default & b.offered, b.offered });
++    return b;
++}
++
+ fn release(own: *Owned) void {
+     own.link.deinit();
+     if (own.e.ce) |x| x.deinit(); // before the buffers it maps go with the engine
+diff --git a/zig/src/families/glm/cuda_prompts.zig b/zig/src/families/glm/cuda_prompts.zig
+index 11ea85e9b..0e53377c0 100644
+--- a/zig/src/families/glm/cuda_prompts.zig
++++ b/zig/src/families/glm/cuda_prompts.zig
+@@ -41,6 +41,12 @@ pub fn pass(e: anytype, parts: []const engine.Prompt, firsts: []u32, comptime Fo
+     var f: Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = &e.pieces, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(true) else null };
+     // TF_GLM_CE_EXCHANGE=1: the batched pass's split exchanges by copy engines too (the same prompt buffers and pieces)
+     if (comptime @hasField(Forward, "ce") and @hasField(@TypeOf(e.*), "ce")) f.ce = e.ce;
++    // the prompts' common policy bits (policy.zig): a kernel bit runs only where every prompt asks for it
++    if (comptime @hasField(Forward, "policy") and @hasField(@TypeOf(e.cur.*), "policy")) {
++        var masks: [engine.max_together]u32 = undefined;
++        for (parts, masks[0..parts.len]) |p, *m| m.* = e.seqs.items[p.slot].?.policy;
++        f.policy = @import("policy.zig").common(masks[0..parts.len]);
++    }
+     // TF_GLM_KV_SHARD: a prompt one rank holds alone attends owner-computed, unpieced (an engine without it: none)
+     if (comptime @hasField(@TypeOf(e.settings), "kv_shard") and @hasDecl(@TypeOf(e.*), "kvCtx")) if (e.settings.kv_shard.on) {
+         f.kv = e.kvCtx();
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 26053321f..cd8d89fee 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -81,6 +81,28 @@ fn narrow(v: f32) ?u16 {
+     return if (std.math.isNan(v) or @as(f32, @bitCast(@as(u32, h) << 16)) == v) h else null;
+ }
+ 
++/// TF_GLM_DSA_SPLIT_QKVA's cut: rank `rank`'s 64-row units of [q_a | kv_a]'s `qkva` output rows (q_a's `q_lora`
++/// first) as rows of q_a and of kv_a; null where the rule leaves the replicated projection alone (under three
++/// ranks, rows not in 64-row units, or a cut that leaves some rank none).
++pub const QkvaSlice = struct { lo: usize, hi: usize, cw: usize, n: usize, parts: [2]struct { kv: bool, lo: usize, hi: usize } };
++pub fn qkvaSlice(q_lora: usize, qkva: usize, world: usize, rank: usize) ?QkvaSlice {
++    if (world < 3 or qkva % 64 != 0) return null;
++    const cw = (qkva / 64 + world - 1) / world * 64;
++    if ((world - 1) * cw >= qkva) return null;
++    const lo = rank * cw;
++    const hi = @min(qkva, lo + cw);
++    var s: QkvaSlice = .{ .lo = lo, .hi = hi, .cw = cw, .n = 0, .parts = undefined };
++    if (lo < q_lora) {
++        s.parts[s.n] = .{ .kv = false, .lo = lo, .hi = @min(hi, q_lora) };
++        s.n += 1;
++    }
++    if (hi > q_lora) {
++        s.parts[s.n] = .{ .kv = true, .lo = @max(lo, q_lora) - q_lora, .hi = hi - q_lora };
++        s.n += 1;
++    }
++    return s;
++}
++
+ const Loader = struct {
+     gpa: std.mem.Allocator,
+     d: *const cuda.Driver,
+@@ -279,26 +301,13 @@ const Loader = struct {
+         const qkva: usize = c.q_lora + c.kv_lora + c.rope;
+         const world = L.w.share.world;
+         const split_on = if (std.c.getenv("TF_GLM_DSA_SPLIT_QKVA")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+-        if (c.dsa and !mtp and split_on and world >= 3 and qkva % 64 == 0) {
+-            const cw = (qkva / 64 + world - 1) / world * 64;
+-            if ((world - 1) * cw < qkva) {
+-                const lo = L.w.share.rank * cw;
+-                const hi = @min(qkva, lo + cw);
+-                var parts: [2]formats.Part = undefined;
+-                var np: usize = 0;
+-                if (lo < c.q_lora) {
+-                    parts[np] = .{ .rel = "self_attn.q_a_proj", .rows = .{ lo, @min(hi, c.q_lora) } };
+-                    np += 1;
+-                }
+-                if (hi > c.q_lora) {
+-                    parts[np] = .{ .rel = "self_attn.kv_a_proj_with_mqa", .rows = .{ @max(lo, c.q_lora) - c.q_lora, hi - c.q_lora } };
+-                    np += 1;
+-                }
+-                proj_dec = try formats.cutProj(L, L.pfx, i, parts[0..np], wants, "layers.{d}.dsa.proj_dec");
+-                dec_n = hi - lo;
+-                dec_cw = cw;
+-            }
+-        }
++        if (c.dsa and !mtp and split_on) if (qkvaSlice(c.q_lora, qkva, world, L.w.share.rank)) |sl| {
++            var parts: [2]formats.Part = undefined;
++            for (sl.parts[0..sl.n], parts[0..sl.n]) |q, *p| p.* = .{ .rel = if (q.kv) "self_attn.kv_a_proj_with_mqa" else "self_attn.q_a_proj", .rows = .{ q.lo, q.hi } };
++            proj_dec = try formats.cutProj(L, L.pfx, i, parts[0..sl.n], wants, "layers.{d}.dsa.proj_dec");
++            dec_n = sl.hi - sl.lo;
++            dec_cw = sl.cw;
++        };
+         try L.whole(try L.get("layers.{d}.self_attn.q_a_layernorm.weight", .{i}), .bf16);
+         const q_norm = try L.put("layers.{d}.dsa.q_norm", .{i});
+         try L.whole(try L.get("layers.{d}.self_attn.kv_a_layernorm.weight", .{i}), .bf16);
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+new file mode 100644
+index 000000000..3aa430a72
+--- /dev/null
++++ b/zig/src/families/glm/policy.zig
+@@ -0,0 +1,116 @@
++//! A request's experiment policy (TF_GLM_POLICY_REQUESTS=1): one u32 mask that picks, per request, between exact kernels
++//! every rank loaded at startup, so one boot A/B's them request by request. Rank 0 takes the mask from the request
++//! ("tf_policy"), sends it with the request's begin step (follow.Header.a) and every rank keeps it on the sequence for
++//! the whole request: nothing reads an environment or a file mid-request. Off (the default): every mask is 0 on the
++//! wire and each switch keeps its boot setting, as before. The bits and their owners: night/swift/POLICY.md.
++
++const std = @import("std");
++
++pub const Mask = u32;
++
++/// The reserved bits. A bit means "the candidate", its absence the boot's baseline path.
++pub const Bit = enum(u5) {
++    dflash2_coupled = 0, // DFlash2's drafts race under the target's keyed noise (TF_GLM_DFLASH2_COUPLED's rule), rank 0
++    router_small = 1, // small-row router kernel (1-9 rows)
++    rope_hoist = 2, // indexer query RoPE once per row
++    topk_multi_cta = 3, // multi-CTA top-2048 selection
++    owner_rows = 4, // prefill q_a/kv_a (and indexer query) on owner rows, then gather
++    qkva_bypass = 5, // a decode window's [q_a | kv_a] on the replicated projection, not the split slices
++};
++
++pub const reserved: Mask = 0x3f;
++
++/// Bits a stream uses on its own (rank 0's drafting), not in a forward: a shared forward never mixes over them.
++pub const per_stream: Mask = 1 << @backingInt(Bit.dflash2_coupled);
++
++pub fn bit(b: Bit) Mask {
++    return @as(Mask, 1) << @backingInt(b);
++}
++
++/// The one accessor every kernel site uses: whether `m` asks for bit `b`.
++pub fn on(m: Mask, b: Bit) bool {
++    return m & bit(b) != 0;
++}
++
++/// What a forward over several sequences runs: a kernel bit only where every sequence asks for it (shared verify
++/// windows, batched prompts). Exact kernels make the outputs the same either way; Boot.mixed counts such forwards.
++pub fn common(masks: []const Mask) Mask {
++    var m: Mask = std.math.maxInt(Mask);
++    for (masks) |x| m &= x;
++    return if (masks.len == 0) 0 else m;
++}
++
++/// The boot's policy settings, read once at startup (rank 0's are the ones that count: the mask crosses the wire).
++pub const Boot = struct {
++    requests: bool = false, // TF_GLM_POLICY_REQUESTS=1: a request's "tf_policy" is taken
++    default: Mask = 0, // a request without the field: TF_GLM_POLICY_DEFAULT, else bit 0 from TF_GLM_DFLASH2_COUPLED=1
++    offered: Mask = 0, // bits this boot can honour (their kernels and weights resident); the rest are dropped
++
++    pub fn read(get: *const fn ([:0]const u8) ?[]const u8) Boot {
++        var b: Boot = .{};
++        if (get("TF_GLM_POLICY_REQUESTS")) |v| b.requests = std.mem.eql(u8, v, "1");
++        if (get("TF_GLM_DFLASH2_COUPLED")) |v| if (!std.mem.eql(u8, v, "0")) {
++            b.default |= bit(.dflash2_coupled);
++        };
++        if (get("TF_GLM_POLICY_DEFAULT")) |v| b.default = parse(v) orelse b.default;
++        return b;
++    }
++
++    /// The mask a request runs with: null when requests are off (every path as the boot set it, nothing logged);
++    /// else the request's mask (or the default), less the bits this boot does not offer.
++    pub fn effective(b: Boot, asked: ?Mask) ?Mask {
++        if (!b.requests) return null;
++        return (asked orelse b.default) & b.offered & reserved;
++    }
++};
++
++/// A mask as text: decimal, or 0x hex.
++pub fn parse(text: []const u8) ?Mask {
++    const t = std.mem.trim(u8, text, " ");
++    if (std.mem.startsWith(u8, t, "0x") or std.mem.startsWith(u8, t, "0X")) return std.fmt.parseInt(Mask, t[2..], 16) catch null;
++    return std.fmt.parseInt(Mask, t, 10) catch null;
++}
++
++fn envOf(comptime pairs: anytype) *const fn ([:0]const u8) ?[]const u8 {
++    return struct {
++        fn get(name: [:0]const u8) ?[]const u8 {
++            inline for (pairs) |p| if (std.mem.eql(u8, name, p[0])) return p[1];
++            return null;
++        }
++    }.get;
++}
++
++test "GLM policy: off unless TF_GLM_POLICY_REQUESTS=1, and then the request's mask less what the boot cannot honour" {
++    const t = std.testing;
++    const off = Boot.read(envOf(.{}));
++    try t.expect(!off.requests);
++    try t.expectEqual(@as(?Mask, null), off.effective(0x21));
++    try t.expectEqual(@as(?Mask, null), off.effective(null));
++    try t.expectEqual(@as(?Mask, null), Boot.read(envOf(.{.{ "TF_GLM_POLICY_REQUESTS", "0" }})).effective(1));
++    var b = Boot.read(envOf(.{.{ "TF_GLM_POLICY_REQUESTS", "1" }}));
++    b.offered = bit(.dflash2_coupled) | bit(.qkva_bypass);
++    try t.expectEqual(@as(?Mask, 0), b.effective(null)); // no field: the default (0)
++    try t.expectEqual(@as(?Mask, 0x21), b.effective(0x21));
++    try t.expectEqual(@as(?Mask, 0x20), b.effective(0x20 | bit(.router_small) | 0x8000_0000)); // not offered: dropped
++    // the coupled env names the default arm; TF_GLM_POLICY_DEFAULT overrides it
++    var c = Boot.read(envOf(.{ .{ "TF_GLM_POLICY_REQUESTS", "1" }, .{ "TF_GLM_DFLASH2_COUPLED", "1" } }));
++    c.offered = reserved;
++    try t.expectEqual(@as(?Mask, 1), c.effective(null));
++    try t.expectEqual(@as(?Mask, 0), c.effective(0));
++    var d = Boot.read(envOf(.{ .{ "TF_GLM_POLICY_REQUESTS", "1" }, .{ "TF_GLM_DFLASH2_COUPLED", "1" }, .{ "TF_GLM_POLICY_DEFAULT", "0x20" } }));
++    d.offered = reserved;
++    try t.expectEqual(@as(?Mask, 0x20), d.effective(null));
++}
++
++test "GLM policy: the accessor, the bits' places and a shared forward's common mask" {
++    const t = std.testing;
++    try t.expectEqual(@as(Mask, 1), bit(.dflash2_coupled));
++    try t.expectEqual(@as(Mask, 0x20), bit(.qkva_bypass));
++    for (std.enums.values(Bit)) |b| try t.expect(bit(b) & reserved != 0);
++    try t.expect(on(0x21, .qkva_bypass) and on(0x21, .dflash2_coupled) and !on(0x21, .router_small));
++    try t.expectEqual(@as(Mask, 0x20), common(&.{ 0x21, 0x30 }));
++    try t.expectEqual(@as(Mask, 0), common(&.{}));
++    try t.expectEqual(@as(?Mask, 33), parse("33"));
++    try t.expectEqual(@as(?Mask, 0x21), parse("0x21"));
++    try t.expectEqual(@as(?Mask, null), parse("-1"));
++}
+diff --git a/zig/src/families/glm/policy_test.zig b/zig/src/families/glm/policy_test.zig
+new file mode 100644
+index 000000000..aff90b1f2
+--- /dev/null
++++ b/zig/src/families/glm/policy_test.zig
+@@ -0,0 +1,373 @@
++//! Request policies on the host (policy.zig): the begin step's mask on every rank, the switches' off state as before,
++//! bit 5's projection choice, and DFlash2's coupled drafts per request: the reply's tokens are the target's alone
++//! (coupled or not, drafts on or off), and the drafter's keyed race is the target's own seed and positions.
++
++const std = @import("std");
++const lanes = @import("lanes");
++const policy = @import("policy.zig");
++const follow = @import("cuda_follow.zig");
++const sampler = @import("cuda_sampler.zig");
++const fw = @import("cuda_forward.zig");
++const weights = @import("cuda_weights.zig");
++const glm_lanes = @import("cuda_lanes.zig");
++const rule = @import("draft_rule.zig");
++const df = @import("dflash.zig");
++const select = @import("dflash_select.zig");
++
++const t = std.testing;
++const Header = follow.Header;
++
++/// Rank 0's begin step as it crosses (Link.send's one-broadcast path: the header's 16 words, then the ids) and as each
++/// other rank reads it back (Link.receive), bytes for bytes.
++fn crossed(h: Header, ids: []const u32) struct { h: Header, ids: [follow.put_ids]u32, n: usize } {
++    var hh = h;
++    hh.n = @intCast(ids.len);
++    var w: follow.Words = undefined;
++    @memcpy(w.w[0..16], std.mem.bytesAsSlice(u32, std.mem.asBytes(&hh)));
++    @memcpy(w.w[16..][0..ids.len], ids);
++    var wire: [follow.head_bytes]u8 = undefined;
++    @memcpy(&wire, std.mem.asBytes(&w));
++    var first: follow.Words = undefined;
++    @memcpy(std.mem.asBytes(&first), &wire);
++    var got: Header = undefined;
++    @memcpy(std.mem.asBytes(&got), std.mem.sliceAsBytes(first.w[0..16]));
++    var out: [follow.put_ids]u32 = undefined;
++    @memcpy(out[0..got.n], first.w[16..][0..got.n]);
++    return .{ .h = got, .ids = out, .n = got.n };
++}
++
++/// The begin header as Leader.beginOn built it before request policies (75e07d0c7), for the off-state comparison.
++fn headerBefore(c: ?sampler.Sampling, twins: u32) Header {
++    var h: Header = .{ .kind = @backingInt(follow.Kind.begin) };
++    h.depth = twins;
++    if (c) |v| {
++        h.flags = 1;
++        h.seed = v.seed;
++        h.temperature = v.temperature;
++        h.top_p = v.top_p;
++        h.min_p = v.min_p;
++        h.top_k = v.top_k;
++    }
++    return h;
++}
++
++test "GLM policy: the begin step carries the request's mask to every rank, and each rank begins with rank 0's sampling and mask" {
++    const samplings = [_]?sampler.Sampling{ null, .{ .seed = 0xDEAD_BEEF_0123_4567, .temperature = 0.7, .top_p = 0.95, .top_k = 20 }, .{ .seed = 7, .temperature = 1.0, .top_p = 1.0, .top_k = 0, .min_p = 0.05 } };
++    const masks = [_]policy.Mask{ 0, 1, 0x20, 0x21, 0x3f, 0xFFFF_FFFF };
++    const pages = [_]u32{ 3, 9, 27, 81 };
++    var checked: usize = 0;
++    for (samplings) |c| for (masks) |m| for ([_]u32{ 0, 2 }) |twins| {
++        const sent = follow.beginHeader(c, twins, m);
++        // every follower reads the same broadcast: four ranks, one decode each, all equal to rank 0's own values
++        for (1..4) |_| {
++            const got = crossed(sent, &pages);
++            try t.expectEqualSlices(u8, std.mem.asBytes(&sent)[8..], std.mem.asBytes(&got.h)[8..]); // past kind and n
++            try t.expectEqualSlices(u32, &pages, got.ids[0..got.n]);
++            const b = follow.beginOf(got.h);
++            try t.expectEqual(m, b.policy);
++            try t.expectEqual(c == null, b.sampling == null);
++            if (c) |v| try t.expectEqual(v, b.sampling.?);
++            checked += 1;
++        }
++    };
++    try t.expectEqual(samplings.len * masks.len * 2 * 3, checked);
++}
++
++test "GLM policy: off (no env, or no field), the begin step's bytes are the ones sent before" {
++    const samplings = [_]?sampler.Sampling{ null, .{ .seed = 42, .temperature = 0.6, .top_p = 0.9, .top_k = 40, .min_p = 0.01 } };
++    for (samplings) |c| for ([_]u32{ 0, 1, 5 }) |twins| {
++        const before = headerBefore(c, twins);
++        const now = follow.beginHeader(c, twins, 0); // Lanes.opening sends `effective orelse 0`: requests off -> 0
++        try t.expectEqualSlices(u8, std.mem.asBytes(&before), std.mem.asBytes(&now));
++    };
++    // the boot without TF_GLM_POLICY_REQUESTS: every request, with or without "tf_policy", runs null (mask 0 on the
++    // wire, coupled from TF_GLM_DFLASH2_COUPLED as before, nothing in the done line)
++    const off: policy.Boot = .{ .offered = policy.reserved };
++    for ([_]?policy.Mask{ null, 0, 1, 0x21, 0xFFFF_FFFF }) |asked| try t.expectEqual(@as(?policy.Mask, null), off.effective(asked));
++}
++
++test "GLM policy: a lane's coupled arm and calibration: its request's bit 0 with policies on, else the boot's knob" {
++    var l: glm_lanes.Lane = .{ .slot = 0 };
++    for ([_]bool{ false, true }) |env| {
++        var k: rule.Knobs = .{};
++        k.coupled = env;
++        l.policy = null; // requests off: the knob, as before
++        try t.expectEqual(env, glm_lanes.Lanes.coupledOf(&k, &l));
++        l.policy = 0;
++        try t.expect(!glm_lanes.Lanes.coupledOf(&k, &l));
++        l.policy = policy.bit(.dflash2_coupled);
++        try t.expect(glm_lanes.Lanes.coupledOf(&k, &l));
++        l.policy = policy.bit(.qkva_bypass);
++        try t.expect(!glm_lanes.Lanes.coupledOf(&k, &l));
++    }
++    // the keyed race: a sampled stream's own seed, 1 / T and top_p; greedy streams never race
++    var s: lanes.Stream = undefined;
++    s.sampling = .{ .seed = 99, .temperature = 0.5, .top_p = 0.9 };
++    const k = glm_lanes.Lanes.keyedOf(&s, true).?;
++    try t.expectEqual(@as(u64, 99), k.seed);
++    try t.expectEqual(@as(f32, 2.0), k.inv_t);
++    try t.expectEqual(@as(f32, 0.9), k.top_p);
++    try t.expect(glm_lanes.Lanes.keyedOf(&s, false) == null);
++    s.sampling = null;
++    try t.expect(glm_lanes.Lanes.keyedOf(&s, true) == null);
++    s.sampling = .{ .seed = 1, .temperature = 0 };
++    try t.expect(glm_lanes.Lanes.keyedOf(&s, true) == null);
++}
++
++test "GLM policy: bit 5 picks the replicated [q_a | kv_a] for a decode window and nothing else changes" {
++    // splitProj's rule before request policies (75e07d0c7): split unless a prompt chunk, no slice, or several ranks here
++    const before = struct {
++        fn wanted(prefill: bool, dec_n: usize, ranks: usize) bool {
++            return !(prefill or dec_n == 0 or ranks != 1);
++        }
++    }.wanted;
++    var cases: usize = 0;
++    for ([_]bool{ false, true }) |prefill| for ([_]usize{ 0, 512, 704 }) |dec_n| for ([_]usize{ 1, 2 }) |ranks| {
++        for ([_]policy.Mask{ 0, 1, 0x1e, 0x1f }) |m| { // every mask without bit 5: the old rule
++            try t.expectEqual(before(prefill, dec_n, ranks), fw.Forward.splitWanted(prefill, dec_n, ranks, m));
++            try t.expect(!fw.Forward.splitWanted(prefill, dec_n, ranks, m | policy.bit(.qkva_bypass)));
++            cases += 1;
++        }
++    };
++    try t.expectEqual(@as(usize, 48), cases);
++    // the loader's cut (qkvaSlice) is the one it made inline before, at every world size, for GLM-5.3's 2,624 rows
++    const q_lora = 2048;
++    const qkva = 2048 + 512 + 64;
++    for (1..9) |world| for (0..world) |rank| {
++        const cw_old = (qkva / 64 + world - 1) / world * 64;
++        const on_old = world >= 3 and (world - 1) * cw_old < qkva;
++        const got = weights.qkvaSlice(q_lora, qkva, world, rank);
++        try t.expectEqual(on_old, got != null);
++        const sl = got orelse continue;
++        const lo = rank * cw_old;
++        const hi = @min(qkva, lo + cw_old);
++        try t.expectEqual(lo, sl.lo);
++        try t.expectEqual(hi, sl.hi);
++        try t.expectEqual(cw_old, sl.cw);
++        var rows: usize = 0;
++        for (sl.parts[0..sl.n]) |p| rows += p.hi - p.lo;
++        try t.expectEqual(hi - lo, rows);
++        if (lo < q_lora) try t.expect(!sl.parts[0].kv and sl.parts[0].lo == lo);
++        if (hi > q_lora) try t.expect(sl.parts[sl.n - 1].kv and sl.parts[sl.n - 1].hi == hi - q_lora);
++    };
++    try t.expectEqual(@as(usize, 704), weights.qkvaSlice(q_lora, qkva, 4, 0).?.cw); // K4 at TP4: 704, 704, 704, 512
++    try t.expectEqual(@as(usize, 512), weights.qkvaSlice(q_lora, qkva, 4, 3).?.hi - weights.qkvaSlice(q_lora, qkva, 4, 3).?.lo);
++}
++
++test "GLM policy: a shared forward runs its sequences' common bits, and a stream counts the forwards it shared with another mask" {
++    try t.expectEqual(@as(policy.Mask, 0x20), policy.common(&.{ 0x21, 0x20 }));
++    try t.expectEqual(@as(policy.Mask, 0), policy.common(&.{ 0x21, 0 }));
++    try t.expectEqual(@as(policy.Mask, 0x21), policy.common(&.{0x21}));
++}
++
++// -- DFlash2 coupled drafts: exactness and the keyed race's alignment -------------------------------------------------
++
++const V: usize = 64; // the toy vocabulary
++const window: usize = df.BLOCK - 1; // a block's drafts
++
++/// The toy target's logits at sequence index `pos` after token `prev` (a Markov model keyed by both: a draft that changed
++/// the context the target reads would change its later rows); `markov` false: by position alone, so a drafter given
++/// the target's logits is an oracle whatever it picked before (the alignment check).
++var markov = true;
++fn targetLogits(out: *[V]f32, pos: usize, prev_in: u32) void {
++    const prev: u32 = if (markov) prev_in else 0;
++    var r = std.Random.DefaultPrng.init(@as(u64, pos) *% 0x9E37_79B9 ^ (@as(u64, prev) << 32) ^ 0x5eed);
++    const g = r.random();
++    for (out) |*v| v.* = @floatCast(g.floatNorm(f64) * 2.0);
++    out[(pos * 7 + prev) % V] += 3.0; // a likely token, so drafts can land
++}
++
++/// The target's token at index `pos` after `prev`: the lane core's host reference of tf_draw (gpu_full.draw: the
++/// keyed race at the absolute position, the sampler the engine runs; test-glm-sampling holds it to the GPU's).
++fn targetToken(pos: usize, prev: u32, s: ?lanes.Sampling) !u32 {
++    var l: [V]f32 = undefined;
++    targetLogits(&l, pos, prev);
++    return lanes.gpu_full.draw(t.allocator, &l, s, @intCast(pos), null);
++}
++
++const Arm = struct { coupled: bool, drafts: bool = true, noise: f64 = 0, shift: i64 = 0 };
++const Run = struct { tokens: [400]u32 = undefined, n: usize = 0, rounds: usize = 0, drafted: usize = 0, accepted: usize = 0 };
++
++/// A reply decoded the way the engine's rounds decode it: the anchor at index `n` (the committed length: Engine.draftBlock's
++/// q.pos), the drafter's 7 drafts by dflash_select.select (keyed by Lanes.keyedOf when coupled), the verify window's row r
++/// drawn at n + 1 + r (Engine.verify: `at + 1`), its drafts kept to the first miss plus the target's token there.
++/// `shift` moves the drafter's key position (a misaligned drafter, for the control).
++fn decode(dr: *df.Drafter, prompt_last: u32, prompt_len: usize, s: ?lanes.Sampling, arm: Arm, len: usize) !Run {
++    var out: Run = .{};
++    var noise = std.Random.DefaultPrng.init(0xd1f7);
++    var stream: lanes.Stream = undefined;
++    stream.sampling = s;
++    const keyed = glm_lanes.Lanes.keyedOf(&stream, arm.coupled);
++    var n = prompt_len; // the first reply token's index: keyed at the prompt length (the lane core's first())
++    var anchor = try targetToken(n, prompt_last, s);
++    out.tokens[0] = anchor;
++    out.n = 1;
++    while (out.n < len) {
++        out.rounds += 1;
++        var drafts: [window]u32 = undefined;
++        var k: usize = 0;
++        if (arm.drafts) {
++            // the drafter's block rows: each row t's candidates are the target's logits one step down the drafter's own
++            // greedy chain (a block pass sees the anchor, not its picks), with optional noise: 16 best by value
++            var prev = anchor;
++            for (1..df.BLOCK) |tt| {
++                var l: [V]f32 = undefined;
++                targetLogits(&l, n + tt, prev);
++                for (&l) |*v| v.* += @floatCast(noise.random().floatNorm(f64) * arm.noise);
++                var order: [V]u32 = undefined;
++                for (&order, 0..) |*o, i| o.* = @intCast(i);
++                std.mem.sort(u32, &order, &l, struct {
++                    fn more(w: *const [V]f32, a: u32, b: u32) bool {
++                        return w[a] > w[b] or (w[a] == w[b] and a < b);
++                    }
++                }.more);
++                const blk = dr.cand[tt * df.CW ..][0..df.CW];
++                for (0..df.TOPK) |j| {
++                    blk[j] = @intCast(order[j]);
++                    blk[df.TOPK + j] = @bitCast(l[order[j]]);
++                }
++                prev = order[0];
++            }
++            var probs: [window]f64 = undefined;
++            const q: df.Req = .{ .slot = 0, .pos = @intCast(@as(i64, @intCast(n)) + arm.shift), .n = 0, .anchor = anchor, .out = &drafts, .probs = &probs, .keyed = keyed };
++            select.select(dr, 0, df.BLOCK, q);
++            k = window;
++        }
++        // the verify window: rows [anchor, d1..dk]; row r's draw is the token at index n + 1 + r after row r's input
++        var landed: usize = 0;
++        var prev = anchor;
++        var r: usize = 0;
++        while (true) : (r += 1) {
++            const tok = try targetToken(n + 1 + r, prev, s);
++            if (out.n < len) {
++                out.tokens[out.n] = tok;
++                out.n += 1;
++            }
++            if (r < k and drafts[r] == tok) {
++                landed += 1;
++                prev = tok;
++                continue;
++            }
++            anchor = tok;
++            break;
++        }
++        out.drafted += k;
++        out.accepted += landed;
++        n += landed + 1;
++    }
++    return out;
++}
++
++fn drafter(gpa: std.mem.Allocator) !df.Drafter {
++    var dr: df.Drafter = .{ .gpa = gpa, .d = undefined, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = df.FF, .rank = 0, .world = 1 };
++    dr.pred = try gpa.alloc(u16, V * df.RANK);
++    dr.succ = try gpa.alloc(u16, V * df.RANK);
++    @memset(dr.pred, 0); // no codebook pull: a draft is its candidate's value (and the keyed noise when coupled)
++    @memset(dr.succ, 0);
++    dr.gh = try gpa.alloc(f32, df.BLOCK * df.RANK);
++    @memset(dr.gh, 0);
++    dr.cand = try gpa.alloc(i32, df.BLOCK * df.CW);
++    @memset(dr.cand, -1);
++    return dr;
++}
++
++fn freeDrafter(gpa: std.mem.Allocator, dr: *df.Drafter) void {
++    gpa.free(dr.pred);
++    gpa.free(dr.succ);
++    gpa.free(dr.gh);
++    gpa.free(dr.cand);
++}
++
++test "GLM policy: the drafter's keyed noise is the target's (sample.cu's race_uniform, bit for bit)" {
++    var r = std.Random.DefaultPrng.init(17);
++    for (0..200_000) |_| {
++        const seed = r.random().int(u64);
++        const pos = r.random().int(u32);
++        const id = r.random().uintLessThan(u32, df.VOCAB);
++        try t.expectEqual(@as(u32, @bitCast(lanes.gpu_full.raceUniform(seed, pos, id))), @as(u32, @bitCast(select.uniform(seed, pos, id))));
++    }
++}
++
++test "GLM policy: DFlash2 coupled or not, drafts on or off, a sampled reply's tokens are the target's alone" {
++    const gpa = t.allocator;
++    var dr = try drafter(gpa);
++    defer freeDrafter(gpa, &dr);
++    const len = 400;
++    const samplings = [_]?lanes.Sampling{
++        null, // greedy: no keyed race either way
++        .{ .seed = 1234, .temperature = 1.0, .top_k = 0, .top_p = 0.95 },
++        .{ .seed = 0xFEED_FACE_CAFE_0001, .temperature = 0.7, .top_k = 20, .top_p = 0.9 },
++        .{ .seed = 5, .temperature = 1.0, .top_k = 0, .top_p = 1.0, .min_p = 0.02 },
++    };
++    markov = true;
++    for (samplings) |s| {
++        const serial = try decode(&dr, 11, 37, s, .{ .coupled = false, .drafts = false }, len);
++        try t.expectEqual(@as(usize, len), serial.n);
++        for ([_]f64{ 0, 1.0 }) |noise| for ([_]bool{ false, true }) |coupled| for ([_]i64{ 0, 1 }) |shift| {
++            const run = try decode(&dr, 11, 37, s, .{ .coupled = coupled, .noise = noise, .shift = shift }, len);
++            try t.expectEqualSlices(u32, serial.tokens[0..len], run.tokens[0..len]); // exact: the target's tokens only
++            try t.expect(run.rounds < serial.rounds); // drafts landed
++        };
++    }
++}
++
++test "GLM policy: coupled drafts land only at the target's own positions (a drafter keyed one off lands as an uncoupled one)" {
++    const gpa = t.allocator;
++    var dr = try drafter(gpa);
++    defer freeDrafter(gpa, &dr);
++    const s: lanes.Sampling = .{ .seed = 77, .temperature = 1.0, .top_k = 0, .top_p = 1.0 };
++    const len = 400;
++    markov = false;
++    defer markov = true;
++    const serial = try decode(&dr, 3, 50, s, .{ .coupled = false, .drafts = false }, len);
++    var acc: [4]f64 = undefined;
++    for ([_]Arm{ .{ .coupled = true }, .{ .coupled = false }, .{ .coupled = true, .shift = 1 }, .{ .coupled = true, .shift = -1 } }, &acc) |arm, *a| {
++        const run = try decode(&dr, 3, 50, s, arm, len);
++        try t.expectEqualSlices(u32, serial.tokens[0..len], run.tokens[0..len]); // misaligned or not: still exact
++        a.* = @as(f64, @floatFromInt(run.accepted)) / @as(f64, @floatFromInt(run.drafted));
++    }
++    // with the target's own logits as the drafter's (top_p 1: the drafter's 16 hold nearly all the mass), the aligned
++    // race picks the target's token wherever it is among them; one position off it is an independent draw
++    std.debug.print("coupled alignment (oracle drafter, T 1, top_p 1): coupled {d:.3}, uncoupled {d:.3}, keyed +1 {d:.3}, keyed -1 {d:.3}\n", .{ acc[0], acc[1], acc[2], acc[3] });
++    try t.expect(acc[0] > 0.5 and acc[0] > 4 * acc[1]); // a chain lands to its first miss: ~0.9 a draft (the 16 miss ~1 in 10)
++    try t.expect(acc[2] < acc[0] - 0.3 and acc[3] < acc[0] - 0.3);
++    try t.expect(@abs(acc[2] - acc[1]) < 0.15);
++}
++
++test "GLM policy: each arm learns its own landing rates (greedy, sampled, coupled sampled)" {
++    const k: rule.Knobs = .{};
++    var l: glm_lanes.Lane = .{ .slot = 0 };
++    // policies off and TF_GLM_DFLASH2_COUPLED off: sampled streams feed calibration 1 as before; on: calibration 2,
++    // which starts from the same prior, so a boot with one arm runs the rates it ran before
++    const L = glm_lanes.Lanes;
++    l.policy = null;
++    try t.expectEqual(@as(usize, 1), L.armOf(true, L.coupledOf(&k, &l)));
++    try t.expectEqual(@as(usize, 0), L.armOf(false, L.coupledOf(&k, &l)));
++    l.policy = 1;
++    try t.expectEqual(@as(usize, 2), L.armOf(true, L.coupledOf(&k, &l)));
++    try t.expectEqual(@as(usize, 0), L.armOf(false, L.coupledOf(&k, &l)));
++    l.policy = 0;
++    try t.expectEqual(@as(usize, 1), L.armOf(true, L.coupledOf(&k, &l)));
++}
++
++test "GLM policy: a shared round counts a forward as mixed only when its streams' kernel bits differ" {
++    var s: [2]lanes.Stream = undefined;
++    var l: [2]glm_lanes.Lane = .{ .{ .slot = 0 }, .{ .slot = 1 } };
++    const held = [_]*glm_lanes.Lane{ &l[0], &l[1] };
++    var w: [2]lanes.backend.Window = undefined;
++    for (&w, &s) |*x, *y| x.stream = y;
++    const cases = [_]struct { a: ?policy.Mask, b: ?policy.Mask, mixed: u32 }{
++        .{ .a = null, .b = null, .mixed = 0 }, // requests off: never counted
++        .{ .a = 0x20, .b = 0x20, .mixed = 0 },
++        .{ .a = 0x21, .b = 0x20, .mixed = 0 }, // bit 0 is each stream's own drafting
++        .{ .a = 0x20, .b = 0x00, .mixed = 1 },
++        .{ .a = 0x01, .b = 0x21, .mixed = 1 },
++    };
++    for (cases) |c| {
++        for (&s) |*x| x.policy_mixed = 0;
++        l[0].policy = c.a;
++        l[1].policy = c.b;
++        glm_lanes.Lanes.mixedPolicies(&w, &held);
++        for (s) |x| try t.expectEqual(c.mixed, x.policy_mixed);
++    }
++}
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 2835e2460..29e8369f7 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -110,6 +110,22 @@ fn flag(f: Value, key: []const u8) ?bool {
+     return v.truthy();
+ }
+ 
++/// ``"tf_policy"``: the request's experiment mask (an integer 0..2^32-1), passed to the engine, which takes it only
++/// when it opts in (GLM: TF_GLM_POLICY_REQUESTS=1); anything else is no field.
++pub fn policyField(f: Value) ?u32 {
++    const v = f.get("tf_policy") orelse return null;
++    const n = v.int64() orelse return null;
++    return std.math.cast(u32, n);
++}
++
++/// The done line's policy fields: the mask the reply ran with (engines that take request policies), and its forwards
++/// shared with a stream of another mask when there were any; empty otherwise, so the line is as before.
++pub fn policyText(buf: []u8, mask: ?u32, mixed: u32) []const u8 {
++    const m = mask orelse return "";
++    if (mixed > 0) return std.fmt.bufPrint(buf, " policy=0x{x} policy_mixed={d}", .{ m, mixed }) catch "";
++    return std.fmt.bufPrint(buf, " policy=0x{x}", .{m}) catch "";
++}
++
+ /// A request rendered and checked but not submitted; it holds the preparing count until generate or release.
+ pub const Prepared = struct {
+     response_channel: ResponseChannel = .automatic,
+@@ -185,6 +201,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
+         .images = rendered.images,
+         .cache_key = rendered.cache_key,
++        .policy = policyField(f),
+     };
+     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
+     errdefer srv.release(false, request);
+@@ -614,7 +631,9 @@ const Generation = struct {
+         var seed_text: [32]u8 = undefined;
+         const seed = if (g.seed) |v| std.fmt.bufPrint(&seed_text, " seed={d}", .{v}) catch unreachable else "";
+         const rate = if (decode_log_s > 0) @as(f64, @floatFromInt(decode_tokens)) / decode_log_s else 0;
+-        log.line("done {s} prompt={d} cached={d} thinking={s} effort={s} tokens={d} sha={s} finish={s}{s} rounds={d} accepted={d}/{d} ttft={d:.3} decode={d:.3} elapsed={d:.3} queued={d:.3} tok/s={d:.1}{s}", .{ g.reply_id, prompt_len, reply.cached_tokens, if (thinking) "True" else "False", if (thinking) effort orelse "none" else "none", g.collected.items.len, sha, reason, cycle, s.rounds, s.accepted, s.drafted, ttft_s, decode_log_s, @max(0, seconds(done_ns - received)), s.queued_seconds, rate, seed });
++        var policy_text: [48]u8 = undefined;
++        const policy = policyText(&policy_text, s.policy, s.policy_mixed);
++        log.line("done {s} prompt={d} cached={d} thinking={s} effort={s} tokens={d} sha={s} finish={s}{s} rounds={d} accepted={d}/{d} ttft={d:.3} decode={d:.3} elapsed={d:.3} queued={d:.3} tok/s={d:.1}{s}{s}", .{ g.reply_id, prompt_len, reply.cached_tokens, if (thinking) "True" else "False", if (thinking) effort orelse "none" else "none", g.collected.items.len, sha, reason, cycle, s.rounds, s.accepted, s.drafted, ttft_s, decode_log_s, @max(0, seconds(done_ns - received)), s.queued_seconds, rate, seed, policy });
+         return reply;
+     }
+ };
+diff --git a/zig/src/server/done_times_test.zig b/zig/src/server/done_times_test.zig
+index 20649b866..91535ceef 100644
+--- a/zig/src/server/done_times_test.zig
++++ b/zig/src/server/done_times_test.zig
+@@ -103,6 +103,8 @@ const Script = struct {
+     cached: u32 = 0,
+     tokens: []const u32 = &.{ 'h', 'i' },
+     seed: ?u64 = null,
++    policy: ?u32 = null, // the request's tf_policy as submitted
++    takes_policy: bool = false, // an engine that runs request policies: its stats carry the mask it ran
+     fn engine(s: *Script) api.Engine {
+         return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+     }
+@@ -112,10 +114,11 @@ const Script = struct {
+     fn submit(ctx: *anyopaque, id: api.Id, req: *const api.Request, sink: api.Sink) api.SubmitError!void {
+         const s: *Script = @ptrCast(@alignCast(ctx));
+         s.seed = if (req.sampling) |v| v.seed else null;
++        s.policy = req.policy;
+         Clock.ns = s.first;
+         sink.event(sink.ctx, id, &.{ .prefilled = s.cached });
+         sink.event(sink.ctx, id, &.{ .tokens = s.tokens });
+-        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop, .stats = .{ .rounds = 19, .accepted = 70, .drafted = 94, .loop_period = 3 } } });
++        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop, .stats = .{ .rounds = 19, .accepted = 70, .drafted = 94, .loop_period = 3, .policy = if (s.takes_policy) (req.policy orelse 0) else null } } });
+     }
+     fn cancel(_: *anyopaque, _: api.Id) void {}
+     fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
+@@ -415,3 +418,69 @@ test "done times: tok/s uses this request's tokens minus one and its fixed-clock
+     try rateLine(1, 500_000_000, " tok/s=0.0\n");
+     try rateLine(0, 500_000_000, " tok/s=0.0\n");
+ }
++
++test "tf_policy: an integer mask passes, anything else is no field; the done line's text only with a mask" {
++    const t = std.testing;
++    var buf: [48]u8 = undefined;
++    try t.expectEqualStrings("", chat.policyText(&buf, null, 3));
++    try t.expectEqualStrings(" policy=0x21", chat.policyText(&buf, 0x21, 0));
++    try t.expectEqualStrings(" policy=0x0 policy_mixed=2", chat.policyText(&buf, 0, 2));
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const o = try json.newObject(a);
++    const f: json.Value = .{ .object = o };
++    try t.expectEqual(@as(?u32, null), chat.policyField(f));
++    try o.put(a, "tf_policy", .{ .int = "33" });
++    try t.expectEqual(@as(?u32, 33), chat.policyField(f));
++    try o.put(a, "tf_policy", .{ .int = "-1" });
++    try t.expectEqual(@as(?u32, null), chat.policyField(f));
++    try o.put(a, "tf_policy", .{ .int = "4294967296" });
++    try t.expectEqual(@as(?u32, null), chat.policyField(f));
++    try o.put(a, "tf_policy", .{ .string = "33" });
++    try t.expectEqual(@as(?u32, null), chat.policyField(f));
++}
++
++/// A request with `fields` through chat.run to the scripted engine: the done line, and the mask the engine got.
++fn policyLine(fields: []const struct { []const u8, json.Value }, takes: bool, out: *std.ArrayList(u8)) !?u32 {
++    var capture: Capture = .{};
++    capture.start();
++    defer capture.deinit();
++    Clock.ns = 10_000_000_000;
++    var script: Script = .{ .first = 10_384_000_000, .takes_policy = takes };
++    var tt: helpers = .{};
++    const srv = try server.Server.init(std.testing.allocator, Clock.io(), script.engine(), text(&tt), .{ .served_name = "test", .model_ids = &.{"test"}, .enable_thinking = false }, null);
++    defer srv.deinit();
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var cx: Cx = .{ .a = a };
++    const o = try json.newObject(a);
++    for (fields) |kv| try o.put(a, kv[0], kv[1]);
++    var output: Output = .{ .end = script.first + 500_000_000 };
++    _ = try chat.run(srv, &cx, .{ .id = "policy", .prompt = .{ .text = "prompt" }, .max_tokens = 2, .fields = .{ .object = o } }, output.sink(), Gone{});
++    try std.testing.expect(!capture.failed);
++    const lines = capture.bytes.items;
++    const at = std.mem.lastIndexOf(u8, lines, "done ") orelse return error.NoDoneLine;
++    try out.appendSlice(std.testing.allocator, lines[at..]);
++    return script.policy;
++}
++
++test "tf_policy: the field reaches the engine, and the done line names the mask only when the engine ran one" {
++    const t = std.testing;
++    var plain: std.ArrayList(u8) = .empty;
++    defer plain.deinit(t.allocator);
++    try t.expectEqual(@as(?u32, null), try policyLine(&.{}, false, &plain));
++    try t.expect(std.mem.indexOf(u8, plain.items, " policy=") == null);
++    // an engine without request policies: the field passes, the line is the plain one byte for byte
++    var ignored: std.ArrayList(u8) = .empty;
++    defer ignored.deinit(t.allocator);
++    try t.expectEqual(@as(?u32, 33), try policyLine(&.{.{ "tf_policy", .{ .int = "33" } }}, false, &ignored));
++    try t.expectEqualStrings(plain.items, ignored.items);
++    // an engine that runs it: the line gains its mask at the end
++    var taken: std.ArrayList(u8) = .empty;
++    defer taken.deinit(t.allocator);
++    try t.expectEqual(@as(?u32, 33), try policyLine(&.{.{ "tf_policy", .{ .int = "33" } }}, true, &taken));
++    try t.expect(std.mem.endsWith(u8, taken.items, " policy=0x21\n"));
++    try t.expectEqualStrings(plain.items[0 .. plain.items.len - 1], taken.items[0 .. taken.items.len - " policy=0x21\n".len]);
++}
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 2f4d1532c..64c239471 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -153,7 +153,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+         input.temperature = if (t == .float) t.float else std.fmt.parseFloat(f64, t.int) catch 0;
+     };
+     const sampling = try json.newObject(cx.a);
+-    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "seed", "priority", "model", "draft", "thinking_budget", "ignore_eos", "return_token_ids", "stop", "grammar_budget" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
++    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "seed", "priority", "model", "draft", "thinking_budget", "ignore_eos", "return_token_ids", "stop", "grammar_budget", "tf_policy" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
+     try grammar.refusal(cx, body);
+     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
+     if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
+diff --git a/zig/src/server/responses_translate.zig b/zig/src/server/responses_translate.zig
+index a90060351..7bacab755 100644
+--- a/zig/src/server/responses_translate.zig
++++ b/zig/src/server/responses_translate.zig
+@@ -10,7 +10,7 @@ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+ 
+ /// Fields a chat completion reads as they are: OpenAI's and this server's own.
+-const passed = [_][]const u8{ "model", "temperature", "top_p", "top_k", "min_p", "seed", "stream", "parallel_tool_calls", "stop", "draft", "thinking_budget", "ignore_eos", "priority", "return_token_ids", "chat_template_kwargs", "grammar_budget" };
++const passed = [_][]const u8{ "model", "temperature", "top_p", "top_k", "min_p", "seed", "stream", "parallel_tool_calls", "stop", "draft", "thinking_budget", "ignore_eos", "priority", "return_token_ids", "chat_template_kwargs", "grammar_budget", "tf_policy" };
+ const refused = [_][2][]const u8{
+     .{ "background", "background responses are not supported: send the request and wait for it" },
+     .{ "conversation", "conversations are not supported: send previous_response_id or the items" },
+diff --git a/zig/tests/cuda/glm_kv_shard_check.zig b/zig/tests/cuda/glm_kv_shard_check.zig
+index 6322dbc24..4b0eff627 100644
+--- a/zig/tests/cuda/glm_kv_shard_check.zig
++++ b/zig/tests/cuda/glm_kv_shard_check.zig
+@@ -152,13 +152,13 @@ pub fn shardCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
+         // a live stream in the other part, so the placement is the case's, not an empty pool's
+         try x.bind(other_slot);
+         const busy = try pages.openFor(other_slot, 600, 0, 1 - c.home);
+-        try x.beginOn(null, busy);
++        try x.beginOn(null, busy, 0);
+         pages.shard.?.switches.twins = c.twin;
+         var first: [2]u32 = undefined;
+         const at: usize = glm.engine.prompt_rows; // the kept state's mark (a chunk start)
+         for ([_]u32{ sharded_slot, twin_slot }, 0..) |slot, j| {
+             try x.bind(slot);
+-            if (slot == sharded_slot) try x.beginOn(null, try pages.openFor(slot, c.len, 64, c.home)) else try x.begin(null);
++            if (slot == sharded_slot) try x.beginOn(null, try pages.openFor(slot, c.len, 64, c.home), 0) else try x.begin(null);
+             const marks: ?glm.engine.Marks = if (c.resume_part != null and slot == sharded_slot) .{ .at = &.{@as(u32, @intCast(at))}, .ctx = e, .call = keepAt } else null;
+             first[j] = try x.prefill(ids, null, null, marks);
+             try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bp.logits, V * 2), "cuMemcpyDtoH");
+@@ -172,7 +172,7 @@ pub fn shardCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
+             pages.shard.?.switches.twins = c.resume_twin;
+             if (c.disk and kept_id != 0) kept_id = try throughDisk(a, e, kept_id);
+             try x.bind(sharded_slot);
+-            try x.beginOn(null, try pages.openFor(sharded_slot, c.len, 64, rp));
++            try x.beginOn(null, try pages.openFor(sharded_slot, c.len, 64, rp), 0);
+             if (kept_id == 0) {
+                 std.debug.print("FAIL kv shard: {s}: no state was kept at {d}\n", .{ c.name, at });
+                 failed = true;
+diff --git a/zig/tests/cuda/glm_lanes_tests.zig b/zig/tests/cuda/glm_lanes_tests.zig
+index 07bac919a..525c96b36 100644
+--- a/zig/tests/cuda/glm_lanes_tests.zig
++++ b/zig/tests/cuda/glm_lanes_tests.zig
+@@ -264,7 +264,7 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank:
+         if (set.pages) {
+             const held = try e.pages.?.open(@intCast(slot), ids.len + 512, 64); // the prompt and every round's rows
+             try x.bind(@intCast(slot));
+-            try x.beginOn(sampling, held);
++            try x.beginOn(sampling, held, 0);
+         } else {
+             try x.bind(@intCast(slot));
+             try x.begin(sampling);
+diff --git a/zig/tests/cuda/glm_paged_tests.zig b/zig/tests/cuda/glm_paged_tests.zig
+index 7da2faa48..db6aab6b6 100644
+--- a/zig/tests/cuda/glm_paged_tests.zig
++++ b/zig/tests/cuda/glm_paged_tests.zig
+@@ -66,7 +66,7 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
+         var drafts: [2][glm.engine.max_drafts]u32 = undefined;
+         for ([_]u32{ paged_slot, twin_slot }, 0..) |slot, j| {
+             try x.bind(slot);
+-            if (slot == paged_slot) try x.beginOn(null, held) else try x.begin(null);
++            if (slot == paged_slot) try x.beginOn(null, held, 0) else try x.begin(null);
+             first[j] = try x.prefill(ids, null, null, null);
+             try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bp.logits, V * 2), "cuMemcpyDtoH");
+             try x.draft(true, &.{first[j]}, 2, &drafts[j], null);
+diff --git a/zig/tests/cuda/glm_pair_tests.zig b/zig/tests/cuda/glm_pair_tests.zig
+index 6e65ee1c2..7ce0d29f8 100644
+--- a/zig/tests/cuda/glm_pair_tests.zig
++++ b/zig/tests/cuda/glm_pair_tests.zig
+@@ -95,7 +95,7 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
+                 for (held[1..], held[0 .. held.len - 1]) |b, prev| unordered += @intFromBool(b != prev + 1);
+             }
+             try x.bind(slots[twin]);
+-            if (set.pages) try x.beginOn(null, held) else try x.begin(null);
++            if (set.pages) try x.beginOn(null, held, 0) else try x.begin(null);
+             const before = e.pair.?.steps;
+             var at: usize = 0;
+             const t = while (true) {
+diff --git a/zig/tests/cuda/glm_qkva_split_bits.zig b/zig/tests/cuda/glm_qkva_split_bits.zig
+new file mode 100644
+index 000000000..e0323f45d
+--- /dev/null
++++ b/zig/tests/cuda/glm_qkva_split_bits.zig
+@@ -0,0 +1,129 @@
++//! `glm-qkva-split-bits <ckpt>`: TF_GLM_DSA_SPLIT_QKVA's slices against the replicated [q_a | kv_a], bit for bit.
++//! A decode window's projection runs on the replicated weight (TF_GLM_DSA_SPLIT_QKVA=0, or request policy bit 5) or on
++//! each rank's slice (the default); both are packed from the checkpoint as the loader packs them (the slices by
++//! cuda_weights.qkvaSlice) and run through the forward's own call (qlinear decode, bf16 out). Every output of every
++//! rank's slice must equal the replicated projection's same column in every row count a window takes (1-32), so a
++//! request may pick either path and get the other's bits. Two controls show the comparison sees a difference.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const glm = @import("glm_cuda");
++const check = @import("check.zig");
++const reference = @import("quant_ref_tests.zig");
++const Rig = reference.RigT;
++const fp8pb = glm.weights.formats.fp8pb;
++
++const max_rows = 32; // shared windows' rows (cuda_engine.shared_rows), a lone window's at most
++
++/// `parts` packed for the lane (cuda_formats.fp8g's packing) and uploaded.
++fn upload(r: *Rig, parts: []const fp8pb.Share) !cuda.qmmf.Weight {
++    const z = try fp8pb.sizes(parts);
++    const codes = try r.a.alloc(u8, z.codes);
++    const tiles = try r.a.alloc(f32, z.scales);
++    try fp8pb.pack(r.a, parts, codes, tiles);
++    return cuda.fp8.weight(try r.dev(codes), try r.dev(std.mem.sliceAsBytes(tiles)), z.n, z.k);
++}
++
++/// x [m][k] times `w` as cuda_proj.matmul runs a block-FP8 projection: the lane's decode, bf16 out; host copy.
++fn project(r: *Rig, lane: *const cuda.qmmf.Lane, w: cuda.qmmf.Weight, x: u64, m: usize, out: []u16) !void {
++    var y = try cuda.DeviceBuffer.alloc(r.gpu.d, m * w.n * 2);
++    defer {
++        cuda.completion.drain(r.gpu.d, r.s, "qkva split output released before completion");
++        y.free();
++    }
++    try y.fill8(0xff, r.s.handle);
++    if (lane.partBytes(m, w) != 0) return error.SlicePartialsNotHeld;
++    const linear: cuda.qlinear.Linear = .{ .lane = lane };
++    try linear.decode(r.s, .{ .fp8g = w }, .{ .x = x, .ldx = w.k }, y.ptr, m);
++    try r.s.synchronize();
++    try y.download(0, std.mem.sliceAsBytes(out[0 .. m * w.n]));
++}
++
++pub fn run(gpu: check.Gpu, dir: []const u8) !void {
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, try std.fs.path.join(a, &.{ dir, "config.json" }), a, .limited(1 << 24));
++    const c = try glm.config.parse(gpu.gpa, text);
++    const qkva: usize = c.q_lora + c.kv_lora + c.rope;
++    var ck = try core.Checkpoint.openModel(gpu.gpa, gpu.io, dir);
++    defer ck.close();
++    var s = try cuda.Stream.init(gpu.d, false);
++    defer s.deinit();
++    var prng = std.Random.DefaultPrng.init(0x9ca_5b17);
++    var r: Rig = .{ .gpu = gpu, .a = a, .s = s, .rng = prng.random() };
++    defer {
++        cuda.completion.drain(gpu.d, s, "qkva split inputs released before completion");
++        for (r.bufs.items) |*b| b.free();
++        r.bufs.deinit(gpu.gpa);
++    }
++    var lane = try cuda.qmmf.Lane.load(gpu.d, (try gpu.ctx.capability()) / 10);
++    defer lane.unload();
++    const D: usize = c.hidden;
++    // the decode window's normed rows: bf16 [32][hidden], one draw for every check
++    const x_host = try r.bfs(max_rows * D, 1.0);
++    const x = try r.dev(std.mem.sliceAsBytes(x_host));
++    var x_bump = try r.a.dupe(u16, x_host);
++    x_bump[5] ^= 1; // one input's last mantissa bit: a control
++    const xb = try r.dev(std.mem.sliceAsBytes(x_bump));
++    const full_out = try r.a.alloc(u16, max_rows * qkva);
++    const bump_out = try r.a.alloc(u16, max_rows * qkva);
++    const part_out = try r.a.alloc(u16, max_rows * qkva);
++    var outputs: usize = 0;
++    var layers_seen: usize = 0;
++    var shift_misses: usize = 0;
++    var bump_misses: usize = 0;
++    for ([_]u32{ 3, 40, 77 }) |layer| {
++        var nb: [128]u8 = undefined;
++        var kb: [128]u8 = undefined;
++        const q_name = try std.fmt.bufPrint(&nb, "model.layers.{d}.self_attn.q_a_proj", .{layer});
++        const kv_name = try std.fmt.bufPrint(&kb, "model.layers.{d}.self_attn.kv_a_proj_with_mqa", .{layer});
++        const qa = fp8pb.Fp8pb.read(gpu.gpa, &ck, q_name) catch |err| {
++            std.debug.print("layer {d}: {s} not in the checkpoint ({s}); skipped\n", .{ layer, q_name, @errorName(err) });
++            continue;
++        };
++        defer qa.deinit(gpu.gpa);
++        const kva = try fp8pb.Fp8pb.read(gpu.gpa, &ck, kv_name);
++        defer kva.deinit(gpu.gpa);
++        try check.expect(qa.n == c.q_lora and kva.n == c.kv_lora + c.rope and qa.k == D, "layer {d}: q_a {d} x {d}, kv_a {d}", .{ layer, qa.n, qa.k, kva.n });
++        layers_seen += 1;
++        // the replicated projection as cutProj packs [q_a | kv_a] whole
++        const full = try upload(&r, &.{ .{ .p = &qa, .lo = 0, .hi = qa.n, .klo = 0, .khi = D }, .{ .p = &kva, .lo = 0, .hi = kva.n, .klo = 0, .khi = D } });
++        for ([_]usize{ 3, 4, 6 }) |world| for (0..world) |rank| {
++            const sl = glm.weights.qkvaSlice(c.q_lora, qkva, world, rank) orelse return error.NoSlice;
++            var parts: [2]fp8pb.Share = undefined;
++            for (sl.parts[0..sl.n], parts[0..sl.n]) |q, *p| p.* = .{ .p = if (q.kv) &kva else &qa, .lo = q.lo, .hi = q.hi, .klo = 0, .khi = D };
++            const w = try upload(&r, parts[0..sl.n]);
++            const n = sl.hi - sl.lo;
++            for (1..max_rows + 1) |m| {
++                try project(&r, &lane, full, x, m, full_out);
++                try project(&r, &lane, w, x, m, part_out);
++                var bad: usize = 0;
++                for (0..m) |row| for (0..n) |col| {
++                    if (full_out[row * qkva + sl.lo + col] != part_out[row * n + col]) bad += 1;
++                };
++                try check.expect(bad == 0, "layer {d} TP{d} rank {d} rows {d}: {d} of {d} outputs differ from the replicated projection", .{ layer, world, rank, m, bad, m * n });
++                outputs += m * n;
++                // control 1: the slice against the replicated columns one 64-row unit over must differ
++                if (sl.lo >= 64) {
++                    var miss: usize = 0;
++                    for (0..m) |row| for (0..n) |col| {
++                        if (full_out[row * qkva + sl.lo - 64 + col] != part_out[row * n + col]) miss += 1;
++                    };
++                    if (miss > 0) shift_misses += 1 else return error.ControlBlind;
++                }
++                // control 2: one input bit flipped moves some outputs of row 0
++                if (rank == 0 and m == 1) {
++                    try project(&r, &lane, full, xb, 1, bump_out);
++                    var miss: usize = 0;
++                    for (0..qkva) |col| {
++                        if (bump_out[col] != full_out[col]) miss += 1;
++                    }
++                    if (miss > 0) bump_misses += 1 else return error.ControlBlind;
++                }
++            }
++        };
++    }
++    try check.expect(layers_seen > 0, "no layer's [q_a | kv_a] in {s}", .{dir});
++    check.pass("glm-qkva-split-bits: {d} layers, TP3/4/6 every rank, rows 1-32: all {d} slice outputs equal the replicated projection's bits; controls differ ({d} shifted, {d} bumped)", .{ layers_seen, outputs, shift_misses, bump_misses });
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 59782eff6..6f7237303 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -105,6 +105,7 @@ const ggml_tests = @import("ggml_tests.zig");
+ const paged_tests = @import("paged_tests.zig");
+ const glm_loader_gate = @import("glm_loader_gate.zig");
+ const glm_fp8g_shares = @import("glm_fp8g_shares.zig");
++const glm_qkva_split_bits = @import("glm_qkva_split_bits.zig");
+ 
+ const gdn_back_tests = @import("gdn_back_tests.zig");
+ const q4_back_tests = @import("q4_back_tests.zig");
+@@ -272,6 +273,7 @@ const usage =
+     \\  glm-synth <dir> [fp8pb|local]  a synthetic GLM-5.3-Flash checkpoint (2 layers, 16 experts) and its dc.json for the lane checks
+     \\  glm-loader-gate <ckpt>   every rank's uploads at TP 1, 2 and 3 against the checkpoint cut on the host, byte for byte
+     \\  glm-fp8g-shares          block-FP8 TP shares packed as GLM's loader packs them, on the lane, against FP64 of the cut
++    \\  glm-qkva-split-bits <ckpt>  [q_a | kv_a]'s split slices (TP3/4/6) against the replicated projection, bit for bit
+     \\  aot-fallback <dir>        a launch's 1 from the runtime-parameter variant: the folded variant's bits (#1003)
+     \\
+ ;
+@@ -491,6 +493,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     }
+     if (std.mem.eql(u8, cmd, "glm-loader-gate")) return glm_loader_gate.run(gpu, try arg(rest, 0));
+     if (std.mem.eql(u8, cmd, "glm-fp8g-shares")) return glm_fp8g_shares.run(gpu);
++    if (std.mem.eql(u8, cmd, "glm-qkva-split-bits")) return glm_qkva_split_bits.run(gpu, try arg(rest, 0));
+     if (std.mem.startsWith(u8, cmd, "dory-")) return dory_serve.run(gpu, cmd, rest);
+     if (std.mem.eql(u8, cmd, "gemma4-states")) return @import("gemma4_states_tests.zig").states(gpu, rest);
+     if (std.mem.eql(u8, cmd, "dory")) return dory_tests.greedy(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
+-- 
+2.43.0
+

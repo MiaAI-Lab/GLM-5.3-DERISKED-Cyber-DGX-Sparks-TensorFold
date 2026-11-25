@@ -1,0 +1,262 @@
+From e3744f4166480bd9204683ad9d33d2eba4d1fad1 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Sat, 21 Nov 2026 19:20:49 +0200
+Subject: [PATCH] exl3: mul1 decode window forms (tf_exl3_grouped_2_nt4 / _k6r8
+ / _k8r8 / _k8r8s / _k8r16s / _k8r8p / _k8r16p)
+
+Decode windows of a mul1 layer (GLM-5.3-Derisked-EXL3-4bpw's 4-bit routed experts; EXLR8 v0.7's mul1_e4m3 in the e4m3
+image) always took tf_exl3_grouped_2 at 8 tiles a block: tilesFor sent every codebook but mcg there. The faster forms
+(read-once loads, dependent launches, the one-width 8-row and the 4-tile forms) are the same grouped bodies at CB 1;
+this patch instantiates them at CB 2 and tilesFor picks them for mul1 layers by the same rules as mcg's. Each gives
+tf_exl3_grouped_2's bits (same k slices, MMA chains and warp-order sums). TF_EXL3_MUL1_DECODE=0 keeps
+tf_exl3_grouped_2. mcg's kernels and choices are unchanged.
+
+Checks (spark6, GB10, sm_121; the GPU shared with another workload):
+  tf-cuda-test exl3-mul1-decode (new): runSlots on a 4-bit mul1 layer (top-8 of 288, D 4096, N 1024) at 1, 2, 3, 4,
+    8, 9, 16 and 32 rows through each form (TF_EXL3_SHFL / TF_EXL3_PDL on, PDL off, SHFL off) and 3-bit k6r8 to 8
+    rows: 30/30 byte-equal to tf_exl3_grouped_2; control: the same words on mcg give other bytes. Median time against
+    tf_exl3_grouped_2: 1 row 0.242 / 0.264 ms (1.09x), 2 rows 1.06x, 4 rows 1.03x, 8 rows 1.01x, 16 rows 0.98x,
+    32 rows 1.00x.
+  test-glm-exl3-host 24/24.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zig/kernels/cuda/exl3_experts.cu          |  25 ++++++
+ zig/src/cuda/exl3_experts.zig             |  20 ++++-
+ zig/tests/cuda/exl3_mul1_decode_tests.zig | 103 ++++++++++++++++++++++
+ zig/tests/cuda/exl3_prompt_k6_tests.zig   |   2 +-
+ zig/tests/cuda/main.zig                   |   2 +
+ 5 files changed, 147 insertions(+), 5 deletions(-)
+ create mode 100644 zig/tests/cuda/exl3_mul1_decode_tests.zig
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index e64e0034f..ae97cd03e 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -68,6 +68,31 @@ extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1,
+     tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+ }
+ 
++// The decode window forms above on the mul1 codebook (a mul1 checkpoint's experts; mul1_e4m3 in the e4m3 image): the
++// same bodies at CB 2, so each gives tf_exl3_grouped_2's bits as its mcg twin gives tf_exl3_grouped_1's
++// (cuda/exl3_experts.zig tilesFor; TF_EXL3_MUL1_DECODE=0 keeps tf_exl3_grouped_2).
++extern "C" __global__ void tf_exl3_grouped_2_nt4(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<2, 4, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++extern "C" __global__ void tf_exl3_grouped_2_k6r8(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body_v2<2, 4, 4, GROUPED_LOAD, 6, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++extern "C" __global__ void tf_exl3_grouped_2_k8r8(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body_v2<2, 4, 4, GROUPED_LOAD, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++extern "C" __global__ void tf_exl3_grouped_2_k8r8s(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body_v2<2, 4, 4, GROUPED_SHFL, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++extern "C" __global__ void tf_exl3_grouped_2_k8r16s(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body_v2<2, 4, 4, GROUPED_SHFL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++extern "C" __global__ void tf_exl3_grouped_2_k8r8p(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body_v2<2, 4, 4, GROUPED_SHFL_PDL, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++extern "C" __global__ void tf_exl3_grouped_2_k8r16p(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body_v2<2, 4, 4, GROUPED_SHFL_PDL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
+ namespace tf_exl3 {
+ 
+ struct GroupArgs {
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index 3ff8228a6..ccfecf4a1 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -115,6 +115,12 @@ pub const Experts = struct {
+     grouped_r8: [2]Function, // mcg at one width (3-bit, 4-bit), 4 tiles, 8 reduction rows: windows of up to 8 rows
+     grouped_s: [2]Function = undefined, // 4-bit mcg, every trellis word read once: 8 and 16 reduction rows (k8r8s, k8r16s)
+     grouped_p: [2]Function = undefined, // the same as dependent launches (k8r8p, k8r16p: waits, triggers)
++    // the same forms on mul1 (tf_exl3_grouped_2_*: the bits of grouped[2]); index 0 of each pair as above
++    grouped_nt4_m1: Function = undefined,
++    grouped_r8_m1: [2]Function = undefined,
++    grouped_s_m1: [2]Function = undefined,
++    grouped_p_m1: [2]Function = undefined,
++    mul1_fast: bool = true, // TF_EXL3_MUL1_DECODE=0: mul1 windows keep grouped[2] (8 tiles); the same bits either way
+     shfl: bool = true, // TF_EXL3_SHFL=0: 4-bit windows keep the lane-window loads (k8r8, nt4); the same bits either way
+     pdl: bool = true, // TF_EXL3_PDL=0: the read-once chain launches as ordinary launches; the same bits either way
+     gateup: Function,
+@@ -160,6 +166,11 @@ pub const Experts = struct {
+         e.grouped_r8 = .{ try e.mod.function("tf_exl3_grouped_1_k6r8"), try e.mod.function("tf_exl3_grouped_1_k8r8") };
+         e.grouped_s = .{ try e.mod.function("tf_exl3_grouped_1_k8r8s"), try e.mod.function("tf_exl3_grouped_1_k8r16s") };
+         e.grouped_p = .{ try e.mod.function("tf_exl3_grouped_1_k8r8p"), try e.mod.function("tf_exl3_grouped_1_k8r16p") };
++        e.grouped_nt4_m1 = try e.mod.function("tf_exl3_grouped_2_nt4");
++        e.grouped_r8_m1 = .{ try e.mod.function("tf_exl3_grouped_2_k6r8"), try e.mod.function("tf_exl3_grouped_2_k8r8") };
++        e.grouped_s_m1 = .{ try e.mod.function("tf_exl3_grouped_2_k8r8s"), try e.mod.function("tf_exl3_grouped_2_k8r16s") };
++        e.grouped_p_m1 = .{ try e.mod.function("tf_exl3_grouped_2_k8r8p"), try e.mod.function("tf_exl3_grouped_2_k8r16p") };
++        e.mul1_fast = envOn("TF_EXL3_MUL1_DECODE");
+         e.shfl = envOn("TF_EXL3_SHFL");
+         e.pdl = envOn("TF_EXL3_PDL");
+         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
+@@ -300,15 +311,16 @@ pub const Experts = struct {
+     /// `pdl`: the kernel waits before it reads the grid before's outputs, so it may launch as a dependent.
+     fn tilesFor(e: *const Experts, l: Layer, rows: usize, which: enum { gate_up, down }) struct { f: Function, nt: usize, pdl: bool = false } {
+         const n = if (which == .gate_up) l.width else l.dims;
+-        if (l.codebook != .mcg or rows > 32 or n % 64 != 0) return .{ .f = e.grouped[@backingInt(l.codebook)], .nt = 8 };
++        const m1 = l.codebook == .mul1 and e.mul1_fast; // mul1: the same forms at CB 2 (tf_exl3_grouped_2_*)
++        if (!(l.codebook == .mcg or m1) or rows > 32 or n % 64 != 0) return .{ .f = e.grouped[@backingInt(l.codebook)], .nt = 8 };
+         const k2 = if (which == .gate_up) l.uniform_k2_gu else l.uniform_k2_d;
+-        if (e.shfl and k2 == 8) return .{ .f = (if (e.pdl) e.grouped_p else e.grouped_s)[@intFromBool(rows > 8)], .nt = 4, .pdl = e.pdl };
+-        if (rows <= 8 and (k2 == 6 or k2 == 8)) return .{ .f = e.grouped_r8[@intFromBool(k2 == 8)], .nt = 4 };
++        if (e.shfl and k2 == 8) return .{ .f = (if (e.pdl) (if (m1) e.grouped_p_m1 else e.grouped_p) else (if (m1) e.grouped_s_m1 else e.grouped_s))[@intFromBool(rows > 8)], .nt = 4, .pdl = e.pdl };
++        if (rows <= 8 and (k2 == 6 or k2 == 8)) return .{ .f = (if (m1) e.grouped_r8_m1 else e.grouped_r8)[@intFromBool(k2 == 8)], .nt = 4 };
+         const four = switch (which) {
+             .gate_up => rows >= 3,
+             .down => rows == 1 or rows >= 8,
+         };
+-        return if (four) .{ .f = e.grouped_nt4, .nt = 4 } else .{ .f = e.grouped[@backingInt(l.codebook)], .nt = 8 };
++        return if (four) .{ .f = if (m1) e.grouped_nt4_m1 else e.grouped_nt4, .nt = 4 } else .{ .f = e.grouped[@backingInt(l.codebook)], .nt = 8 };
+     }
+ 
+     /// The down epilogue: each pair's FP32 output into sc.y, and with `wts` each row's sum over its slots into `out`.
+diff --git a/zig/tests/cuda/exl3_mul1_decode_tests.zig b/zig/tests/cuda/exl3_mul1_decode_tests.zig
+new file mode 100644
+index 000000000..bc8d99361
+--- /dev/null
++++ b/zig/tests/cuda/exl3_mul1_decode_tests.zig
+@@ -0,0 +1,103 @@
++//! The decode window forms on the mul1 codebook (tf_exl3_grouped_2_nt4 / _k6r8 / _k8r8 / _k8r8s / _k8r16s / _k8r8p /
++//! _k8r16p): Experts.runSlots on a 4-bit mul1 layer at 1 to 32 rows, every form (read-once with and without dependent
++//! launches, the lane-window 8-row and 4-tile forms) byte-equal to tf_exl3_grouped_2 (TF_EXL3_MUL1_DECODE=0), and
++//! their time. The synthetic layer is exl3-prompt-k6's (D 4096, N 1024, top-8 of 288).
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const k6 = @import("exl3_prompt_k6_tests.zig");
++const ex = cuda.exl3_experts;
++
++const D = k6.D;
++const K = k6.K;
++
++fn runOn(c: *k6.Ctx, exp: *const ex.Experts, l: ex.Layer, dx: u64, dpk: u64, rows: usize, out: []f32) !void {
++    var cc = c.*;
++    cc.exp = exp;
++    var s = try k6.Slots.init(&cc, l, dx, dpk, rows);
++    defer s.deinit();
++    try s.go(out);
++}
++
++fn slotsGo(s: *const k6.Slots) anyerror!void {
++    return s.go(null);
++}
++
++pub fn run(gpu: check.Gpu) !void {
++    var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
++    defer arena.deinit();
++    var stream = try cuda.Stream.init(gpu.d, false);
++    defer stream.deinit();
++    var exp = try ex.Experts.load(gpu.d);
++    defer exp.unload();
++    var pm = try cuda.Module.load(gpu.d, cuda.kernels.experts);
++    defer pm.unload();
++    var c: k6.Ctx = .{ .gpu = gpu, .a = arena.allocator(), .s = stream, .exp = &exp, .router = try cuda.grouped.Router.resolve(pm) };
++    var prng = std.Random.DefaultPrng.init(0x2b1d);
++    const rng = prng.random();
++    var b: k6.Bufs = .{ .d = gpu.d, .gpa = gpu.gpa };
++    defer b.deinit();
++    var sets = try k6.synthetic(&c, &b, rng);
++    sets[0].book = .mul1;
++    const in = try k6.inputs(&c, rng, 32);
++    const dx = try b.put(std.mem.sliceAsBytes(in.x));
++    const dpk = try b.put(std.mem.sliceAsBytes(in.pk));
++    // the oracle: every mul1 window on tf_exl3_grouped_2
++    var off = exp;
++    off.mul1_fast = false;
++    const Form = struct { name: []const u8, shfl: bool, pdl: bool };
++    const forms = [_]Form{ .{ .name = "read-once, dependent launches (k8r8p / k8r16p)", .shfl = true, .pdl = true }, .{ .name = "read-once (k8r8s / k8r16s)", .shfl = true, .pdl = false }, .{ .name = "lane windows (k8r8, nt4)", .shfl = false, .pdl = false } };
++    const want = try gpu.gpa.alloc(f32, 32 * K * D);
++    defer gpu.gpa.free(want);
++    const got = try gpu.gpa.alloc(f32, 32 * K * D);
++    defer gpu.gpa.free(got);
++    var cases: usize = 0;
++    for ([_]usize{ 1, 2, 3, 4, 8, 9, 16, 32 }) |rows| {
++        const n = rows * K * D;
++        try runOn(&c, &off, sets[0].layer(8, 8, true), dx, dpk, rows, want[0..n]);
++        for (forms) |f| {
++            var on = exp;
++            on.shfl = f.shfl;
++            on.pdl = f.pdl;
++            on.mul1_fast = true;
++            @memset(got[0..n], std.math.nan(f32));
++            try runOn(&c, &on, sets[0].layer(8, 8, true), dx, dpk, rows, got[0..n]);
++            var what: [160]u8 = undefined;
++            try check.sameBytes(try std.fmt.bufPrint(&what, "mul1 decode {d} rows, {s}", .{ rows, f.name }), std.mem.sliceAsBytes(got[0..n]), std.mem.sliceAsBytes(want[0..n]));
++            cases += 1;
++        }
++        // 3-bit mul1 at up to 8 rows: k6r8 (lane windows)
++        if (rows <= 8) {
++            try runOn(&c, &off, sets[0].layer(6, 6, true), dx, dpk, rows, want[0..n]);
++            try runOn(&c, &exp, sets[0].layer(6, 6, true), dx, dpk, rows, got[0..n]);
++            try check.sameBytes("mul1 decode 3-bit, k6r8", std.mem.sliceAsBytes(got[0..n]), std.mem.sliceAsBytes(want[0..n]));
++            cases += 1;
++        }
++        check.pass("mul1 decode, {d} rows: every form byte-equal to tf_exl3_grouped_2", .{rows});
++    }
++    // control: the same words on mcg give other bytes (the forms run the mul1 decode)
++    {
++        var mcg = sets[0];
++        mcg.book = .mcg;
++        try runOn(&c, &exp, mcg.layer(8, 8, true), dx, dpk, 8, want[0 .. 8 * K * D]);
++        try runOn(&c, &exp, sets[0].layer(8, 8, true), dx, dpk, 8, got[0 .. 8 * K * D]);
++        try check.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(got[0 .. 8 * K * D]), std.mem.sliceAsBytes(want[0 .. 8 * K * D])), "mul1 decode control: mcg and mul1 gave the same bytes", .{});
++        cases += 1;
++    }
++    // time: runSlots on the mul1 layer, fast forms (defaults) against grouped_2, interleaved rounds
++    std.debug.print("TIME mul1 decode, one layer (top-{d} of {d}, D {d}, N {d}), ms median of 5 rounds x 20: rows | forms | grouped_2 | ratio\n", .{ K, k6.E, D, k6.N });
++    for ([_]usize{ 1, 2, 4, 8, 16, 32 }) |rows| {
++        var t: [2][5]f64 = undefined;
++        for (0..5) |round| for ([_]*const ex.Experts{ &exp, &off }, 0..) |e, j| {
++            var cc = c;
++            cc.exp = e;
++            var s = try k6.Slots.init(&cc, sets[0].layer(8, 8, true), dx, dpk, rows);
++            defer s.deinit();
++            t[j][round] = try k6.timed(&cc, 20, &s, slotsGo);
++        };
++        const a = check.median(&t[0]);
++        const o = check.median(&t[1]);
++        std.debug.print("TIME {d} | {d:.4} | {d:.4} | {d:.3}x\n", .{ rows, a, o, o / a });
++    }
++    check.pass("exl3-mul1-decode: {d} cases byte-equal to tf_exl3_grouped_2", .{cases});
++}
+diff --git a/zig/tests/cuda/exl3_prompt_k6_tests.zig b/zig/tests/cuda/exl3_prompt_k6_tests.zig
+index 5b2a59471..96ee11623 100644
+--- a/zig/tests/cuda/exl3_prompt_k6_tests.zig
++++ b/zig/tests/cuda/exl3_prompt_k6_tests.zig
+@@ -102,7 +102,7 @@ fn scales(c: *Ctx, rng: std.Random, n: usize, scale: f32) ![]f16 {
+ }
+ 
+ /// Random words in 4-bit slots shared by both widths; `one` shares one input scale, `own` has each expert's.
+-fn synthetic(c: *Ctx, b: *Bufs, rng: std.Random) ![2]Set {
++pub fn synthetic(c: *Ctx, b: *Bufs, rng: std.Random) ![2]Set {
+     const slot = words(8);
+     var ptrs: [3]u64 = undefined;
+     var host: [3][]const []const i16 = undefined;
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index aca6de791..49f2df6a9 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -237,6 +237,7 @@ const usage =
+     \\  exl3-tp2 <rank> <host:port> [dir]  EXL3 tensor parallel: rank shards vs the Python engine's, all-gathered (dir none skips them)
+     \\  exl3-tiles [DIR]          EXL3's tile candidate: codebooks and tiles bit-equal, FP64, rows through qlinear and Dense
+     \\  exl3-prompt-once [DIR]     TF_GLM_PF_EXPERTS_ONCE gate/up against rot_in + gu, byte for byte (DIR: x9a layer.bin);
++    \\  exl3-mul1-decode          mul1 decode window forms (tf_exl3_grouped_2_*) byte-equal to tf_exl3_grouped_2, and their time
+     \\  exl3-prompt-k6 [DIR|none] [BASE]  EXL3 prompt kernels at 3 and 4 bits, GLM's shapes: runSlots, FP64, row bytes, time;
+     \\                            DIR adds a real layer, BASE (an earlier exl3_experts fatbin) its 4-bit bytes
+     \\  train-pack MODEL EXAMPLES [COUNT]   training passes holding several sequences against one a pass: differences, time
+@@ -425,6 +426,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "glm-conc-rows")) return @import("glm_conc_rows_tests.zig").run(gpu, if (rest.len > 0) rest[0] else return error.NeedLayerDir);
+     if (std.mem.eql(u8, cmd, "exl3-prompt-once-e4m3")) return @import("exl3_prompt_once_tests.zig").runE4m3(gpu, if (rest.len > 0) rest[0] else null);
+     if (std.mem.eql(u8, cmd, "exl3-prompt-once")) return @import("exl3_prompt_once_tests.zig").run(gpu, if (rest.len > 0) rest[0] else null);
++    if (std.mem.eql(u8, cmd, "exl3-mul1-decode")) return @import("exl3_mul1_decode_tests.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "exl3-prompt-k6")) return @import("exl3_prompt_k6_tests.zig").run(gpu, if (rest.len > 0) rest[0] else "none", if (rest.len > 1) rest[1] else null);
+     if (std.mem.eql(u8, cmd, "exl3-tp2")) return exl3_tp2_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else "none");
+     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
+-- 
+2.43.0
+

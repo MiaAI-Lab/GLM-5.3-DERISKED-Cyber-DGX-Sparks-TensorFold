@@ -1,0 +1,93 @@
+From f3a68fced0cecc28356e3556392e6677c92c4441 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 10:41:45 +0200
+Subject: [PATCH 177/178] glm_moe_dsa: the two-halves prompt path runs an EXL3
+ layer's routed experts once over the chunk
+
+Each half's call read every expert's weights (2 x 2,048 rows: 8.5 + 8.5 ms against 12.5 ms for 4,096 rows on one GB10,
+TP4 shape); the prompt profile had the experts at 48% of a 4,096-row chunk. Each half's shared expert and slot sum still
+run a half at a time: half 0's shared expert under half 1's mixer exchange, half 1's under half 0's ffn exchange.
+A pair's sums do not depend on the call holding it, so the same bits. TF_GLM_HALVES_EXPERTS_WHOLE=0: per half.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_forward.zig | 25 +++++++++++++++++++++++++
+ zig/src/families/glm/cuda_moe.zig     | 18 ++++++++++++++++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 7746d2f..ba7fee4 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -627,6 +627,13 @@ pub const Forward = struct {
+         return !std.mem.eql(u8, std.mem.span(v), "0");
+     }
+ 
++    /// TF_GLM_HALVES_EXPERTS_WHOLE (default on): in the two-halves path a MoE layer's routed experts run once over the
++    /// chunk's rows (each half's shared expert and slot sum still a half at a time, under the other half's exchange).
++    fn wholeExperts() bool {
++        const v = std.c.getenv("TF_GLM_HALVES_EXPERTS_WHOLE") orelse return true;
++        return !std.mem.eql(u8, std.mem.span(v), "0");
++    }
++
+     fn wholeDsaHalves(f: *const Forward, R: usize) !void {
+         const r = f.ranks[0];
+         const c = &r.w.config;
+@@ -676,6 +683,24 @@ pub const Forward = struct {
+                 try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h], null);
+             }
+             prof_mod.context(f.prof, j, null, .ffn);
++            if (l.ffn == .moe and l.ffn.moe.exl3 != null and wholeExperts()) { // (EXL3) the routed experts once over both halves (every expert's weights read once)
++                const m = l.ffn.moe;
++                // half 0's shared expert under half 1's mixer exchange
++                try f.stream.wait(p.gathered[0]);
++                try glue.rmsnormBy(f.set(), f.stream, hidden[0], D, l.post_norm, normed[0], D, xs[0], c.eps, rows[0], D);
++                try moe.sharedSlot(f.moeKernels(), f.stream, m, b.moe, b.normed, D, 0, rows[0]);
++                try f.stream.wait(p.gathered[1]);
++                try glue.rmsnormBy(f.set(), f.stream, hidden[1], D, l.post_norm, normed[1], D, xs[1], c.eps, rows[1], D);
++                try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, D, R, true);
++                try moe.combineRows(f.moeKernels(), f.stream, m, b.moe, 0, rows[0], part[0]);
++                try f.sideExchange(p, 0, side_comm, part[0], part[0] + span_bytes, hidden[0], rows[0], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[0] } else null);
++                // half 1's shared expert and sum under half 0's exchange
++                try moe.sharedSlot(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[1], R);
++                try moe.combineRows(f.moeKernels(), f.stream, m, b.moe, lo[1], R, part[1]);
++                try f.sideExchange(p, 1, side_comm, part[1], part[1] + span_bytes, hidden[1], rows[1], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[1] } else null);
++                di += 1;
++                continue;
++            }
+             for (0..2) |h| {
+                 try f.stream.wait(p.gathered[h]);
+                 try glue.rmsnormBy(f.set(), f.stream, hidden[h], D, l.post_norm, normed[h], D, xs[h], c.eps, rows[h], D);
+diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.zig
+index cc9b0e0..7b9cf27 100644
+--- a/zig/src/families/glm/cuda_moe.zig
++++ b/zig/src/families/glm/cuda_moe.zig
+@@ -145,6 +145,24 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
+     try glue.combine(k.set, stream, s.ey + lo * slots * d * eb, !bf16_slots, s.wts + lo * slots * 4, out, n, d, slots);
+ }
+ 
++/// A prompt chunk's shared expert of rows lo..hi into the slot rows (fill's first part, no fork): with `combineRows`, a
++/// body run over every row of the chunk is filled a piece at a time, the same kernels on the same rows as fill.
++pub fn sharedSlot(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize) !void {
++    if (forks(k, true)) return error.BadFill;
++    const stamp = prof_mod.span(k.prof, stream, .shared_expert);
++    defer stamp.end();
++    try sharedRows(k, stream, l, s, x, x_stride, lo, hi, true, true);
++}
++
++/// fill's second part on a prompt chunk: the slot sum of rows lo..hi into out fp32 [hi - lo][dims].
++pub fn combineRows(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, out: u64) !void {
++    const d = l.routed.dims;
++    const slots = l.top_k + 1;
++    const bf16_slots = bf16Rows(l, true);
++    const eb: usize = if (bf16_slots) 2 else 4;
++    try glue.combine(k.set, stream, s.ey + lo * slots * d * eb, !bf16_slots, s.wts + lo * slots * 4, out, hi - lo, d, slots);
++}
++
+ /// The shared expert of rows lo..hi on `stream`: [gate | up], SwiGLU, down into `sy`, then with `slot` its rows into the
+ /// last slot of `ey` (the grouped decode path reads `sy` itself).
+ fn sharedRows(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool, slot: bool) !void {
+-- 
+2.43.0
+

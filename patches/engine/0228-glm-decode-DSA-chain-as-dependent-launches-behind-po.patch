@@ -1,0 +1,720 @@
+From 3aaa93a0fecc6abed3b601b30690668243b831c2 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@miaai.invalid>
+Date: Sun, 22 Nov 2026 01:09:36 +0200
+Subject: [PATCH 228/230] glm: decode DSA chain as dependent launches behind
+ policy bit 8 (dsa_pdl); wait-only entry
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zig/kernels/cuda/glm_dsa_topk_multi.cuh |  8 ++++---
+ zig/kernels/cuda/glm_glue_attn.cuh      | 28 +++++++++++++++++++++++++
+ zig/kernels/cuda/glm_glue_index.cuh     | 10 +++++++++
+ zig/kernels/cuda/glm_glue_norm.cuh      |  2 ++
+ zig/kernels/cuda/glm_index_decode.cuh   | 10 ++++++---
+ zig/kernels/cuda/glm_triton.cuh         |  8 +++++++
+ zig/src/families/glm/cuda_dsa_block.zig |  8 +++----
+ zig/src/families/glm/cuda_forward.zig   |  2 +-
+ zig/src/families/glm/cuda_glue.zig      | 10 +++++----
+ zig/src/families/glm/cuda_kv_split.zig  |  2 +-
+ zig/src/families/glm/cuda_latent.zig    | 12 +++++------
+ zig/src/families/glm/cuda_native.zig    |  2 ++
+ zig/src/families/glm/cuda_sparse.zig    | 22 +++++++++----------
+ zig/src/families/glm/policy.zig         | 12 +++++++++++
+ 14 files changed, 103 insertions(+), 33 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_dsa_topk_multi.cuh b/zig/kernels/cuda/glm_dsa_topk_multi.cuh
+index 46d59e8b1..cdb9659d4 100644
+--- a/zig/kernels/cuda/glm_dsa_topk_multi.cuh
++++ b/zig/kernels/cuda/glm_dsa_topk_multi.cuh
+@@ -39,8 +39,9 @@ __device__ __forceinline__ int row_limit(int64_t np, const int* pos, int64_t r,
+ // bits[r][1][..] (words a part; bit b of word w is token 32 w + b). Rows of NP <= CAP mark nothing (the merge takes
+ // them whole); each CTA writes only its span's words below its row's NP.
+ extern "C" __global__ void __launch_bounds__(glm_dsel::T1)
+-    tf_glm_dsa_tscan(const float* __restrict__ S, int64_t np, const int* __restrict__ pos, int K, int target,
++    tf_glm_dsa_tscan(const float* S, int64_t np, const int* pos, int K, int target,
+                      uint32_t* __restrict__ bits, int64_t words) {
++  glm_triton::pdl_enter();
+   using namespace glm_dsel;
+   __shared__ int hist[256];
+   __shared__ uint32_t sh_prefix;
+@@ -105,8 +106,9 @@ extern "C" __global__ void __launch_bounds__(glm_dsel::T1)
+ // shared memory sizeof(glm_dsa_multi::Merge). PATH null or [R] int32: 0 the whole row in one select (NP <= CAP), 1 the
+ // candidates, 2 the whole row after the candidates missed (the fallback), 3 ties at the floor.
+ extern "C" __global__ void __launch_bounds__(glm_dsel::T2)
+-    tf_glm_dsa_tmerge(const float* __restrict__ S, int* __restrict__ OUT, int64_t np, const int* __restrict__ pos, int K,
+-                      const uint32_t* __restrict__ bits, int64_t words, int* __restrict__ counts, int* __restrict__ PATH) {
++    tf_glm_dsa_tmerge(const float* S, int* __restrict__ OUT, int64_t np, const int* pos, int K,
++                      const uint32_t* bits, int64_t words, int* __restrict__ counts, int* __restrict__ PATH) {
++  glm_triton::pdl_enter();
+   using namespace glm_dsel;
+   extern __shared__ __align__(16) unsigned char dsm[];
+   glm_dsa_multi::Merge& sm = *reinterpret_cast<glm_dsa_multi::Merge*>(dsm);
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index 0169b5b70..95a1555a0 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -574,6 +574,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
+                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
+                      const int* pt, int64_t pstep) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<16>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
+ }
+ 
+@@ -581,6 +582,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_32(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
+                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
+                      const int* pt, int64_t pstep) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<32>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
+ }
+ 
+@@ -589,6 +591,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+                          const int* tok, const int* cnt, float* po, float* pm, float* pl,
+                          int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<16, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
+                                  po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
+ }
+@@ -596,6 +599,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_32_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+                          const int* tok, const int* cnt, float* po, float* pm, float* pl,
+                          int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<32, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
+                                  po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
+ }
+@@ -605,6 +609,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+                                const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
+                                int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<16, true, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
+                                        po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
+ }
+@@ -612,6 +617,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_32_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+                                const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
+                                int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<32, true, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
+                                        po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
+ }
+@@ -622,6 +628,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* tok, const int* cnt,
+                            __nv_bfloat16* out, int64_t rows, int64_t heads, int64_t w, float scale, int nch,
+                            const int* pt, int64_t pstep) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_fused<16, false, false>(qa, lc, nullptr, tok, cnt, nullptr, nullptr, nullptr, rows, heads, w,
+                                                 scale, 1, pt, pstep, nullptr, out, nch);
+ }
+@@ -629,6 +636,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_32_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* tok, const int* cnt,
+                            __nv_bfloat16* out, int64_t rows, int64_t heads, int64_t w, float scale, int nch,
+                            const int* pt, int64_t pstep) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_fused<32, false, false>(qa, lc, nullptr, tok, cnt, nullptr, nullptr, nullptr, rows, heads, w,
+                                                 scale, 1, pt, pstep, nullptr, out, nch);
+ }
+@@ -636,6 +644,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_fp8_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* tok,
+                                const int* cnt, __nv_bfloat16* out, int64_t rows, int64_t heads, int64_t w, float scale,
+                                int nch) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_fused<16, true, false>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), nullptr, tok, cnt,
+                                                nullptr, nullptr, nullptr, rows, heads, w, scale, 1, nullptr, 0, scales,
+                                                out, nch);
+@@ -644,6 +653,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_32_fp8_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* tok,
+                                const int* cnt, __nv_bfloat16* out, int64_t rows, int64_t heads, int64_t w, float scale,
+                                int nch) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_fused<32, true, false>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), nullptr, tok, cnt,
+                                                nullptr, nullptr, nullptr, rows, heads, w, scale, 1, nullptr, 0, scales,
+                                                out, nch);
+@@ -652,6 +662,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_fp8_paged_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
+                                      const int* tok, const int* cnt, __nv_bfloat16* out, int64_t rows, int64_t heads,
+                                      int64_t w, float scale, int nch, const int* pt, int64_t pstep) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_fused<16, true, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), nullptr, tok, cnt,
+                                               nullptr, nullptr, nullptr, rows, heads, w, scale, 1, pt, pstep, scales,
+                                               out, nch);
+@@ -660,6 +671,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_32_fp8_paged_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
+                                      const int* tok, const int* cnt, __nv_bfloat16* out, int64_t rows, int64_t heads,
+                                      int64_t w, float scale, int nch, const int* pt, int64_t pstep) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_fused<32, true, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), nullptr, tok, cnt,
+                                               nullptr, nullptr, nullptr, rows, heads, w, scale, 1, pt, pstep, scales,
+                                               out, nch);
+@@ -673,6 +685,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_w576(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                           const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                           float scale, int sparse, const int* pt, int64_t pstep) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<16, false, false, glm_attn::DSA_LW>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale,
+                                                             sparse, pt, pstep);
+ }
+@@ -682,6 +695,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_w576_s4(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                              const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                              float scale, int sparse, const int* pt, int64_t pstep) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<16, false, false, glm_attn::DSA_LW, glm_attn::CH / 4>(qa, lc, pos, tok, cnt, po, pm, pl, rows,
+                                                                             heads, w, scale, sparse, pt, pstep);
+ }
+@@ -689,6 +703,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_fused_w576(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* tok, const int* cnt,
+                                 __nv_bfloat16* out, int64_t rows, int64_t heads, int64_t w, float scale, int nch,
+                                 const int* pt, int64_t pstep) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_fused<16, false, false, glm_attn::DSA_LW>(qa, lc, nullptr, tok, cnt, nullptr, nullptr, nullptr,
+                                                              rows, heads, w, scale, 1, pt, pstep, nullptr, out, nch);
+ }
+@@ -700,6 +715,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_w576_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+                               const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
+                               int64_t heads, int64_t w, float scale, int sparse) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<16, true, false, glm_attn::DSA_LW>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok,
+                                                            cnt, po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0,
+                                                            scales);
+@@ -708,6 +724,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_w576_s4_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
+                                  const int* pos, const int* tok, const int* cnt, float* po, float* pm, float* pl,
+                                  int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<16, true, false, glm_attn::DSA_LW, glm_attn::CH / 4>(
+       qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse,
+       nullptr, 0, scales);
+@@ -716,6 +733,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_fused_w576_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
+                                     const int* tok, const int* cnt, __nv_bfloat16* out, int64_t rows, int64_t heads,
+                                     int64_t w, float scale, int nch) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_fused<16, true, false, glm_attn::DSA_LW>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), nullptr,
+                                                             tok, cnt, nullptr, nullptr, nullptr, rows, heads, w, scale,
+                                                             1, nullptr, 0, scales, out, nch);
+@@ -726,6 +744,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_w576_i8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+                              const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
+                              int64_t heads, int64_t w, float scale, int sparse) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<16, true, false, glm_attn::DSA_LW, glm_attn::CH, true>(
+       qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, nullptr,
+       0, scales);
+@@ -742,6 +761,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_w576_s4_i8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
+                                 const int* pos, const int* tok, const int* cnt, float* po, float* pm, float* pl,
+                                 int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_wide<16, true, false, glm_attn::DSA_LW, glm_attn::CH / 4, true>(
+       qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse,
+       nullptr, 0, scales);
+@@ -750,6 +770,7 @@ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_fused_w576_i8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
+                                    const int* tok, const int* cnt, __nv_bfloat16* out, int64_t rows, int64_t heads,
+                                    int64_t w, float scale, int nch) {
++  glm_triton::pdl_enter();
+   glm_attn::chunks_fused<16, true, false, glm_attn::DSA_LW, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc),
+                                                                   nullptr, tok, cnt, nullptr, nullptr, nullptr, rows,
+                                                                   heads, w, scale, 1, nullptr, 0, scales, out, nch);
+@@ -759,6 +780,7 @@ extern "C" __global__ void __launch_bounds__(256)
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
+                  int64_t heads, int nch, int sparse) {
++  glm_triton::pdl_enter();
+   constexpr int LW = glm_attn::LW;
+   const int64_t r = blockIdx.x, h = blockIdx.y;
+   if (sparse && cnt[r] == 0) return;
+@@ -847,6 +869,7 @@ __device__ __forceinline__ const AttnSeg& seg_of(const AttnSegs& t, int row) {
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_fp8_paged_segs(int64_t heads, int64_t w, float scale, int sparse, int64_t pstep,
+                                     const glm_attn::AttnSegs t) {
++  glm_triton::pdl_enter();
+   const glm_attn::AttnSeg& g = glm_attn::seg_of(t, static_cast<int>(blockIdx.x));
+   const int64_t c = blockIdx.z;
+   if (c >= g.nch) return;  // past the segment's own grid
+@@ -857,6 +880,7 @@ extern "C" __global__ void __launch_bounds__(256)
+ 
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_merge_segs(__nv_bfloat16* out, int64_t heads, int sparse, const glm_attn::AttnSegs t) {
++  glm_triton::pdl_enter();
+   const glm_attn::AttnSeg& g = glm_attn::seg_of(t, static_cast<int>(blockIdx.x));
+   glm_attn::merge_body(g.po, g.pm, g.pl, out + static_cast<int64_t>(g.row0) * heads * glm_attn::LW, g.cnt, g.rows,
+                        heads, g.nch, sparse, static_cast<int64_t>(blockIdx.x) - g.row0);
+@@ -867,6 +891,7 @@ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_scores(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const __nv_bfloat16* pk,
+                   float* out, const int* pos, int64_t np, int64_t nb, float scale, float wscale, int64_t heads,
+                   int loop, const int* pt, int64_t ps) {
++  glm_triton::pdl_enter();
+   constexpr int D = 128, HP = 32, BP = 64;
+   __shared__ __align__(16) __nv_bfloat16 sm[4 * 2 * 16 * D];  // q's 32 rows, then each warp's two 16-pool buffers
+   auto at = [](int row, int u) { return row * D + ((u ^ (row & 7)) << 3); };
+@@ -954,6 +979,7 @@ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_dsa_scores(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const __nv_bfloat16* ik,
+                       float* out, const int* pos, int64_t np, int64_t nb, float scale, float wscale, int64_t heads,
+                       int loop, const float* inv) {
++  glm_triton::pdl_enter();
+   constexpr int D = 128, HP = 32, BP = 64, ROPE = 64;
+   __shared__ __align__(16) __nv_bfloat16 sm[4 * 2 * 16 * D];  // q's 32 rows, then each warp's two 16-key buffers
+   auto at = [](int row, int u) { return row * D + ((u ^ (row & 7)) << 3); };
+@@ -1070,6 +1096,7 @@ extern "C" __global__ void __launch_bounds__(128)
+                             const __nv_bfloat16* ik,
+                             float* out, const int* pos, int64_t np, int64_t nb, float scale, float wscale,
+                             int64_t heads, int loop, const float* inv) {
++  glm_triton::pdl_enter();
+   constexpr int D = 128, HP = 32, BP = 64;
+   __shared__ __align__(16) __nv_bfloat16 sm[4 * 2 * 16 * D];  // q's 32 rows (roped), then each warp's two 16-key buffers
+   auto at = [](int row, int u) { return row * D + ((u ^ (row & 7)) << 3); };
+@@ -1157,6 +1184,7 @@ extern "C" __global__ void __launch_bounds__(128)
+ // memory holds after its rope, so its fragments, dots, ReLU, head weights and reduction see the same values.
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_dsa_qrope(const __nv_bfloat16* qi, __nv_bfloat16* qr, const int* pos, int64_t heads, const float* inv) {
++  glm_triton::pdl_enter();
+   constexpr int D = 128, ROPE = 64;
+   const int64_t r = blockIdx.x;
+   const int p = pos[0] + (int)r;
+diff --git a/zig/kernels/cuda/glm_glue_index.cuh b/zig/kernels/cuda/glm_glue_index.cuh
+index b1eb92361..1890fa39b 100644
+--- a/zig/kernels/cuda/glm_glue_index.cuh
++++ b/zig/kernels/cuda/glm_glue_index.cuh
+@@ -9,6 +9,7 @@ using namespace glm_triton;
+ extern "C" __global__ void __launch_bounds__(32)
+     tf_glm_index_write(const __nv_bfloat16* kr, int64_t k_stride, const float* gr, const __nv_bfloat16* lnw,
+                        const __nv_bfloat16* lnb, __nv_bfloat16* ik, __nv_bfloat16* ig, const int* pos, float eps) {
++  glm_triton::pdl_enter();
+   constexpr int D = 128;
+   const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
+   const int d0 = threadIdx.x * 4;
+@@ -38,6 +39,7 @@ extern "C" __global__ void __launch_bounds__(32)
+ extern "C" __global__ void __launch_bounds__(32)
+     tf_glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape, __nv_bfloat16* pk,
+                      const int* pos, int64_t rows, const int* pt, int64_t ps) {
++  glm_triton::pdl_enter();
+   constexpr int D = 128;
+   const int64_t P = pos[0], p = P / 4 + blockIdx.x;
+   if (4 * p + 3 > P + rows - 1) return;
+@@ -154,6 +156,7 @@ __device__ __forceinline__ const Seg& by_block(const Segs& t, int b) {
+ // x: the window's rows
+ extern "C" __global__ void __launch_bounds__(512)
+     tf_glm_lat_write_fp8_paged_segs(int64_t stride, int64_t ps, const glm_wsegs::Segs t) {
++  glm_triton::pdl_enter();
+   const glm_wsegs::Seg& g = glm_wsegs::by_row(t, static_cast<int>(blockIdx.x));
+   glm_latw::write_fp8_paged(g.lat, stride, g.cache, g.scales, g.pos, g.pt, ps, static_cast<int64_t>(blockIdx.x) - g.row0);
+ }
+@@ -161,12 +164,14 @@ extern "C" __global__ void __launch_bounds__(512)
+ extern "C" __global__ void __launch_bounds__(32)
+     tf_glm_index_write_segs(int64_t k_stride, const __nv_bfloat16* lnw, const __nv_bfloat16* lnb, float eps,
+                             const glm_wsegs::Segs t) {
++  glm_triton::pdl_enter();
+   const glm_wsegs::Seg& g = glm_wsegs::by_row(t, static_cast<int>(blockIdx.x));
+   glm_idxw::index_write(g.kr, k_stride, g.gr, lnw, lnb, g.ik, g.ig, g.pos, eps, static_cast<int64_t>(blockIdx.x) - g.row0);
+ }
+ // x: every segment's rows / 4 + 2 pool blocks in turn
+ extern "C" __global__ void __launch_bounds__(32)
+     tf_glm_pool_keys_segs(const __nv_bfloat16* ape, int64_t ps, const glm_wsegs::Segs t) {
++  glm_triton::pdl_enter();
+   const glm_wsegs::Seg& g = glm_wsegs::by_block(t, static_cast<int>(blockIdx.x));
+   glm_idxw::pool_keys(g.ik, g.ig, ape, g.pk, g.pos, g.rows, g.pt, ps, static_cast<int64_t>(blockIdx.x) - g.b0);
+ }
+@@ -181,6 +186,7 @@ struct tf_glm_copies {
+   tf_glm_copy c[16];
+ };
+ extern "C" __global__ void __launch_bounds__(256) tf_glm_copy_segs(const tf_glm_copies t) {
++  glm_triton::pdl_enter();
+   const tf_glm_copy& c = t.c[blockIdx.y];
+   for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < c.n; i += (int64_t)gridDim.x * blockDim.x)
+     c.dst[i] = c.src[i];
+@@ -326,12 +332,14 @@ __device__ __forceinline__ void select_row(const float* scores, O* out, int64_t
+ // sparse._select_rows (VISIBLE), a row per 4-warp block: K best visible pools by 8-bit radix select, ties to lower.
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_select_rows(const float* scores, int64_t* out, int64_t np, const int* pos, int k) {
++  glm_triton::pdl_enter();
+   glm_index::select_row<128>(scores, out, np, pos, k);
+ }
+ 
+ // tf_glm_select_rows a row per 1,024-thread block, for a few rows over many pools (a decode step's): its bytes.
+ extern "C" __global__ void __launch_bounds__(1024)
+     tf_glm_select_rows_wide(const float* scores, int64_t* out, int64_t np, const int* pos, int k) {
++  glm_triton::pdl_enter();
+   glm_index::select_row<1024>(scores, out, np, pos, k);
+ }
+ 
+@@ -339,6 +347,7 @@ extern "C" __global__ void __launch_bounds__(1024)
+ // then the count: 2048 past the all-visible prefix, 0 within it (those rows keep the dense pass's whole-context result).
+ extern "C" __global__ void __launch_bounds__(1024)
+     tf_glm_dsa_topk(const float* scores, int* out, int64_t np, const int* pos, int k, int* counts) {
++  glm_triton::pdl_enter();
+   glm_index::select_row<1024, false, int>(scores, out, np, pos, k);
+   if (threadIdx.x == 0) {
+     const int64_t n = (int64_t)pos[0] + blockIdx.x + 1;
+@@ -352,6 +361,7 @@ extern "C" __global__ void __launch_bounds__(1024)
+ extern "C" __global__ void __launch_bounds__(32)
+     tf_glm_index_write_dsa(const __nv_bfloat16* kr, int64_t k_stride, const __nv_bfloat16* lnw, const __nv_bfloat16* lnb,
+                            __nv_bfloat16* ik, const int* pos, const float* inv, float eps) {
++  glm_triton::pdl_enter();
+   constexpr int D = 128, ROPE = 64;
+   const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
+   const int d0 = threadIdx.x * 4;
+diff --git a/zig/kernels/cuda/glm_glue_norm.cuh b/zig/kernels/cuda/glm_glue_norm.cuh
+index 5efa982ba..86b30da10 100644
+--- a/zig/kernels/cuda/glm_glue_norm.cuh
++++ b/zig/kernels/cuda/glm_glue_norm.cuh
+@@ -138,6 +138,7 @@ __device__ void rmsnorm(const __nv_bfloat16* x, int64_t x_stride, const W* w, __
+   extern "C" __global__ void __launch_bounds__(NW * 32)                                                            \
+       tf_glm_rmsnorm_##D(const __nv_bfloat16* x, int64_t x_stride, const __nv_bfloat16* w, __nv_bfloat16* out,    \
+                          int64_t o_stride, float* xs, float eps, int sums) {                                       \
++    glm_triton::pdl_enter();                                                                                       \
+     glm_glue::rmsnorm<D, BLOCK, NW, S>(x, x_stride, w, out, o_stride, xs, eps, sums);                              \
+   }
+ 
+@@ -153,5 +154,6 @@ RMSNORM(2048, 2048, 4, 8)
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_rmsnorm_4096_f32w(const __nv_bfloat16* x, int64_t x_stride, const float* w, __nv_bfloat16* out,
+                              int64_t o_stride, float* xs, float eps, int sums) {
++  glm_triton::pdl_enter();
+   glm_glue::rmsnorm<4096, 4096, 8, 8, float>(x, x_stride, w, out, o_stride, xs, eps, sums);
+ }
+diff --git a/zig/kernels/cuda/glm_index_decode.cuh b/zig/kernels/cuda/glm_index_decode.cuh
+index 43d3e5ec7..1000e6b05 100644
+--- a/zig/kernels/cuda/glm_index_decode.cuh
++++ b/zig/kernels/cuda/glm_index_decode.cuh
+@@ -12,6 +12,8 @@
+ #include <cuda_runtime.h>
+ #include <stdint.h>
+ 
++#include "glm_triton.cuh"
++
+ namespace glm_dsel {
+ 
+ constexpr int T1 = 256;     // scan threads
+@@ -206,8 +208,9 @@ struct Merge {
+ // bits[r][1][..] (words a part; bit b of word w is pool 32 w + b). Rows of NP <= CAP mark nothing (the merge takes
+ // them whole); each CTA writes only its span's words below its row's NP.
+ extern "C" __global__ void __launch_bounds__(glm_dsel::T1)
+-    tf_glm_dsel_scan(const float* __restrict__ S, int64_t np, const int* __restrict__ pos, int K, int target,
++    tf_glm_dsel_scan(const float* S, int64_t np, const int* pos, int K, int target,
+                      uint32_t* __restrict__ bits, int64_t words) {
++  glm_triton::pdl_enter();
+   using namespace glm_dsel;
+   __shared__ int hist[256];
+   __shared__ uint32_t sh_prefix;
+@@ -272,8 +275,9 @@ extern "C" __global__ void __launch_bounds__(glm_dsel::T1)
+ // 0 the whole row in one select (NP <= CAP), 1 the candidates, 2 the whole row after the candidates missed, 3 ties
+ // at the floor.
+ extern "C" __global__ void __launch_bounds__(glm_dsel::T2)
+-    tf_glm_dsel_merge(const float* __restrict__ S, int64_t* __restrict__ OUT, int64_t np, const int* __restrict__ pos,
+-                      int K, const uint32_t* __restrict__ bits, int64_t words, int* __restrict__ PATH) {
++    tf_glm_dsel_merge(const float* S, int64_t* __restrict__ OUT, int64_t np, const int* pos,
++                      int K, const uint32_t* bits, int64_t words, int* __restrict__ PATH) {
++  glm_triton::pdl_enter();
+   using namespace glm_dsel;
+   __shared__ Merge sm;
+   const int64_t r = blockIdx.x;
+diff --git a/zig/kernels/cuda/glm_triton.cuh b/zig/kernels/cuda/glm_triton.cuh
+index bbe9dfdf7..d034336e0 100644
+--- a/zig/kernels/cuda/glm_triton.cuh
++++ b/zig/kernels/cuda/glm_triton.cuh
+@@ -72,5 +72,13 @@ __device__ __forceinline__ void pdl_trigger() {
+   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+ #endif
+ }
++// pdl_enter: the first statement of the decode DSA chain's kernels (Set.pdl_dsa; after upstream's glm_pdl::enter):
++// this one waits, so a dependent launch reads and writes as a plain one. Wait only, no early trigger: a plain launch
++// (the bit off) then runs exactly as before, and no dependent behind it (glm_mm, the PDL chain) starts any earlier.
++// Their inputs from earlier grids are read coherently (no const __restrict__: ptxas may hoist non-coherent loads above
++// the wait).
++__device__ __forceinline__ void pdl_enter() {
++  pdl_wait();
++}
+ 
+ }  // namespace glm_triton
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index d5a547ed9..3b5775f12 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -265,7 +265,7 @@ pub fn kvRope(set: glue.Set, stream: cuda.Stream, l: Layer, dp: u64, lat: u64, p
+ pub fn indexWriteDsa(set: glue.Set, stream: cuda.Stream, l: Layer, ikr: u64, ik: u64, pos: u64, rows: usize) !void {
+     var a: cuda.Args = .{};
+     inline for (.{ ikr, @as(i64, @intCast(l.index.d + l.index.heads)), l.index.ln_w, l.index.ln_b, ik, pos, l.inv, @as(f32, 1e-6) }) |v| a.add(v);
+-    try cuda.launch.launch(set.glue.index_write_dsa, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
++    try cuda.launch.launch(set.glue.index_write_dsa, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 }, .pdl = set.pdl_dsa }, stream, &a);
+ }
+ 
+ /// One sequence's rows r0..r0 + rows at pos: latent and index keys written, dense then sparse attention into s.ol.
+@@ -478,7 +478,7 @@ pub fn writeSegsLatent(k: Kernels, stream: cuda.Stream, l: Layer, lt: *const Wri
+     a.add(@as(i64, @intCast(l.lw)));
+     a.add(@as(i64, @intCast(lps)));
+     a.add(lt.*);
+-    try cuda.launch.launch(set.glue.lat_write_fp8_paged_segs, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, stream, &a);
++    try cuda.launch.launch(set.glue.lat_write_fp8_paged_segs, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 }, .pdl = set.pdl_dsa }, stream, &a);
+     stamp.end();
+     stamp = prof.span(k.prof, stream, .index_update);
+     defer stamp.end();
+@@ -488,12 +488,12 @@ pub fn writeSegsLatent(k: Kernels, stream: cuda.Stream, l: Layer, lt: *const Wri
+     b.add(ix.ln_b);
+     b.add(@as(f32, 1e-6)); // indexUpdate's
+     b.add(t.*);
+-    try cuda.launch.launch(set.glue.index_write_segs, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &b);
++    try cuda.launch.launch(set.glue.index_write_segs, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 }, .pdl = set.pdl_dsa }, stream, &b);
+     var p: cuda.Args = .{};
+     p.add(ix.ape);
+     p.add(@as(i64, @intCast(ps)));
+     p.add(t.*);
+-    try cuda.launch.launch(set.glue.pool_keys_segs, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = 32 } }, stream, &p);
++    try cuda.launch.launch(set.glue.pool_keys_segs, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = 32 }, .pdl = set.pdl_dsa }, stream, &p);
+ }
+ 
+ test "a shared window's cache-write segments fit glm_glue_index.cuh's table and one launch's arguments" {
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 6b4e9344c..e2ce22a66 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -305,7 +305,7 @@ pub const Forward = struct {
+     }
+ 
+     pub fn set(f: *const Forward) glue.Set {
+-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split, .hc_part = f.m.hc_part, .dscore = if (f.m.dscore) |*x| x else null, .policy = f.policy | f.m.index_boot, .x8 = if (f.m.x8) |*x| x else null };
++        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .pdl_dsa = policy_mod.on(f.policy, .dsa_pdl) and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split, .hc_part = f.m.hc_part, .dscore = if (f.m.dscore) |*x| x else null, .policy = f.policy | f.m.index_boot, .x8 = if (f.m.x8) |*x| x else null };
+     }
+ 
+     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index a2d261f90..62a47f78f 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -10,10 +10,12 @@ const index_mod = @import("cuda_index.zig");
+ /// `dsel`: a decode window's DSA select on many CTAs (tf_glm_dsel_*, cuda_sparse; TF_GLM_DSEL, default on).
+ /// `pdl_hc`: a decode window's hc_post, hc_partial8 and hc_finish launch as dependents (TF_GLM_PDL_CHAIN's hc).
+ /// `pdl_moe`: a decode window's slice_sum, topk_group and topk_group_sum launch as dependents (TF_GLM_PDL_CHAIN's moe).
++/// `pdl_dsa`: a decode window's DSA chain (attention, index writes, scores and selection, rmsnorm) launches as
++/// dependents (policy bit 8, dsa_pdl); each of those kernels opens with pdl_enter (glm_triton.cuh).
+ /// `hc_split`: hc_pre's finish on the split schedule (TF_GLM_HC_SPLIT=0: off), the same bits.
+ /// `hc_part`: hc_pre's decode dots over more blocks by rows (partSplit; TF_GLM_HC_PART), the same bits.
+ /// `dscore`: a decode window's index scores on glm_index_scores (tf_glm_scores' bytes; TF_GLM_DSCORES, default on).
+-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false, hc_split: bool = false, hc_part: PartTable = .{ .n = 0 }, dscore: ?*const index_mod.Kernels = null, policy: @import("policy.zig").Mask = 0, x8: ?*const @import("cuda_x8.zig").Run = null };
++pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false, pdl_dsa: bool = false, hc_split: bool = false, hc_part: PartTable = .{ .n = 0 }, dscore: ?*const index_mod.Kernels = null, policy: @import("policy.zig").Mask = 0, x8: ?*const @import("cuda_x8.zig").Run = null };
+ 
+ /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
+ pub const Norm = union(enum) { bf16: u64, f32: u64 };
+@@ -214,7 +216,7 @@ pub fn rmsnorm(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, o
+     a.add(xs orelse @as(u64, 0));
+     a.add(eps);
+     a.add(@as(c_int, @intFromBool(xs != null)));
+-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = warps * 32 } }, stream, &a);
++    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = warps * 32 }, .pdl = set.pdl_dsa }, stream, &a);
+ }
+ 
+ /// rmsnorm by a Norm: a float32 weight (the hidden size) through rmsnorm_4096_f32w, rmsnorm_4096's arithmetic.
+@@ -226,7 +228,7 @@ pub fn rmsnormBy(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, n: Norm
+     if (d != 4096) return error.NoRmsnormWidth;
+     var a: cuda.Args = .{};
+     inline for (.{ x, i64of(x_stride), g, out, i64of(o_stride), xs orelse @as(u64, 0), eps, @as(c_int, @intFromBool(xs != null)) }) |v| a.add(v);
+-    try cuda.launch.launch(set.glue.rmsnorm_4096_f32w, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
++    try cuda.launch.launch(set.glue.rmsnorm_4096_f32w, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 }, .pdl = set.pdl_dsa }, stream, &a);
+ }
+ 
+ fn cdiv(a: usize, b: usize) u32 {
+@@ -503,7 +505,7 @@ pub fn copySegs(set: Set, stream: cuda.Stream, t: *const Copies, n: usize) !void
+     const blocks: u32 = @intCast(@min(@as(i64, 128), @divFloor(most + 255, 256)));
+     var a: cuda.Args = .{};
+     a.add(t.*);
+-    try cuda.launch.launch(set.glue.copy_segs, .{ .grid = .{ .x = blocks, .y = @intCast(n) }, .block = .{ .x = 256 } }, stream, &a);
++    try cuda.launch.launch(set.glue.copy_segs, .{ .grid = .{ .x = blocks, .y = @intCast(n) }, .block = .{ .x = 256 }, .pdl = set.pdl_dsa }, stream, &a);
+ }
+ 
+ test "copySegs' table is glm_glue_index.cuh's tf_glm_copies" {
+diff --git a/zig/src/families/glm/cuda_kv_split.zig b/zig/src/families/glm/cuda_kv_split.zig
+index 5519565e2..a4317239f 100644
+--- a/zig/src/families/glm/cuda_kv_split.zig
++++ b/zig/src/families/glm/cuda_kv_split.zig
+@@ -645,7 +645,7 @@ pub const Ctx = struct {
+         ca.add(x.qall);
+         ca.add(lc);
+         inline for (.{ pos, x.ltok, x.lcnt, x.po, x.pm, x.pl, @as(i64, @intCast(rows)), @as(i64, @intCast(H)), @as(i64, sparse.dsa_width), scaleOf(l), @as(c_int, 1), @as(u64, 0), @as(i64, 0) }) |a| ca.add(a);
+-        try cuda.launch.launch(set.glue.chunks_16_w576_s4, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(H / latent.heads_tile), .z = nch }, .block = .{ .x = latent.chunk_threads }, .shared = glue.chunksSmemW(16, glue.dsa_row) }, stream, &ca);
++        try cuda.launch.launch(set.glue.chunks_16_w576_s4, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(H / latent.heads_tile), .z = nch }, .block = .{ .x = latent.chunk_threads }, .shared = glue.chunksSmemW(16, glue.dsa_row), .pdl = set.pdl_dsa }, stream, &ca);
+         // 4. one (o, m, l) a row and head, by the head's owner
+         var ma: cuda.Args = .{};
+         inline for (.{ x.po, x.pm, x.pl, @as(i64, @intCast(rows)), @as(c_int, @intCast(H)), @as(c_int, nch), x.so, x.sm, x.sl, x.t }) |a| ma.add(a);
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index bd9df5aa8..aa941b3b9 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -180,7 +180,7 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64,
+         a.add(@as(i64, @intCast(t.ps)));
+     }
+     const shared = if (lw == glue.dsa_row) glue.chunksSmemW(heads_tile, glue.dsa_row) else if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
+-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = chunk_threads }, .shared = shared }, stream, &a);
++    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = chunk_threads }, .shared = shared, .pdl = set.pdl_dsa }, stream, &a);
+ }
+ 
+ /// latent.sparse_attention: rows with counts > 0 over their selected tokens (i32 [rows][w]); others left alone.
+@@ -224,7 +224,7 @@ pub fn sparseDsaSplit(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, s
+         a.add(t.pt);
+         a.add(@as(i64, @intCast(t.ps)));
+     }
+-    try cuda.launch.launch(if (scales != 0) (if (int8()) set.glue.chunks_16_w576_s4_i8 else set.glue.chunks_16_w576_s4_fp8) else set.glue.chunks_16_w576_s4, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, heads_tile), .z = @intCast(nch) }, .block = .{ .x = chunk_threads }, .shared = glue.chunksSmemW(heads_tile, glue.dsa_row) }, stream, &a);
++    try cuda.launch.launch(if (scales != 0) (if (int8()) set.glue.chunks_16_w576_s4_i8 else set.glue.chunks_16_w576_s4_fp8) else set.glue.chunks_16_w576_s4, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, heads_tile), .z = @intCast(nch) }, .block = .{ .x = chunk_threads }, .shared = glue.chunksSmemW(heads_tile, glue.dsa_row), .pdl = set.pdl_dsa }, stream, &a);
+     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
+     return true;
+ }
+@@ -257,7 +257,7 @@ fn fused(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t
+         a.add(@as(i64, @intCast(t.ps)));
+     }
+     const shared = if (lw == glue.dsa_row) glue.chunksSmemW(heads_tile, glue.dsa_row) else if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
+-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb) }, .block = .{ .x = chunk_threads }, .shared = shared }, stream, &a);
++    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb) }, .block = .{ .x = chunk_threads }, .shared = shared, .pdl = set.pdl_dsa }, stream, &a);
+ }
+ 
+ /// The most segments one attentionSegs launch takes (glm_glue_attn.cuh's ATTN_SEGS: Engine.max_shared).
+@@ -286,13 +286,13 @@ pub fn attentionSegs(set: glue.Set, stream: cuda.Stream, t: *const AttnSegs, row
+     a.add(@as(c_int, @intFromBool(sparse)));
+     a.add(@as(i64, @intCast(pstep)));
+     a.add(t.*);
+-    try cuda.launch.launch(set.glue.chunks_16_fp8_paged_segs, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, heads_tile), .z = @intCast(most) }, .block = .{ .x = chunk_threads }, .shared = glue.chunksSmem(heads_tile) }, stream, &a);
++    try cuda.launch.launch(set.glue.chunks_16_fp8_paged_segs, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, heads_tile), .z = @intCast(most) }, .block = .{ .x = chunk_threads }, .shared = glue.chunksSmem(heads_tile), .pdl = set.pdl_dsa }, stream, &a);
+     var m: cuda.Args = .{};
+     m.add(out);
+     m.add(@as(i64, @intCast(heads)));
+     m.add(@as(c_int, @intFromBool(sparse)));
+     m.add(t.*);
+-    try cuda.launch.launch(set.glue.merge_segs, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = 128 } }, stream, &m);
++    try cuda.launch.launch(set.glue.merge_segs, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = 128 }, .pdl = set.pdl_dsa }, stream, &m);
+ }
+ 
+ test "a shared window's attention segments fit glm_glue_attn.cuh's table and one launch's arguments" {
+@@ -306,7 +306,7 @@ fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64,
+     if (lw != 512 and lw != glue.dsa_row) return error.LatentShape;
+     var a: cuda.Args = .{};
+     inline for (.{ p.po, p.pm, p.pl, out, counts, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(c_int, @intCast(nch)), @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
+-    try cuda.launch.launch(set.glue.merge, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = 128 } }, stream, &a);
++    try cuda.launch.launch(set.glue.merge, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = 128 }, .pdl = set.pdl_dsa }, stream, &a);
+ }
+ 
+ test "GLM index: a sparse call merges in the kernel only past its partials' rows" {
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index faa9f79d2..ac23fa66e 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -520,6 +520,8 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+             // bits 2 and 3 on glm_moe_dsa's indexer: their kernels sit in glm_glue and their scratch (the roped
+             // queries, the select's bit words) in every decode window's buffers on every rank, loaded unconditionally
+             if (a.rope != 0) b.offered |= policy.bit(.rope_hoist) | policy.bit(.topk_multi_cta);
++            // bit 8 on glm_moe_dsa's decode DSA chain: the same kernels (each opens with pdl_enter), launched dependent
++            if (a.rope != 0) b.offered |= policy.bit(.dsa_pdl);
+         },
+         else => {},
+     };
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index 383b1d0e7..64393d93e 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -78,11 +78,11 @@ pub fn decodeSelect(set: glue.Set, stream: cuda.Stream, scores: u64, pools: u64,
+     if (g > 0) {
+         var sa: cuda.Args = .{};
+         inline for (.{ scores, @as(i64, @intCast(np)), at, @as(c_int, topk_pools), @as(c_int, dsel_target), bits, @as(i64, @intCast(words)) }) |v| sa.add(v);
+-        try cuda.launch.launch(set.glue.dsel_scan, .{ .grid = .{ .x = @intCast(g), .y = @intCast(rows) }, .block = .{ .x = dsel_scan_threads } }, stream, &sa);
++        try cuda.launch.launch(set.glue.dsel_scan, .{ .grid = .{ .x = @intCast(g), .y = @intCast(rows) }, .block = .{ .x = dsel_scan_threads }, .pdl = set.pdl_dsa }, stream, &sa);
+     }
+     var ma: cuda.Args = .{};
+     inline for (.{ scores, pools, @as(i64, @intCast(np)), at, @as(c_int, topk_pools), bits, @as(i64, @intCast(words)), path }) |v| ma.add(v);
+-    try cuda.launch.launch(set.glue.dsel_merge, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = dsel_merge_threads } }, stream, &ma);
++    try cuda.launch.launch(set.glue.dsel_merge, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = dsel_merge_threads }, .pdl = set.pdl_dsa }, stream, &ma);
+ }
+ 
+ /// The indexer candidates' boot settings: TF_GLM_DSA_ROPE_HOIST=1 sets policy bit 2 (rope_hoist) and
+@@ -191,7 +191,7 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+         if (hoist != null) {
+             var ra: cuda.Args = .{};
+             inline for (.{ q, s.qr, at, @as(i64, @intCast(heads)), inv }) |v| ra.add(v);
+-            try cuda.launch.launch(set.glue.dsa_qrope, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 128 } }, stream, &ra);
++            try cuda.launch.launch(set.glue.dsa_qrope, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 128 }, .pdl = set.pdl_dsa }, stream, &ra);
+             q = s.qr;
+         }
+         const sl = hoist orelse loop;
+@@ -202,7 +202,7 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+         } else {
+         var sa: cuda.Args = .{};
+         inline for (.{ q, wts + a * stride * 2, @as(i64, @intCast(stride)), ik, s.scores, at, @as(i64, @intCast(np)), @as(i64, @intCast(nb)), scale, headScale(heads), @as(i64, @intCast(heads)), @as(c_int, @intCast(sl)), inv }) |v| sa.add(v);
+-        try cuda.launch.launch(if (hoist != null) set.glue.dsa_scores_roped else set.glue.dsa_scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, sl)) }, .block = .{ .x = 128 } }, stream, &sa);
++        try cuda.launch.launch(if (hoist != null) set.glue.dsa_scores_roped else set.glue.dsa_scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, sl)) }, .block = .{ .x = 128 }, .pdl = set.pdl_dsa }, stream, &sa);
+         }
+         stamp.end();
+         stamp = prof_mod.span(profile, stream, .index_select);
+@@ -217,15 +217,15 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+             if (g > 0) {
+                 var ka: cuda.Args = .{};
+                 inline for (.{ s.scores, @as(i64, @intCast(np)), at, @as(c_int, dsa_width), @as(c_int, tscan_target), s.ls, @as(i64, @intCast(words)) }) |v| ka.add(v);
+-                try cuda.launch.launch(set.glue.dsa_tscan, .{ .grid = .{ .x = @intCast(g), .y = @intCast(n) }, .block = .{ .x = tscan_threads } }, stream, &ka);
++                try cuda.launch.launch(set.glue.dsa_tscan, .{ .grid = .{ .x = @intCast(g), .y = @intCast(n) }, .block = .{ .x = tscan_threads }, .pdl = set.pdl_dsa }, stream, &ka);
+             }
+             var ma: cuda.Args = .{};
+             inline for (.{ s.scores, tokens + a * dsa_width * 4, @as(i64, @intCast(np)), at, @as(c_int, dsa_width), s.ls, @as(i64, @intCast(words)), counts + a * 4, @as(u64, 0) }) |v| ma.add(v);
+-            try cuda.launch.launch(set.glue.dsa_tmerge, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = tmerge_threads }, .shared = glue.dsa_tmerge_smem }, stream, &ma);
++            try cuda.launch.launch(set.glue.dsa_tmerge, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = tmerge_threads }, .shared = glue.dsa_tmerge_smem, .pdl = set.pdl_dsa }, stream, &ma);
+         } else {
+             var ta: cuda.Args = .{};
+             inline for (.{ s.scores, tokens + a * dsa_width * 4, @as(i64, @intCast(np)), at, @as(c_int, dsa_width), counts + a * 4 }) |v| ta.add(v);
+-            try cuda.launch.launch(set.glue.dsa_topk, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 } }, stream, &ta);
++            try cuda.launch.launch(set.glue.dsa_topk, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 }, .pdl = set.pdl_dsa }, stream, &ta);
+         }
+         stamp.end();
+         if (split == null and a + n == rows and std.c.getenv("TF_GLM_DSA_DUMP") != null) try dsaProbe(set, stream, s.scores, tokens + (a + n - 1) * dsa_width * 4, counts + (a + n - 1) * 4, n - 1, np, np);
+@@ -298,10 +298,10 @@ fn dsaProbe(set: glue.Set, stream: cuda.Stream, scores: u64, toks: u64, cnt: u64
+ pub fn indexUpdate(set: glue.Set, stream: cuda.Stream, k_raw: u64, k_stride: usize, gate: u64, ln_w: u64, ln_b: u64, ape: u64, ik: u64, ig: u64, pk: u64, t: latent.Table, pos: u64, rows: usize) !void {
+     var a: cuda.Args = .{};
+     inline for (.{ k_raw, @as(i64, @intCast(k_stride)), gate, ln_w, ln_b, ik, ig, pos, @as(f32, 1e-6) }) |v| a.add(v);
+-    try cuda.launch.launch(set.glue.index_write, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
++    try cuda.launch.launch(set.glue.index_write, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 }, .pdl = set.pdl_dsa }, stream, &a);
+     var b: cuda.Args = .{};
+     inline for (.{ ik, ig, ape, pk, pos, @as(i64, @intCast(rows)), t.pt, @as(i64, @intCast(t.ps)) }) |v| b.add(v);
+-    try cuda.launch.launch(set.glue.pool_keys, .{ .grid = .{ .x = @intCast(rows / 4 + 2) }, .block = .{ .x = 32 } }, stream, &b);
++    try cuda.launch.launch(set.glue.pool_keys, .{ .grid = .{ .x = @intCast(rows / 4 + 2) }, .block = .{ .x = 32 }, .pdl = set.pdl_dsa }, stream, &b);
+ }
+ 
+ /// sparse.pool_bucket: visible pools for rows pos .. pos + rows - 1, a power of two (at least 1024), at most `np_max`.
+@@ -393,7 +393,7 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
+         // a decode window's rows: the same scores from glm_index_scores (8 rows a CTA, key tiles staged once)
+         const dec = if (set.dscore) |k| if (k.takesDecode(rows, np_max, nb, pk, t.ps)) k else null else null;
+         var stamp = prof.span(profile, stream, .index_score);
+-        if (quick) |k| try k.scores(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps) else if (dec) |k| try k.scoresTiles(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps, index_mod.decodeLoop(nb)) else try cuda.launch.launch(set.glue.scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
++        if (quick) |k| try k.scores(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps) else if (dec) |k| try k.scoresTiles(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps, index_mod.decodeLoop(nb)) else try cuda.launch.launch(set.glue.scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 }, .pdl = set.pdl_dsa }, stream, &sa);
+         stamp.end();
+         stamp = prof.span(profile, stream, .index_select);
+         if (quick) |k| if (k.select) {
+@@ -409,7 +409,7 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
+         }
+         var sel: cuda.Args = .{};
+         inline for (.{ s.scores, s.pools + a * topk_pools * 8, @as(i64, @intCast(np_max)), at, @as(c_int, topk_pools) }) |v| sel.add(v);
+-        try cuda.launch.launch(if (wide) set.glue.select_rows_wide else set.glue.select_rows, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = if (wide) 1024 else 128 } }, stream, &sel);
++        try cuda.launch.launch(if (wide) set.glue.select_rows_wide else set.glue.select_rows, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = if (wide) 1024 else 128 }, .pdl = set.pdl_dsa }, stream, &sel);
+         stamp.end();
+     }
+     const stamp = prof.span(profile, stream, .index_select);
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+index 915d8b9e0..47297b9ff 100644
+--- a/zig/src/families/glm/policy.zig
++++ b/zig/src/families/glm/policy.zig
+@@ -153,3 +153,15 @@ test "GLM policy: the accessor, the bits' places and a shared forward's common m
+     try t.expectEqual(@as(?Mask, 0x21), parse("0x21"));
+     try t.expectEqual(@as(?Mask, null), parse("-1"));
+ }
++
++test "GLM policy: bit 8 (dsa_pdl) is reserved, offered and parsed like the rest; 6 and 7 stay free here" {
++    const t = std.testing;
++    try t.expectEqual(@as(Mask, 0x100), bit(.dsa_pdl));
++    try t.expect(bit(.dsa_pdl) & per_stream == 0); // a kernel bit: a shared forward runs it where every sequence asks
++    try t.expect(on(parse("0x100").?, .dsa_pdl) and on(parse("256").?, .dsa_pdl) and !on(0x20, .dsa_pdl));
++    var b = Boot.read(envOf(.{.{ "TF_GLM_POLICY_REQUESTS", "1" }}));
++    try t.expectEqual(@as(?Mask, 0), b.effective(0x100)); // not offered: dropped
++    b.offered = bit(.dsa_pdl) | bit(.rope_hoist);
++    try t.expectEqual(@as(?Mask, 0x104), b.effective(0x1c4)); // 6 and 7 not offered by this branch
++    try t.expectEqual(@as(Mask, 0x100), common(&.{ 0x104, 0x120 }));
++}
+-- 
+2.43.0
+

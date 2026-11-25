@@ -1,0 +1,92 @@
+From 284175180e250a548ea0af6faa4aae27f53b830d Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 06:13:10 +0200
+Subject: [PATCH] glm: TF_GLM_DSPARK_HEAD=full, DSpark's block rows through the
+ rank's own head rows (bf16 or the HEAD format) instead of the 4-bit draft
+ head
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/dspark.zig | 32 +++++++++++++++++++++++++-------
+ 1 file changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/zig/src/families/glm/dspark.zig b/zig/src/families/glm/dspark.zig
+index 631bf93..53cd695 100644
+--- a/zig/src/families/glm/dspark.zig
++++ b/zig/src/families/glm/dspark.zig
+@@ -19,6 +19,15 @@ const q4 = @import("cuda_q4.zig");
+ const glue = @import("cuda_glue.zig");
+ const df = @import("dflash.zig");
+ const dl = @import("dflash_load.zig");
++const projection = @import("cuda_proj.zig");
++const b16 = @import("cuda_b16.zig");
++
++/// TF_GLM_DSPARK_HEAD=full: the block rows through the rank's own head rows (bf16, or the HEAD format) rather than
++/// its 4-bit draft head (the default, as DFlash2 and the MTP chains).
++pub fn fullHead() bool {
++    const v = std.c.getenv("TF_GLM_DSPARK_HEAD") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "full");
++}
+ 
+ pub const D: usize = 6144;
+ pub const H: usize = 64;
+@@ -91,6 +100,7 @@ pub const Spark = struct {
+     pm: u64 = 0,
+     pl: u64 = 0,
+     pacc: u64 = 0,
++    hpart: u64 = 0, // the full head's K-slice partials (TF_GLM_DSPARK_HEAD=full, a bf16 head)
+     h_hn: []u16 = &.{}, // the block rows' normed h (rank 0 reads it back for the confidences)
+     last_conf: [DRAFTS]f64 = @splat(0),
+ 
+@@ -245,7 +255,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+         sp.conf_b = bf(cb[0]);
+     }
+     sp.h_hn = try gpa.alloc(u16, df.MAX_M * D);
+-    try carve(sp, d, head.n);
++    try carve(sp, d, @max(head.n, e.w.share.vocab.len()));
+     // the Drafter: DFlash2's bookkeeping (slots, rings, taps, candidates) at DSpark's sizes; its own pass is `spark`
+     const dr = try gpa.create(df.Drafter);
+     errdefer gpa.destroy(dr);
+@@ -270,6 +280,7 @@ fn carve(sp: *Spark, d: *const cuda.Driver, head_n: usize) !void {
+         .{ "gu", M * 2 * FF * 2 }, .{ "act", M * FF * 2 },       .{ "hn", M * D * 2 },       .{ "xs", C * (AUX * D / 64) * 4 },
+         .{ "logits", M * head_n * 2 }, .{ "c1", C * D * 2 },      .{ "ctx", C * D * 2 },      .{ "ckv", C * 2 * HW * 2 },
+         .{ "pm", M * H * (CH + 1) * 4 }, .{ "pl", M * H * (CH + 1) * 4 }, .{ "pacc", M * H * (CH + 1) * HD * 4 },
++        .{ "hpart", @max(16, b16.partBytes(M, head_n, D)) },
+     };
+     var at: u64 = 0;
+     inline for (fields) |f| {
+@@ -420,17 +431,24 @@ pub fn pass(dr: *df.Drafter, e: anytype, S: usize) !void {
+     // h = norm(x) through the verifier's 4-bit draft head (this rank's vocabulary), its 16 best a row, gathered
+     try glue.rmsnorm(set(e), e.stream, sp.x, D, sp.norm, sp.hn, D, sp.xs, EPS, M, D);
+     const head = e.w.draft_head.?;
+-    var r0: usize = 0;
+-    while (r0 < M) : (r0 += 16) {
+-        const rows = @min(16, M - r0);
+-        try q4.matmul(&e.m.q4, e.stream, sp.hn + r0 * D * 2, D, sp.xs + r0 * (D / 64) * 4, head, sp.logits + r0 * head.n * 2, rows);
++    var cols: usize = head.n;
++    if (fullHead()) {
++        cols = e.w.share.vocab.len();
++        const hs: glue.Set = .{ .glue = &e.m.glue, .mm = if (e.m.tiled) &e.m.mm else null, .packs = e.m.packs, .linear = .{ .lane = &e.m.lane } };
++        try projection.matmul(hs, e.stream, e.w.head, sp.hn, D, sp.logits, sp.hpart, M, cols, D, false);
++    } else {
++        var r0: usize = 0;
++        while (r0 < M) : (r0 += 16) {
++            const rows = @min(16, M - r0);
++            try q4.matmul(&e.m.q4, e.stream, sp.hn + r0 * D * 2, D, sp.xs + r0 * (D / 64) * 4, head, sp.logits + r0 * head.n * 2, rows);
++        }
+     }
+-    const chunks = (head.n + 4095) / 4096;
++    const chunks = (cols + 4095) / 4096;
+     const nw = M * df.CW;
+     {
+         var a: cuda.Args = .{};
+         a.add(sp.logits);
+-        a.add(@as(i32, @intCast(head.n)));
++        a.add(@as(i32, @intCast(cols)));
+         a.add(@as(i32, @intCast(e.share.vocab.lo)));
+         a.add(dr.pv);
+         a.add(dr.pi);
+-- 
+2.43.0
+

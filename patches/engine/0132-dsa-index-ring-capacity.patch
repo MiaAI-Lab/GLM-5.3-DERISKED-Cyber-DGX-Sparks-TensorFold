@@ -1,0 +1,109 @@
+From ff2e1b5603fb35d71ee65c3fdafaaa502642d114 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:22:22 +0200
+Subject: [PATCH] DSA index-key ring spans full context; snapshots skip dead ig
+ rings
+
+glm_moe_dsa's dsa_select scores raw index keys over every visible
+position, so its ik ring must span capacity (was 8192: earlier chunks'
+keys were evicted, breaking cross-chunk retrieval). ig/pk are never
+written for rope!=0 layers; snapshots must not copy them.
+---
+ zig/src/families/glm/cuda_disk_image.zig      | 7 +++++--
+ zig/src/families/glm/cuda_snapshot_layout.zig | 3 ++-
+ zig/src/families/glm/cuda_state.zig           | 5 +++--
+ 3 files changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_disk_image.zig b/zig/src/families/glm/cuda_disk_image.zig
+index 8305163..0f8d501 100644
+--- a/zig/src/families/glm/cuda_disk_image.zig
++++ b/zig/src/families/glm/cuda_disk_image.zig
+@@ -63,6 +63,7 @@ pub const Shape = struct {
+     pooled_row: u32,
+     capacity: u32,
+     head: bool, // the MTP head's caches are kept (drafting)
++    dsa: bool, // glm_moe_dsa: the ig rings are dead (its select reads ik only); the image keeps no ig part
+ 
+     pub fn of(st: *const State, c: *const Config, capacity: usize, head: bool) !Shape {
+         if (st.rings.len == 0) return error.SnapshotShape;
+@@ -83,6 +84,7 @@ pub const Shape = struct {
+             .pooled_row = c.i_dim * 2,
+             .capacity = @intCast(capacity),
+             .head = head,
++            .dsa = c.dsa,
+         };
+     }
+ 
+@@ -98,7 +100,7 @@ fn cache(sh: Shape, n: u64) [5]u64 {
+         n * sh.latent,
+         if (sh.scales) n * 4 else 0,
+         @min(n, sh.ring_rows) * sh.ring_row,
+-        @min(n, sh.ring_rows) * sh.ring_row,
++        if (sh.dsa) 0 else @min(n, sh.ring_rows) * sh.ring_row,
+         @min(n / sparse.pool + 2, sh.pk_rows) * sh.pooled_row,
+     };
+ }
+@@ -112,7 +114,8 @@ pub fn parts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator
+         const c = cache(sh, at);
+         try out.append(a, .{ .bytes = c[0], .row = sh.latent });
+         if (sh.scales) try out.append(a, .{ .bytes = c[1], .row = 4 });
+-        try out.appendSlice(a, &.{ .{ .bytes = c[2] }, .{ .bytes = c[3] } });
++        try out.append(a, .{ .bytes = c[2] });
++        if (c[3] > 0) try out.append(a, .{ .bytes = c[3] });
+         // whole pools are rows by position; the pool past them and the spare row stay the state's own
+         try out.appendSlice(a, &.{ .{ .bytes = pooled * sh.pooled_row, .row = sh.pooled_row, .per = sparse.pool }, .{ .bytes = c[4] - pooled * sh.pooled_row } });
+     }
+diff --git a/zig/src/families/glm/cuda_snapshot_layout.zig b/zig/src/families/glm/cuda_snapshot_layout.zig
+index 38bef0f..5f66940 100644
+--- a/zig/src/families/glm/cuda_snapshot_layout.zig
++++ b/zig/src/families/glm/cuda_snapshot_layout.zig
+@@ -65,6 +65,7 @@ pub const Plan = struct {
+     fn rows(p: *Plan, st: *const State, c: *const Config, x: cache.Caches, j: usize, at: usize) !void {
+         const latent = try std.math.mul(usize, at, @as(usize, c.kv_lora) * @as(usize, if (x.ls == 0) 2 else 1));
+         const ring = try std.math.mul(usize, @min(at, st.ring_rows), st.ring_row);
++        const gate = if (c.dsa) 0 else ring; // glm_moe_dsa's ig rings are never written: its select reads ik only
+         const pooled = try std.math.mul(usize, @min(at / sparse.pool + 2, x.pk_rows), @as(usize, c.i_dim) * 2);
+         const latent_row = @as(usize, c.kv_lora) * @as(usize, if (x.ls == 0) 2 else 1);
+         if (p.latent) {
+@@ -73,7 +74,7 @@ pub const Plan = struct {
+             if (x.ls != 0) try p.addLatent(st, x, x.ls, try std.math.mul(usize, at, @sizeOf(f32)), page_rows * @sizeOf(f32));
+         }
+         try p.add(st, st.rings[2 * j], ring);
+-        try p.add(st, st.rings[2 * j + 1], ring);
++        if (gate > 0) try p.add(st, st.rings[2 * j + 1], gate);
+         try p.addCache(st, x, x.pk, pooled, page_rows / sparse.pool * @as(usize, c.i_dim) * 2);
+     }
+ 
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index be2b057..65fa9b1 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -116,6 +116,7 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
+     const kw = 3 * n + 2 * c.kda_dim + s.kda.len();
+     const pk_rows = capacity / sparse.pool + 2;
+     const ring_rows = @min(capacity, index_ring);
++    const ik_rows = if (c.dsa) capacity else ring_rows; // glm_moe_dsa's select scores raw ik over every visible key
+     const rows: usize = @intFromBool(table == null); // on pages a cache's rows are the pool's
+     var sizes: std.ArrayList(usize) = .empty;
+     errdefer sizes.deinit(gpa);
+@@ -124,7 +125,7 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
+     const lc_bytes = try latent.cacheBytes(capacity, c.kv_lora, kv8);
+     for (0..nd + 1) |j| {
+         const on: usize = @intFromBool(j < nd or head); // the last is the MTP layer's
+-        try sizes.appendSlice(gpa, &.{ on * rows * lc_bytes, on * ring_rows * c.i_dim * 2, on * ring_rows * c.i_dim * 2, on * rows * pk_rows * c.i_dim * 2 });
++        try sizes.appendSlice(gpa, &.{ on * rows * lc_bytes, on * ik_rows * c.i_dim * 2, on * ring_rows * c.i_dim * 2, on * rows * pk_rows * c.i_dim * 2 });
+     }
+     try sizes.appendSlice(gpa, &.{ 4, c.hidden * 2 }); // MTP position and sequence-owned first-draft row
+     if (table) |t| try sizes.append(gpa, t * 4);
+@@ -516,7 +517,7 @@ pub const State = struct {
+         for (caches, 0..) |*x, j| x.* = .{ .lc = p[8 + 4 * j], .ls = if (kv8) p[8 + 4 * j] + capacity * c.kv_lora else 0, .ik = p[9 + 4 * j], .ig = p[10 + 4 * j], .pk = p[11 + 4 * j], .pk_rows = pk_rows };
+         const rings = try gpa.alloc(u64, 2 * (nd + 1));
+         for (0..nd + 1) |j| rings[2 * j ..][0..2].* = .{ p[9 + 4 * j], p[10 + 4 * j] };
+-        const ring_rows = @min(capacity, index_ring);
++        const ring_rows = if (c.dsa) capacity else @min(capacity, index_ring); // glm_moe_dsa's ik rings span the context; rebases never fire
+         var st: State = .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + @intFromBool(head) * capacity * c.kv_lora else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw, .kv8 = kv8, .head = head };
+         if (paged) |q| {
+             st.table = p[14 + 4 * nd];
+-- 
+2.43.0
+

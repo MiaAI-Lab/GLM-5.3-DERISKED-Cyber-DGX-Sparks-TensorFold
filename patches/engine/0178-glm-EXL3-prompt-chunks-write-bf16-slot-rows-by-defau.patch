@@ -1,0 +1,83 @@
+From 35377f6579f32e8fcd991149ca6540af19054389 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:51:26 +0200
+Subject: [PATCH 178/178] glm: EXL3 prompt chunks write bf16 slot rows by
+ default (TF_GLM_EXL3_BF16_SLOTS=0: fp32)
+
+K4 at TP4: 8K agent+code panel KL against BF16 -0.00177 [-0.00438, +0.00083] nats against fp32 slot rows (agent upper
++0.00197, code +0.00027); prefill 875 -> 937 tok/s at 9K, 869 -> 928 at 37K (no drafts).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/exl3_experts.cu   | 2 +-
+ zig/src/cuda/exl3_prompt.zig       | 2 +-
+ zig/src/families/glm/cuda_exl3.zig | 7 ++++---
+ zig/src/families/glm/cuda_moe.zig  | 2 +-
+ 4 files changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index bb39dfc..87d6e9b 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -431,7 +431,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const h
+     prompt_down<8>(Xd, Td, svh_d, y, K, D, ys, yrow, smem_raw, rows_sh, cb, e, cnt, warp, lane);
+ }
+ 
+-// The same writing bf16 slot rows (y bf16 [rows][yrow][D]; TF_GLM_EXL3_BF16_SLOTS), the arguments tf_exl3_prompt_down's.
++// The same writing bf16 slot rows (y bf16 [rows][yrow][D]: GLM's prompt chunks), the arguments tf_exl3_prompt_down's.
+ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_b16(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+         float* __restrict__ y, int K, int D, int ys, int yrow) {
+diff --git a/zig/src/cuda/exl3_prompt.zig b/zig/src/cuda/exl3_prompt.zig
+index 2734494..f00ade2 100644
+--- a/zig/src/cuda/exl3_prompt.zig
++++ b/zig/src/cuda/exl3_prompt.zig
+@@ -10,7 +10,7 @@ const Stream = @import("stream.zig").Stream;
+ pub const tile = 64;
+ /// `y` [pairs][dims] fp32 when `yrow` is 0; with `yrow` set the caller points `y` at its own slot rows ([rows][yrow][dims],
+ /// pair p = row * slots + slot at row * yrow + slot) and the down kernel writes there, so no copy follows.
+-/// `y_bf16` (with `yrow` set): the down kernel writes bf16 slot rows, as an NVFP4 prompt chunk's (TF_GLM_EXL3_BF16_SLOTS).
++/// `y_bf16` (with `yrow` set): the down kernel writes bf16 slot rows, as an NVFP4 prompt chunk's (GLM's prompt chunks; TF_GLM_EXL3_BF16_SLOTS=0: fp32).
+ pub const Scratch = struct { xg: u64, xu: u64, xd: u64, y: u64, rows: usize, slots: usize, yrow: usize = 0, y_bf16: bool = false };
+ /// A group's verified half-bit width: its own field, else uniform_k2; 0 when unverified or the two disagree.
+ fn verified(group: u32, uniform: u32) u32 {
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index 95974fc..dd04c9f 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -313,14 +313,15 @@ fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usiz
+     const m: cuda.abi.Memcpy2D = .{ .src = src, .src_pitch = spitch, .dst = dst, .dst_pitch = dpitch, .width = width, .height = height };
+     try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), what);
+ }
+-/// TF_GLM_EXL3_BF16_SLOTS=1: a prompt chunk's fused EXL3 experts write bf16 slot rows (an NVFP4 chunk's form; half the
+-/// slot-row bytes the down kernel writes and the combine reads), not fp32. Different numerics: opt-in.
++/// A prompt chunk's fused EXL3 experts write bf16 slot rows (an NVFP4 chunk's form; half the slot-row bytes the down
++/// kernel writes and the combine reads), not fp32; TF_GLM_EXL3_BF16_SLOTS=0 keeps fp32. On K4 at TP4 (2026-11-15): 8K
++/// agent+code panel KL against BF16 -0.00177 [-0.00438, +0.00083] nats vs fp32 slots; prefill +7%.
+ pub fn bf16Slots() bool {
+     const S = struct {
+         var once: ?bool = null;
+     };
+     if (S.once) |v| return v;
+-    const v = if (std.c.getenv("TF_GLM_EXL3_BF16_SLOTS")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
++    const v = if (std.c.getenv("TF_GLM_EXL3_BF16_SLOTS")) |e| !std.mem.eql(u8, std.mem.span(e), "0") else true;
+     S.once = v;
+     return v;
+ }
+diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.zig
+index 7b9cf27..8a9d0b9 100644
+--- a/zig/src/families/glm/cuda_moe.zig
++++ b/zig/src/families/glm/cuda_moe.zig
+@@ -58,7 +58,7 @@ fn grouped(k: Kernels, l: Layer, rows: usize, prompt: bool) bool {
+     return k.fuse and l.exl3 != null and !prompt and rows >= 1 and rows <= glue.select_group_rows and l.top_k == exl3.top_k;
+ }
+ 
+-/// The slot rows' form: bf16 in an NVFP4 prompt chunk (and an EXL3 one under TF_GLM_EXL3_BF16_SLOTS), else fp32.
++/// The slot rows' form: bf16 in an NVFP4 prompt chunk (and an EXL3 one's fused experts unless TF_GLM_EXL3_BF16_SLOTS=0), else fp32.
+ fn bf16Rows(l: Layer, prompt: bool) bool {
+     if (!prompt) return false;
+     const w = l.exl3 orelse return true;
+-- 
+2.43.0
+

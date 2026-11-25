@@ -1,0 +1,80 @@
+From 32eab0edc1af3b2a04ef245dcb2ab82b5d3109e1 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 12:21:44 +0200
+Subject: [PATCH] glm: an EXL3 checkpoint's block FP8 dense layers and MTP
+ experts
+
+wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 quantizes the routed experts of layers
+3-77 to EXL3 and keeps every other tensor as its FP8 source stored it:
+block FP8 (weight_scale_inv) dense layers, attention, shared experts and
+MTP experts. Attention and shared experts already took block FP8 from
+any checkpoint; the dense layers were forced to bf16 on an EXL3 one, and
+its MTP experts were read as EXL3. Both now follow the stored dtype: block
+FP8 dense layers on the lane as an FP8 checkpoint's, and block FP8 MTP
+experts as an FP8 checkpoint's experts (BF16 ones as NVFP4, as before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_exl3.zig    |  2 +-
+ zig/src/families/glm/cuda_weights.zig | 19 ++++++++++++-------
+ 2 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index 5993855..d236852 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -74,7 +74,7 @@ pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why
+         }
+     }
+     // a checkpoint's "codebook" names its default; the per-expert markers decide (a resumed encode can mix them by layer)
+-    const book = q.get("codebook") orelse std.json.Value{ .null = {} };
++    const book = q.get("codebook") orelse return; // absent (EXL3-K4-v1): the markers say
+     if (book != .string or !(std.mem.eql(u8, book.string, "mcg") or std.mem.eql(u8, book.string, "mul1"))) {
+         why.set("EXL3 codebook {f}: the CUDA family reads \"mcg\" or \"mul1\"", .{std.json.fmt(book, .{})});
+         return error.UnsupportedQuant;
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 5c0f3af..dcaf3ad 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -399,15 +399,18 @@ const Loader = struct {
+             const mod = try std.fmt.bufPrint(&nb, "{s}layers.{d}.mlp.gate_proj", .{ L.pfx, i });
+             if (r.of(mod) == .fp8) return L.fp8Dense(i);
+         }
+-        const mx = !c.exl3 and !c.fp8 and (try L.get("layers.{d}.mlp.gate_proj.weight", .{i})).dtype == .f8_e4m3; // FP4-Local's
+-        const want: formats.Format = if (c.exl3) .bf16 else if (c.fp8) .fp8_pb else if (mx) .mxfp8 else .nvfp4;
++        const stored_f8 = (try L.get("layers.{d}.mlp.gate_proj.weight", .{i})).dtype == .f8_e4m3;
++        const mx = !c.exl3 and !c.fp8 and stored_f8; // FP4-Local's
++        // an EXL3 checkpoint keeps its dense layers as its source stored them: bf16, or block FP8 (EXL3-K4-v1's)
++        const x3_f8 = c.exl3 and stored_f8;
++        const want: formats.Format = if (c.exl3 and !x3_f8) .bf16 else if (c.fp8 or x3_f8) .fp8_pb else if (mx) .mxfp8 else .nvfp4;
+         inline for (.{ "gate_proj", "up_proj", "down_proj" }) |x| try L.format("layers.{d}.mlp." ++ x, .{i}, want);
+-        const w: mlp.Weights = if (c.exl3) bf16: { // an EXL3 checkpoint keeps its dense layers bf16
++        const w: mlp.Weights = if (c.exl3 and !x3_f8) bf16: { // an EXL3 checkpoint's bf16 dense layers
+             inline for (.{ "gate_proj", "up_proj" }) |x| try L.rows(try L.get("layers.{d}.mlp." ++ x ++ ".weight", .{i}), s.lo, s.hi, c.dense_inter, .bf16);
+             const gu = try L.put("layers.{d}.mlp.gu", .{i});
+             try L.cols(try L.get("layers.{d}.mlp.down_proj.weight", .{i}), s.lo, s.hi, .bf16);
+             break :bf16 .{ .bf16 = .{ .gu = gu, .down = try L.put("layers.{d}.mlp.down", .{i}) } };
+-        } else if (c.fp8) f8: { // a block FP8 checkpoint's dense layers: [gate | up] and down on the lane, as its shared experts
++        } else if (c.fp8 or x3_f8) f8: { // a block FP8 checkpoint's dense layers: [gate | up] and down on the lane, as its shared experts
+             const parts = [_]formats.Part{ .{ .rel = "mlp.gate_proj", .rows = .{ s.lo, s.hi } }, .{ .rel = "mlp.up_proj", .rows = .{ s.lo, s.hi } } };
+             const gu = try formats.cutProj(L, L.pfx, i, &parts, &.{.fp8_pb}, "layers.{d}.mlp.gu");
+             const down = try formats.cutProj(L, L.pfx, i, &.{.{ .rel = "mlp.down_proj", .cols = .{ s.lo, s.hi } }}, &.{.fp8_pb}, "layers.{d}.mlp.down");
+@@ -553,9 +556,11 @@ const Loader = struct {
+         var x3: ?exl3.Experts = null;
+         // an EXL3 checkpoint's MTP layer may keep BF16 experts (drowzeys/keys-GLM-5.3-EXL3): quantized to NVFP4 at load,
+         // as NVIDIA's NVFP4 checkpoint ships and this loader serves its BF16 MTP experts
+-        const mtp_bf16 = c.exl3 and i == c.layers and if (L.get("layers.{d}.mlp.experts.0.gate_proj.trellis", .{i})) |_| false else |_| true;
+-        if (mtp_bf16) {
+-            routed = try L.nvfp4Experts(i);
++        // (or block FP8 ones, EXL3-K4-v1's: served as a block FP8 checkpoint's experts)
++        const mtp_plain = c.exl3 and i == c.layers and if (L.get("layers.{d}.mlp.experts.0.gate_proj.trellis", .{i})) |_| false else |_| true;
++        if (mtp_plain) {
++            const f8 = (try L.get("layers.{d}.mlp.experts.0.gate_proj.weight", .{i})).dtype == .f8_e4m3;
++            routed = if (f8) try L.fp8Experts(i) else try L.nvfp4Experts(i);
+         } else if (c.exl3) { // the MTP layer's experts too
+             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
+         } else if (c.fp8) {
+-- 
+2.43.0
+

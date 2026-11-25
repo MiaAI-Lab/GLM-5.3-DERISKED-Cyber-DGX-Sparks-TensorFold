@@ -1,0 +1,80 @@
+From 55bbe8185d60ac12c71175440bfa605214d9ceda Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Mon, 23 Nov 2026 05:16:22 +0200
+Subject: [PATCH] glm: unified bit 27 prompt select blocks past 131,072 keys on
+ the multi-CTA top-2048 (U6.3)
+
+---
+ zig/src/families/glm/cuda_native.zig | 1 +
+ zig/src/families/glm/cuda_sparse.zig | 9 ++++++++-
+ zig/src/families/glm/cuda_state.zig  | 2 +-
+ zig/src/families/glm/policy.zig      | 1 +
+ 4 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 21f602ffd..77d898704 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -541,6 +541,7 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+     b.offered |= policy.bit(.prompt_hoist); // 24: the prompt buffers' roped-query block (cuda_state, p[76])
+     b.offered |= policy.bit(.scores_rows); // 25: tf_glm_dsa_scores_r8 (with bit 24)
+     b.offered |= policy.bit(.attn_skip); // 26: tf_glm_chunks_16_w576_i8_skip
++    b.offered |= policy.bit(.prompt_topk_multi); // 27: the prompt buffers' bit words (cuda_state ls)
+     std.log.info("request policies on (TF_GLM_POLICY_REQUESTS=1): default 0x{x}, offered 0x{x}", .{ b.default & b.offered, b.offered });
+     return b;
+ }
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index 8aaad2601..383b1d0e7 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -130,6 +130,10 @@ pub const tscan_threads = 256;
+ pub const tscan_target = 4096;
+ pub const tmerge_threads = 1024;
+ 
++/// Policy bit 27: the keys from which a prompt select block (512 rows) takes the multi-CTA top-2048 (spark6, 512 rows:
++/// 61K 1.27 vs 1.31 ms, 120K 1.72 vs 2.06, 186K 6.52 vs 2.74).
++pub const prompt_multi_from = 131072;
++
+ /// The keys from which the multi-CTA top-2048 is faster (spark5: even at 20,480, slower at 16,384, faster at 24,576).
+ pub const multi_from = 24576;
+ 
+@@ -202,7 +206,10 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+         }
+         stamp.end();
+         stamp = prof_mod.span(profile, stream, .index_select);
+-        if (split == null and topkMulti(policy.on(set.policy, .topk_multi_cta), np, n, s.bits_rows)) {
++        // policy bit 27 (U6.3): a prompt select block's rows past prompt_multi_from keys take tscan / tmerge too (the
++        // same lists bit for bit; their bit words in s.ls, sized for a select block in prompt buffers)
++        const pmulti = set.prompt and n > swift_rows and np >= prompt_multi_from and policy.on(set.policy, .prompt_topk_multi);
++        if (pmulti or (split == null and topkMulti(policy.on(set.policy, .topk_multi_cta), np, n, s.bits_rows))) {
+             // policy bit 3 (topk_multi_cta): the floor's marks on many CTAs (none when every row fits the merge), then a
+             // CTA a row
+             const words = cdiv(np, 32);
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 0a9a54e09..c586a83ed 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -351,7 +351,7 @@ pub const Buffers = struct {
+             partial_rows * HL * 4,
+             4, // dummy
+             @min(seg, sparse.select_rows) * np_max * 4,
+-            @max(rows * sparse.select_list * 4, if (prefill) 0 else sparse.bitsBytes(@min(seg, sparse.wide_rows), np_max)), // ls: a decode select's bit words too
++            @max(rows * sparse.select_list * 4, if (prefill) (if (c.dsa) sparse.bitsBytes(@min(rows, sparse.select_rows), np_max) else 0) else sparse.bitsBytes(@min(seg, sparse.wide_rows), np_max)), // ls: a decode select's bit words too, and a dsa prompt select block's (policy bit 27)
+             rows * sparse.select_list * 4,
+             (if (prefill) rows + s.world else rows) * sparse.topk_pools * 8, // pools; a split's equal blocks end at most world - 1 rows past them
+             4,
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+index b26a0f4ca..7f737c7d2 100644
+--- a/zig/src/families/glm/policy.zig
++++ b/zig/src/families/glm/policy.zig
+@@ -28,6 +28,7 @@ pub const Bit = enum(u5) {
+     prompt_hoist = 24, // U6.1: a prompt chunk's indexer queries roped once a row (tf_glm_dsa_qrope + tf_glm_dsa_scores_roped)
+     scores_rows = 25, // U6.2: with bit 24, a prompt select block's scores 8 rows a CTA sharing each staged key block (tf_glm_dsa_scores_r8)
+     attn_skip = 26, // U5x: dense decode chunks end at their last tile with a visible key (tf_glm_chunks_16_w576_i8_skip)
++    prompt_topk_multi = 27, // U6.3: prompt select blocks past 131,072 keys on tf_glm_dsa_tscan / tmerge
+ };
+ 
+ pub const reserved: Mask = 0x3f;
+-- 
+2.43.0
+

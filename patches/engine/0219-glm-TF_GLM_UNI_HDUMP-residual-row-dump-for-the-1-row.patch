@@ -1,0 +1,106 @@
+From a70478a1a16372f569a818d85358a04a4a64db9b Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Mon, 23 Nov 2026 01:54:37 +0200
+Subject: [PATCH] glm: TF_GLM_UNI_HDUMP residual-row dump for the 1-row decode
+ divergence (diagnosis, off by default; position from <file>.pos)
+
+---
+ zig/src/families/glm/cuda_forward.zig |  8 +++++
+ zig/src/families/glm/uni_hdump.zig    | 52 +++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+)
+ create mode 100644 zig/src/families/glm/uni_hdump.zig
+
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index c8f5ee696..02ba9e839 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -292,6 +292,12 @@ pub const Forward = struct {
+         return if (f.ranks.len == 1 and !f.ranks[0].b.prefill) f.l2pf else null;
+     }
+ 
++    /// TF_GLM_UNI_HDUMP (diagnosis, uni_hdump.zig): rank 0's watched row of the residual after layer `j`'s exchange.
++    fn hdump(f: *const Forward, j: usize, site: u32, R: usize) !void {
++        const r = f.ranks[0];
++        try @import("uni_hdump.zig").at(f.d, f.stream, r.w.share.rank, j, site, R, r.st.pos, r.b.prefill, r.b.hidden, r.w.config.hidden);
++    }
++
+     /// Policy bit 16 (U1): the prefetch's second table and its stopping paced kernel, where loaded and asked for.
+     pub fn prefetchV2(f: *const Forward) ?cuda.Function {
+         const p = f.prefetch() orelse return null;
+@@ -905,6 +911,7 @@ pub const Forward = struct {
+             if (pf) |p| if (v2) |sf| try p.forkV2(f.stream, j, .f, sf) else try p.fork(f.stream, j, .f);
+             try f.reduceDsa(R);
+             if (v2 != null) try pf.?.stopV2(f.stream);
++            try f.hdump(j, 0, R);
+             prof_mod.context(f.prof, j, null, .ffn);
+             for (f.ranks) |r| {
+                 const l = r.w.layers[j];
+@@ -916,6 +923,7 @@ pub const Forward = struct {
+             if (pf) |p| if (v2) |sf| try p.forkV2(f.stream, j, .n, sf) else try p.fork(f.stream, j, .n);
+             try f.reduceDsa(R);
+             if (v2 != null) try pf.?.stopV2(f.stream);
++            try f.hdump(j, 1, R);
+             if (f.prof) |p| p.mark(f.stream, .gather_b);
+             // DSpark's taps: the layer's whole residual rows (decode never scatters; a prompt's scatter path gathers
+             // its rows back into hidden on this stream before the next layer reads them)
+diff --git a/zig/src/families/glm/uni_hdump.zig b/zig/src/families/glm/uni_hdump.zig
+new file mode 100644
+index 000000000..15e838893
+--- /dev/null
++++ b/zig/src/families/glm/uni_hdump.zig
+@@ -0,0 +1,52 @@
++//! TF_GLM_UNI_HDUMP=<file> (diagnosis, rank 0, night/unified S0c): the watched position is the decimal number in
++//! <file>.pos, re-read at each forward's first layer (absent or unreadable: none). Every forward whose rows cover the
++//! position appends that row's bf16 residual after each exchange of each layer (site 0: the
++//! mixer's, 1: the ffn's) as a 32-byte header (layer, site, rows, prompt, first position) and dims x 2 bytes. Off
++//! (unset): nothing runs. Synchronizes the stream at each dump (a diagnostic boot only).
++const std = @import("std");
++const cuda = @import("cuda");
++
++var fd: std.c.fd_t = -1;
++var pos_path: [512:0]u8 = @splat(0);
++var watched: ?usize = null;
++var read_once = false;
++
++fn open() bool {
++    if (!read_once) {
++        read_once = true;
++        const path = std.c.getenv("TF_GLM_UNI_HDUMP") orelse return false;
++        const p = std.mem.span(path);
++        if (p.len + 5 > pos_path.len) return false;
++        @memcpy(pos_path[0..p.len], p);
++        @memcpy(pos_path[p.len .. p.len + 4], ".pos");
++        fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
++        std.log.info("TF_GLM_UNI_HDUMP: residual rows to {s} (position in {s})", .{ p, std.mem.sliceTo(&pos_path, 0) });
++    }
++    return fd >= 0;
++}
++
++fn reread() void {
++    watched = null;
++    const f = std.c.open(&pos_path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
++    if (f < 0) return;
++    defer _ = std.c.close(f);
++    var b: [32]u8 = undefined;
++    const n = std.c.read(f, &b, b.len);
++    if (n <= 0) return;
++    watched = std.fmt.parseInt(usize, std.mem.trim(u8, b[0..@intCast(n)], " \n\r\t"), 10) catch null;
++}
++
++/// After layer `j`'s exchange `site` of a forward of `rows` rows from `pos0`: the watched row of `hidden` (bf16 [rows][dims]).
++pub fn at(d: *const cuda.Driver, stream: cuda.Stream, rank: usize, j: usize, site: u32, rows: usize, pos0: usize, prompt: bool, hidden: u64, dims: usize) !void {
++    if (rank != 0 or !open()) return;
++    if (j == 0 and site == 0) reread();
++    const pos = watched orelse return;
++    if (pos < pos0 or pos >= pos0 + rows) return;
++    var buf: [32768]u8 = undefined;
++    if (dims * 2 > buf.len) return;
++    try stream.synchronize();
++    try d.check(d.api.cuMemcpyDtoH_v2(&buf, hidden + (pos - pos0) * dims * 2, dims * 2), "cuMemcpyDtoH");
++    var h: [8]u32 = .{ @intCast(j), site, @intCast(rows), @intFromBool(prompt), @truncate(pos0), @truncate(pos0 >> 32), @intCast(dims), 0x48445550 };
++    _ = std.c.write(fd, std.mem.asBytes(&h), 32);
++    _ = std.c.write(fd, &buf, dims * 2);
++}
+-- 
+2.43.0
+

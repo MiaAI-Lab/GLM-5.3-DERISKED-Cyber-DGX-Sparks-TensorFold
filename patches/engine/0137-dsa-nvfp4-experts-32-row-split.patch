@@ -1,0 +1,50 @@
+From 9ae087bd9a1f2f78a03d63dbef4a8c9f2cac4161 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:46:33 +0200
+Subject: [PATCH] glm_moe_dsa: NVFP4 routed experts split in 32-row units
+
+2,048 rows in 64-row units do not divide by six: TP=6 gave ranks 0 and 1
+384 rows of every expert and the rest 320 (~12 GiB more on two ranks,
+which set every rank's window). In 32s the split is 352 x 4 and 320 x 2.
+The NVFP4 packer asserts only n % 32 and k % 32, and the decode and
+prompt kernels guard odd K groups and partial output blocks. EXL3 and
+FP8 keep 128; Flash keeps 64.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_shard.zig | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_shard.zig b/zig/src/families/glm/cuda_shard.zig
+index ce5b547..4406a80 100644
+--- a/zig/src/families/glm/cuda_shard.zig
++++ b/zig/src/families/glm/cuda_shard.zig
+@@ -35,7 +35,7 @@ pub const Share = struct {
+             .kda = try span(c.kda_heads, 1, rank, world),
+             .mla = try span(c.mla_heads, 1, rank, world),
+             .dense = try span(c.dense_inter, unit, rank, world),
+-            .moe = try span(c.moe_inter, if (c.exl3 or c.fp8) 128 else unit, rank, world), // EXL3 tiles and rotations, FP8 scale blocks: 128
++            .moe = try span(c.moe_inter, moeUnit(c), rank, world),
+             .shared = try span(c.shared_inter, unit, rank, world),
+             .vocab = try span(c.vocab, c.head_unit, rank, world),
+         };
+@@ -59,6 +59,15 @@ pub const Share = struct {
+     }
+ };
+ 
++/// A routed expert's intermediate rows a rank takes whole. EXL3 tiles and rotations, FP8 scale blocks: 128. NVFP4
++/// packs 32-row blocks and its kernels guard odd K groups and partial output blocks (nvfp4_experts.cu k_loop,
++/// prompt_tiles), so glm_moe_dsa's NVFP4 experts split in 32s: at TP=6 its 2,048 rows go 352 x 4 and 320 x 2 rather
++/// than 384, 384 and 320 x 4, about 6 GiB off ranks 0 and 1. Flash keeps 64 (its partitions and tests unchanged).
++fn moeUnit(c: *const Config) usize {
++    if (c.exl3 or c.fp8) return 128;
++    return if (c.dsa) 32 else unit;
++}
++
+ /// Rank `rank`'s [lo, hi) of `total` elements taken in whole `per`s.
+ fn span(total: usize, per: usize, rank: usize, world: usize) !Span {
+     if (total % per != 0 or world > 256) return error.BadSplit;
+-- 
+2.43.0
+

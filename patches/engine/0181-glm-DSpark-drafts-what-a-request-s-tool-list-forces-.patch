@@ -1,0 +1,844 @@
+From f0c369534cae24319b419b6e4adf53657ee0269f Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 17:46:28 +0200
+Subject: [PATCH] glm: DSpark drafts what a request's tool list forces in a
+ tool call (a name's rest, its keys, the tags between; TF_GLM_TOOL_DRAFTS=0:
+ off)
+
+Rank 0 reads each request's <tools> block (the first <tools> pair that lists a tool: GLM-5.3's template names the tags
+in a sentence first) into the request's copy proposer, the names and parameter keys tokenized as the model writes them
+after a tag. DSpark's chain takes the forced token where only one listed name or key continues the call (and the tags
+between) and carries on from it; the cursor is built from the stream's context plus the round's kept tokens it does not
+hold yet. Drafts only propose: replies stay exact. TP4 K4 (12 parity prompts, 256 tokens): tool tokens a round 2.50 ->
+3.04, tool tok/s 30.5 -> 34.8; drafted replies equal the serial ones. TF_GLM_TOOL_DRAFTS_LOG=N logs the first N
+cursors. test-glm-tools-host (new); test-glm-dspark-host now runs dspark.zig's tests (the file was not in the module's
+test list).
+
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/build/glm_family_host.zig         |   1 +
+ zig/src/families/glm/cuda.zig         |   4 +
+ zig/src/families/glm/cuda_lanes.zig   |  39 ++-
+ zig/src/families/glm/dflash.zig       |   3 +-
+ zig/src/families/glm/dspark.zig       |  60 ++++
+ zig/src/families/glm/tool_carrier.zig |  51 ++++
+ zig/src/families/glm/tool_draft.zig   | 415 ++++++++++++++++++++++++++
+ zig/src/native/cuda.zig               |   8 +
+ zig/src/native/cuda_glm_tools.zig     |  79 +++++
+ zig/src/native/cuda_host_close.zig    |   1 +
+ 10 files changed, 659 insertions(+), 2 deletions(-)
+ create mode 100644 zig/src/families/glm/tool_carrier.zig
+ create mode 100644 zig/src/families/glm/tool_draft.zig
+ create mode 100644 zig/src/native/cuda_glm_tools.zig
+
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 469ee0ac..481a9a83 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -20,6 +20,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     index_emulated.expectExitCode(0);
+     b.step("test-glm-index-emulate", "GLM's prompt indexer kernels as host C++ against a plain top-K and a model of tf_glm_scores").dependOn(&index_emulated.step);
+     const kv8_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "GLM FP8 KV:", "GLM heads:" } }));
++    b.step("test-glm-tools-host", "A request's tool list as drafts: the prompt's <tools> block, the call cursor and its forced tokens, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM tool drafts:"} })).step);
+     b.step("test-glm-dspark-host", "DSpark's host chain (candidate merge, Markov alignment, confidence) without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM DSpark:"} })).step);
+     b.step("test-glm-fp8-kv-host", "GLM latent cache layout, mode agreement and recorded CUDA launches without devices").dependOn(&kv8_run.step);
+     step.dependOn(&kv8_run.step);
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index 673acb49..d09f2e6c 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -101,9 +101,13 @@ test {
+     _ = @import("cuda_snapshot_host.zig");
+     _ = @import("cuda_tile.zig");
+     _ = @import("heat"); // upstream's heat bands, run where the GLM ranks use them
++    _ = @import("tool_draft.zig");
++    _ = @import("dspark.zig");
+ }
+ 
+ pub const dflash = @import("dflash.zig");
++pub const tool_draft = @import("tool_draft.zig");
++pub const tool_carrier = @import("tool_carrier.zig");
+ pub const dflash_candidates = @import("dflash_candidates.zig");
+ pub const dflash_load_owner = @import("dflash_load_owner.zig");
+ 
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index a192b349..6b1d46d2 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -9,6 +9,8 @@ const dflash = @import("dflash.zig");
+ const prompt_lp = @import("cuda_prompt_logprobs.zig");
+ const cuda = @import("cuda");
+ const rule = @import("draft_rule.zig");
++const tool_draft = @import("tool_draft.zig");
++const tool_carrier = @import("tool_carrier.zig");
+ 
+ const be = lanes.backend;
+ 
+@@ -569,6 +571,40 @@ pub const Lanes = struct {
+     /// DFlash2: every request's kept rows committed, then one block round for them all (cuda_follow's block step).
+     /// A stream whose next window a copy takes (the core asks one draft while its room holds more) has its kept rows
+     /// ingested with no block pass, since those drafts would be thrown away (TF_GLM_DFLASH2_COPY_SKIP=0: the pass runs).
++    /// The request's tool list (tool_carrier.zig) at its anchor: the cursor over the stream's context, then over the
++    /// round's kept tokens (`follow`, ending at the anchor; the first token alone after a prompt) the context does not
++    /// hold yet (a round drafted before its commit). Null: no tool list on the request.
++    fn toolCursor(r: be.DraftRequest, anchor: u32) ?tool_draft.Cursor {
++        if (!tool_log_read) {
++            tool_log_read = true;
++            if (std.c.getenv("TF_GLM_TOOL_DRAFTS_LOG")) |v| tool_log = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
++        }
++        const pr = r.stream.proposer orelse return toolMiss("the stream has no proposer");
++        const w = tool_carrier.Carrier.of(pr) orelse return toolMiss("the stream's proposer is not the tool carrier");
++        if (w.schema.tools.len == 0) return null; // no tool list in the prompt (not logged: most requests)
++        const ctx = r.stream.context.items;
++        const one = [1]u32{anchor};
++        const tail: []const u32 = if (r.rows) |rows| r.follow[0..rows.len] else &one;
++        var have: usize = tail.len; // the longest start of `tail` the context already ends with
++        while (have > 0) : (have -= 1) if (ctx.len >= have and std.mem.eql(u32, ctx[ctx.len - have ..], tail[0..have])) break;
++        var c = w.schema.cursor(ctx);
++        for (tail[have..]) |t| c.advance(t);
++        if (tool_log > 0) {
++            tool_log -= 1;
++            std.log.info("glm tool drafts: {d} tools, context {d} tokens (last {d}), round tail {d} of which {d} held, anchor {d}, state {s}", .{ w.schema.tools.len, ctx.len, if (ctx.len > 0) ctx[ctx.len - 1] else 0, tail.len, have, anchor, @tagName(c.st) });
++        }
++        return c;
++    }
++    var tool_log: u32 = 0; // TF_GLM_TOOL_DRAFTS_LOG=N: the first N cursors (or misses) logged (rank 0)
++    var tool_log_read = false;
++    fn toolMiss(why: []const u8) ?tool_draft.Cursor {
++        if (tool_log > 0) {
++            tool_log -= 1;
++            std.log.info("glm tool drafts: no cursor: {s}", .{why});
++        }
++        return null;
++    }
++
+     fn draftBlock(self: *Lanes, requests: []const be.DraftRequest) !void {
+         if (requests.len > dflash.MAX_S) return error.TooManyStreams;
+         var reqs: [dflash.MAX_S]dflash.Req = undefined;
+@@ -593,7 +629,8 @@ pub const Lanes = struct {
+                 .inv_t = @floatCast(1.0 / @max(r.stream.sampling.?.temperature, 1e-6)),
+                 .top_p = @floatCast(r.stream.sampling.?.top_p),
+             };
+-            const q: dflash.Req = .{ .slot = l.slot, .pos = 0, .n = kept, .anchor = anchor, .out = &l.held, .probs = &l.chances, .keyed = keyed };
++            const tools = toolCursor(r, anchor);
++            const q: dflash.Req = .{ .slot = l.slot, .pos = 0, .n = kept, .anchor = anchor, .out = &l.held, .probs = &l.chances, .keyed = keyed, .tools = tools };
+             if (k.copy_skip and r.depth == 1 and r.stream.draftRoom() > 2) {
+                 skips[ns] = q;
+                 ns += 1;
+diff --git a/zig/src/families/glm/dflash.zig b/zig/src/families/glm/dflash.zig
+index 22bd676e..fa3f924e 100644
+--- a/zig/src/families/glm/dflash.zig
++++ b/zig/src/families/glm/dflash.zig
+@@ -100,7 +100,8 @@ pub const Slot = struct {
+ };
+ 
+ /// One stream's request: `n` rows of its last verify into its context first (0: none), the anchor, rank 0's `out`.
+-pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, out: ?[]u32 = null, probs: ?[]f64 = null, keyed: ?select.Keyed = null };
++/// `tools` (DSpark): where the stream stands in a tool call, by its request's tool list (tool_draft.zig).
++pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, out: ?[]u32 = null, probs: ?[]f64 = null, keyed: ?select.Keyed = null, tools: ?@import("tool_draft.zig").Cursor = null };
+ 
+ /// Context runs: `n` tap rows at `taps` (consecutive), positions pos0.., into `ring`.
+ pub const Run = struct { ring: u64, taps: u64, n: usize, pos0: i64 };
+diff --git a/zig/src/families/glm/dspark.zig b/zig/src/families/glm/dspark.zig
+index 12f29aef..7641690e 100644
+--- a/zig/src/families/glm/dspark.zig
++++ b/zig/src/families/glm/dspark.zig
+@@ -495,6 +495,7 @@ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
+     const sp = dr.spark.?;
+     const out = q.out.?;
+     var prev: usize = q.anchor;
++    var tools = q.tools; // the stream's place in a tool call after its anchor, stepped with the chain
+     var alive: f64 = 1;
+     _ = &alive;
+     for (0..DRAFTS) |t| {
+@@ -544,6 +545,14 @@ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
+             pick = g.next;
+             chance = @max(conf, g.conf);
+         };
++        // the request's tool list forces this token (a name's or key's rest, the tags between): ahead of the fixed rules
++        if (tools) |*cur| {
++            if (cur.forced()) |f| {
++                pick = f.id;
++                chance = @max(conf, f.conf);
++            }
++            cur.advance(pick);
++        }
+         prev = pick;
+         out[t] = @intCast(prev);
+         if (q.probs) |p| p[t] = chance;
+@@ -608,3 +617,54 @@ test "GLM DSpark: the chain merges ranks' candidates by value then id, biases by
+     try t.expectApproxEqAbs(@as(f64, 0.5), probs[0], 1e-12); // after the anchor 7: z = 0
+     try t.expectApproxEqAbs(1.0 / (1.0 + @exp(-2.0)), probs[1], 1e-12); // after 9: z = 2
+ }
++
++test "GLM DSpark: the request's tool list forces a name's rest, the key and the tags, and the chain carries on from them" {
++    const t = std.testing;
++    const gpa = t.allocator;
++    const td = @import("tool_draft.zig");
++    const V: usize = 154880; // the tags' ids index the Markov tables
++    var sp: Spark = .{ .module = undefined, .k = undefined, .weights = undefined, .vocab = V };
++    sp.w1 = try gpa.alloc(u16, V * RANK);
++    defer gpa.free(sp.w1);
++    sp.w2 = try gpa.alloc(u16, V * RANK);
++    defer gpa.free(sp.w2);
++    @memset(sp.w1, 0);
++    @memset(sp.w2, 0);
++    sp.conf_h = try gpa.alloc(f32, D);
++    defer gpa.free(sp.conf_h);
++    @memset(sp.conf_h, 0);
++    sp.h_hn = try gpa.alloc(u16, df.MAX_M * D);
++    defer gpa.free(sp.h_hn);
++    @memset(sp.h_hn, 0);
++    sp.conf_m = @splat(0);
++    sp.conf_b = 0;
++    const world: usize = 1;
++    const M: usize = df.BLOCK;
++    const cand = try gpa.alloc(i32, world * M * CW);
++    defer gpa.free(cand);
++    @memset(cand, -1);
++    for (0..M) |r| { // every slot's best candidate is token 1
++        cand[r * CW] = 1;
++        cand[r * CW + TOPK] = @bitCast(@as(f32, 2.0));
++    }
++    var dr: df.Drafter = .{ .gpa = gpa, .d = undefined, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = FF, .rank = 0, .world = world, .spark = &sp };
++    dr.cand = cand;
++    // read_file(path) and run_shell(command): after `<tool_call> read` only read_file is left
++    const read = [_]u32{ 878, 2458 };
++    const run = [_]u32{ 6108, 48634 };
++    const path = [_]u32{2343};
++    const command = [_]u32{5631};
++    const schema: td.Schema = .{ .tools = &.{
++        .{ .name = &read, .params = &.{.{ .key = &path, .required = true }} },
++        .{ .name = &run, .params = &.{.{ .key = &command, .required = true }} },
++    } };
++    var out: [df.BLOCK - 1]u32 = undefined;
++    var probs: [df.BLOCK - 1]f64 = undefined;
++    select(&dr, 0, M, .{ .slot = 0, .pos = 100, .n = 0, .anchor = 878, .out = &out, .probs = &probs, .tools = schema.cursor(&.{ 5, td.tool_call, 878 }) });
++    // _file, <arg_key>, path, </arg_key>, <arg_value> forced; the value's tokens are DSpark's own (token 1, chance 0.5)
++    try t.expectEqualSlices(u32, &.{ 2458, td.arg_key, 2343, td.arg_key_end, td.arg_value, 1, 1 }, &out);
++    for ([_]f64{ 0.97, 0.95, 0.9, 0.97, 0.99, 0.5, 0.5 }, probs) |want, got| try t.expectApproxEqAbs(want, got, 1e-12);
++    // without the list the chain is DSpark's alone
++    select(&dr, 0, M, .{ .slot = 0, .pos = 100, .n = 0, .anchor = 878, .out = &out, .probs = &probs });
++    try t.expectEqualSlices(u32, &.{ 1, 1, 1, 1, 1, 1, 1 }, &out);
++}
+diff --git a/zig/src/families/glm/tool_carrier.zig b/zig/src/families/glm/tool_carrier.zig
+new file mode 100644
+index 00000000..739fdf28
+--- /dev/null
++++ b/zig/src/families/glm/tool_carrier.zig
+@@ -0,0 +1,51 @@
++//! A request's tool schema on its stream: the copy proposer the lane host makes for it (tool_draft.zig's drafts).
++const std = @import("std");
++const lanes = @import("lanes");
++const tool_draft = @import("tool_draft.zig");
++const Allocator = std.mem.Allocator;
++const Schema = tool_draft.Schema;
++
++/// A request's copy proposer (the core's SuffixLookup, every call passed through) that also carries its tool schema:
++/// the drafter's rank 0 finds it on the stream and reads the cursor from it.
++pub const Carrier = struct {
++    gpa: Allocator,
++    arena: std.heap.ArenaAllocator, // the schema's token sequences
++    inner: lanes.SuffixLookup,
++    schema: Schema = .{},
++
++    pub fn proposer(w: *Carrier) lanes.proposer.Proposer {
++        return .{ .ptr = w, .vtable = &vtable };
++    }
++
++    /// The carrier behind a stream's proposer (null: another proposer).
++    pub fn of(p: lanes.proposer.Proposer) ?*const Carrier {
++        return if (p.vtable == &vtable) @ptrCast(@alignCast(p.ptr)) else null;
++    }
++
++    pub fn deinit(w: *Carrier) void {
++        w.inner.deinit();
++        w.arena.deinit();
++    }
++
++    const In = lanes.SuffixLookup;
++    pub const vtable: lanes.proposer.Proposer.VTable = .{ .propose = proposeFn, .propose_after = afterFn, .last_match = lastMatchFn, .last_end = lastEndFn, .observe = observeFn };
++
++    fn self(ptr: *anyopaque) *Carrier {
++        return @ptrCast(@alignCast(ptr));
++    }
++    fn proposeFn(ptr: *anyopaque, context: []const u32, max_draft: i64) anyerror![]const u32 {
++        return In.vtable.propose(&self(ptr).inner, context, max_draft);
++    }
++    fn afterFn(ptr: *anyopaque, history: []const u32, tail: []const u32, max_draft: i64) anyerror![]const u32 {
++        return In.vtable.propose_after.?(&self(ptr).inner, history, tail, max_draft);
++    }
++    fn lastMatchFn(ptr: *anyopaque) i64 {
++        return In.vtable.last_match(&self(ptr).inner);
++    }
++    fn lastEndFn(ptr: *anyopaque) usize {
++        return In.vtable.last_end.?(&self(ptr).inner);
++    }
++    fn observeFn(ptr: *anyopaque, proposed: i64, accepted: i64) void {
++        In.vtable.observe.?(&self(ptr).inner, proposed, accepted);
++    }
++};
+diff --git a/zig/src/families/glm/tool_draft.zig b/zig/src/families/glm/tool_draft.zig
+new file mode 100644
+index 00000000..30ee57f2
+--- /dev/null
++++ b/zig/src/families/glm/tool_draft.zig
+@@ -0,0 +1,415 @@
++//! Tool-call drafts the request's own tool list forces (TF_GLM_TOOL_DRAFTS=0: off).
++//!
++//! GLM-5.3 writes a call as `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`. The names and
++//! parameter keys come from the prompt's `<tools>` block, so once a name or key has started and only one of the listed
++//! ones continues it, the next tokens are known, as are the tags around them. DSpark drafts these positions poorly
++//! (its first draft lands on 61% of them on the parity set's tool replies against 86% on words), so its chain takes
++//! the forced token there and carries on from it. Drafts only propose: the verify keeps every reply exact.
++//!
++//! The schema is token sequences (the host tokenizes the names and keys once a request); this file reads no text
++//! and needs no lane core (tool_carrier.zig holds a request's schema on its stream).
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++
++/// GLM-5.3's tool-call tags (added tokens of its tokenizer; dspark.zig's fixed tag rules name the same ids).
++pub const tool_call: u32 = 154843;
++pub const tool_call_end: u32 = 154844;
++pub const arg_key: u32 = 154847;
++pub const arg_key_end: u32 = 154848;
++pub const arg_value: u32 = 154849;
++pub const arg_value_end: u32 = 154850;
++
++pub const max_params = 64; // a tool's parameters a cursor tracks (its used set is one u64)
++const max_tools = 256;
++const max_piece = 24; // a name's or key's tokens a cursor holds; a longer one forces nothing until its closing tag
++const look_back = 4096; // a stream's last tokens searched for the open <tool_call>
++
++pub const Param = struct { key: []const u32, required: bool };
++pub const Tool = struct { name: []const u32, params: []const Param };
++
++/// A request's tools: every name and key as the tokenizer writes it after a tag.
++pub const Schema = struct {
++    tools: []const Tool = &.{},
++
++    /// The state after `tokens` (a stream's prompt and reply so far, its last token the draft anchor).
++    pub fn cursor(s: *const Schema, tokens: []const u32) Cursor {
++        var c: Cursor = .{ .schema = s };
++        if (s.tools.len == 0) return c;
++        const from = tokens.len -| look_back;
++        var open: ?usize = null;
++        var i = tokens.len;
++        while (i > from) {
++            i -= 1;
++            if (tokens[i] == tool_call_end) break; // the last call closed: outside
++            if (tokens[i] == tool_call) {
++                open = i;
++                break;
++            }
++        }
++        const at = open orelse return c;
++        for (tokens[at..]) |t| c.advance(t);
++        return c;
++    }
++};
++
++pub const Forced = struct { id: u32, conf: f64 };
++pub const St = enum { outside, name, key, after_key, value, after_value };
++
++/// Where a reply stands inside a tool call, and what its schema forces next.
++pub const Cursor = struct {
++    schema: *const Schema,
++    st: St = .outside,
++    tool: u32 = 0,
++    used: u64 = 0,
++    piece: [max_piece]u32 = undefined, // the name's or key's tokens so far
++    n: u32 = 0,
++    over: bool = false, // the piece outgrew `piece`
++
++    fn sofar(c: *const Cursor) []const u32 {
++        return c.piece[0..c.n];
++    }
++
++    /// The token the schema forces next (null: the model's choice).
++    pub fn forced(c: *const Cursor) ?Forced {
++        const tools = c.schema.tools;
++        switch (c.st) {
++            .outside, .value => return null,
++            .name => {
++                if (c.over) return null;
++                var only: ?usize = null;
++                for (tools, 0..) |t, i| {
++                    if (!std.mem.startsWith(u32, t.name, c.sofar())) continue;
++                    if (only != null) return null; // two names continue it
++                    only = i;
++                }
++                const t = tools[only orelse return null];
++                if (c.n < t.name.len) return .{ .id = t.name[c.n], .conf = 0.97 };
++                return .{ .id = if (t.params.len > 0) arg_key else tool_call_end, .conf = 0.95 };
++            },
++            .key => {
++                if (c.over or c.tool >= tools.len) return null;
++                const ps = tools[c.tool].params;
++                if (c.n == 0) { // no token of the key yet: the next unused parameter in the schema's order, if required
++                    for (ps, 0..) |p, i| {
++                        if (i >= max_params or c.used >> @intCast(i) & 1 != 0) continue;
++                        return if (p.required and p.key.len > 0) .{ .id = p.key[0], .conf = 0.9 } else null;
++                    }
++                    return null;
++                }
++                var only: ?usize = null;
++                for (ps, 0..) |p, i| {
++                    if (i >= max_params or c.used >> @intCast(i) & 1 != 0) continue;
++                    if (!std.mem.startsWith(u32, p.key, c.sofar())) continue;
++                    if (only != null) return null;
++                    only = i;
++                }
++                const p = ps[only orelse return null];
++                return if (c.n < p.key.len) .{ .id = p.key[c.n], .conf = 0.97 } else .{ .id = arg_key_end, .conf = 0.97 };
++            },
++            .after_key => return .{ .id = arg_value, .conf = 0.99 },
++            .after_value => {
++                if (c.tool >= tools.len) return null;
++                var left = false;
++                for (tools[c.tool].params, 0..) |p, i| {
++                    if (i >= max_params or c.used >> @intCast(i) & 1 != 0) continue;
++                    if (p.required) return .{ .id = arg_key, .conf = 0.95 };
++                    left = true;
++                }
++                // every required parameter written: the call closes (an optional one may still follow)
++                return .{ .id = tool_call_end, .conf = if (left) 0.85 else 0.95 };
++            },
++        }
++    }
++
++    /// The state after token `t`.
++    pub fn advance(c: *Cursor, t: u32) void {
++        if (t == tool_call) {
++            c.* = .{ .schema = c.schema, .st = .name };
++            return;
++        }
++        switch (c.st) {
++            .outside => {},
++            .name => {
++                if (t == arg_key) {
++                    c.tool = c.match(null) orelse std.math.maxInt(u32);
++                    c.used = 0;
++                    c.open(.key);
++                } else if (t == tool_call_end) {
++                    c.st = .outside;
++                } else c.push(t);
++            },
++            .key => {
++                if (t == arg_key_end) {
++                    if (c.tool < c.schema.tools.len) if (c.match(c.tool)) |i| {
++                        if (i < max_params) c.used |= @as(u64, 1) << @intCast(i);
++                    };
++                    c.open(.after_key);
++                } else if (t == tool_call_end) {
++                    c.st = .outside;
++                } else c.push(t);
++            },
++            .after_key => c.st = if (t == arg_value) .value else .outside,
++            .value => {
++                if (t == arg_value_end) c.st = .after_value;
++                if (t == tool_call_end) c.st = .outside;
++            },
++            .after_value => {
++                if (t == arg_key) c.open(.key) else c.st = .outside;
++            },
++        }
++    }
++
++    fn open(c: *Cursor, st: St) void {
++        c.st = st;
++        c.n = 0;
++        c.over = false;
++    }
++
++    fn push(c: *Cursor, t: u32) void {
++        if (c.n == max_piece) {
++            c.over = true;
++            return;
++        }
++        c.piece[c.n] = t;
++        c.n += 1;
++    }
++
++    /// The tool (`of` null) or `of`'s parameter whose tokens are exactly the piece.
++    fn match(c: *const Cursor, of: ?u32) ?u32 {
++        if (c.over) return null;
++        if (of) |tool| {
++            for (c.schema.tools[tool].params, 0..) |p, i| if (std.mem.eql(u32, p.key, c.sofar())) return @intCast(i);
++            return null;
++        }
++        for (c.schema.tools, 0..) |t, i| if (std.mem.eql(u32, t.name, c.sofar())) return @intCast(i);
++        return null;
++    }
++};
++
++/// TF_GLM_TOOL_DRAFTS=0 turns the schema's drafts off (the fixed tag rules of dspark.zig stay).
++pub fn wanted() bool {
++    const v = std.c.getenv("TF_GLM_TOOL_DRAFTS") orelse return true;
++    return !std.mem.eql(u8, std.mem.span(v), "0");
++}
++
++pub const Encoder = struct { ctx: *anyopaque, encode: *const fn (ctx: *anyopaque, a: Allocator, text: []const u8) anyerror![]const u32 };
++
++/// The tools between `<tools>` and `</tools>` in a rendered prompt: one JSON object a line, a function's `name` and its
++/// `parameters.properties` keys in their written order (`required` marks which must appear); an OpenAI-style
++/// `{"type": "function", "function": {...}}` wrapper is read through. Lines that are not such objects are skipped.
++pub fn schemaOf(a: Allocator, text: []const u8, enc: Encoder) !Schema {
++    // the first <tools> ... </tools> pair that lists a tool: GLM-5.3's template names the tags in a sentence first
++    // ("within <tools></tools> XML tags:"), an empty pair, before the block itself
++    var from: usize = 0;
++    while (std.mem.indexOfPos(u8, text, from, "<tools>")) |open| {
++        const body_at = open + "<tools>".len;
++        const close = std.mem.indexOfPos(u8, text, body_at, "</tools>") orelse return .{};
++        const s = try schemaIn(a, text[body_at..close], enc);
++        if (s.tools.len > 0) return s;
++        from = close + "</tools>".len;
++    }
++    return .{};
++}
++
++fn schemaIn(a: Allocator, body: []const u8, enc: Encoder) !Schema {
++    var tools: std.ArrayList(Tool) = .empty;
++    var lines = std.mem.splitScalar(u8, body, '\n');
++    while (lines.next()) |raw| {
++        const line = std.mem.trim(u8, raw, " \t\r");
++        if (line.len == 0 or line[0] != '{' or tools.items.len == max_tools) continue;
++        const doc = std.json.parseFromSliceLeaky(std.json.Value, a, line, .{}) catch continue;
++        if (doc != .object) continue;
++        const f = if (doc.object.get("function")) |x| (if (x == .object) x else doc) else doc;
++        const name = f.object.get("name") orelse continue;
++        if (name != .string or name.string.len == 0) continue;
++        var params: std.ArrayList(Param) = .empty;
++        if (f.object.get("parameters")) |ps| if (ps == .object) {
++            const required: ?std.json.Value = ps.object.get("required");
++            if (ps.object.get("properties")) |props| if (props == .object) {
++                var it = props.object.iterator();
++                while (it.next()) |kv| {
++                    const key = kv.key_ptr.*;
++                    if (key.len == 0) continue;
++                    var must = false;
++                    if (required) |rq| if (rq == .array) for (rq.array.items) |r| {
++                        if (r == .string and std.mem.eql(u8, r.string, key)) must = true;
++                    };
++                    try params.append(a, .{ .key = try enc.encode(enc.ctx, a, key), .required = must });
++                }
++            };
++        };
++        try tools.append(a, .{ .name = try enc.encode(enc.ctx, a, name.string), .params = params.items });
++    }
++    return .{ .tools = tools.items };
++}
++
++const testing = std.testing;
++
++// read_file(path), run_shell(command, timeout_s?), edit_file(path, old, new), search(pattern, glob?) as the parity
++// set's tool prompts list them; token ids as GLM-5.3's tokenizer writes the names and keys.
++const t_read = [_]u32{ 878, 2458 };
++const t_run = [_]u32{ 6108, 48634 };
++const t_edit = [_]u32{ 7001, 2458 };
++const t_search = [_]u32{1836};
++const k_path = [_]u32{2343};
++const k_command = [_]u32{5631};
++const k_timeout = [_]u32{ 9001, 9002 };
++const k_old = [_]u32{9003};
++const k_new = [_]u32{9004};
++const k_pattern = [_]u32{14329};
++const k_glob = [_]u32{9005};
++const test_schema: Schema = .{ .tools = &.{
++    .{ .name = &t_read, .params = &.{.{ .key = &k_path, .required = true }} },
++    .{ .name = &t_run, .params = &.{ .{ .key = &k_command, .required = true }, .{ .key = &k_timeout, .required = false } } },
++    .{ .name = &t_edit, .params = &.{ .{ .key = &k_path, .required = true }, .{ .key = &k_old, .required = true }, .{ .key = &k_new, .required = true } } },
++    .{ .name = &t_search, .params = &.{ .{ .key = &k_pattern, .required = true }, .{ .key = &k_glob, .required = false } } },
++} };
++
++fn expectForced(c: Cursor, want: ?u32) !void {
++    const f = c.forced();
++    try testing.expectEqual(want, if (f) |x| x.id else null);
++}
++
++test "GLM tool drafts: a call's forced tokens: the rest of a unique name, its keys in order, the tags between, the close" {
++    const s = &test_schema;
++    // prose, then <tool_call>: four names may follow, nothing forced
++    var c = s.cursor(&.{ 11, 12, tool_call });
++    try expectForced(c, null);
++    // `read` continues only read_file: its second token, then <arg_key>, its one key, </arg_key>, <arg_value>
++    c.advance(878);
++    try expectForced(c, 2458);
++    c.advance(2458);
++    try expectForced(c, arg_key);
++    c.advance(arg_key);
++    try expectForced(c, 2343);
++    c.advance(2343);
++    try expectForced(c, arg_key_end);
++    c.advance(arg_key_end);
++    try expectForced(c, arg_value);
++    c.advance(arg_value);
++    try expectForced(c, null); // the value is the model's
++    c.advance(500);
++    c.advance(501);
++    try expectForced(c, null);
++    c.advance(arg_value_end);
++    try expectForced(c, tool_call_end); // every parameter written
++    try testing.expectEqual(@as(f64, 0.95), c.forced().?.conf);
++    c.advance(tool_call_end);
++    try expectForced(c, null);
++}
++
++test "GLM tool drafts: the cursor from a stream's tokens equals the one advanced token by token, and a closed call is outside" {
++    const s = &test_schema;
++    const reply = [_]u32{ 7, tool_call, 6108, 48634, arg_key, 5631, arg_key_end, arg_value, 40, 41, arg_value_end };
++    for (0..reply.len + 1) |n| {
++        var step: Cursor = .{ .schema = s };
++        for (reply[0..n]) |t| step.advance(t);
++        const got = s.cursor(reply[0..n]);
++        try testing.expectEqual(step.st, got.st);
++        const a = step.forced();
++        const b = got.forced();
++        try testing.expectEqual(if (a) |x| x.id else null, if (b) |x| x.id else null);
++    }
++    // run_shell's command written, timeout_s optional: the close at the lower chance
++    const c = s.cursor(&reply);
++    try expectForced(c, tool_call_end);
++    try testing.expectEqual(@as(f64, 0.85), c.forced().?.conf);
++    // a second call after a closed one starts again; after its close nothing is forced
++    try expectForced(s.cursor(&(reply ++ [_]u32{ tool_call_end, tool_call, 1836 })), arg_key);
++    try expectForced(s.cursor(&(reply ++ [_]u32{tool_call_end})), null);
++}
++
++test "GLM tool drafts: several required keys go in the schema's order; a started key picks its own; unknown names and keys force nothing wrong" {
++    const s = &test_schema;
++    var c = s.cursor(&.{ tool_call, 7001, 2458, arg_key });
++    try expectForced(c, 2343); // edit_file: path first
++    for ([_]u32{ 2343, arg_key_end, arg_value, 1, arg_value_end }) |t| c.advance(t);
++    try expectForced(c, arg_key); // old and new still required
++    c.advance(arg_key);
++    try expectForced(c, 9003);
++    c.advance(9004); // the model wrote `new` first: that key is complete, its end tag follows
++    try expectForced(c, arg_key_end);
++    for ([_]u32{ arg_key_end, arg_value, 2, arg_value_end, arg_key }) |t| c.advance(t);
++    try expectForced(c, 9003); // old is the one left
++    // a name no tool has: nothing until the tags, and its keys are unknown
++    var u = s.cursor(&.{ tool_call, 31337 });
++    try expectForced(u, null);
++    u.advance(arg_key);
++    try expectForced(u, null);
++    u.advance(77);
++    try expectForced(u, null);
++    u.advance(arg_key_end);
++    try expectForced(u, arg_value);
++    // an empty schema forces nothing
++    const none: Schema = .{};
++    try expectForced(none.cursor(&.{ tool_call, 878 }), null);
++}
++
++test "GLM tool drafts: two names sharing a prefix force nothing until one is left, and a longer name keeps a shorter one open" {
++    const a = [_]u32{ 10, 11 };
++    const b = [_]u32{ 10, 12 };
++    const short = [_]u32{20};
++    const long = [_]u32{ 20, 21 };
++    const s: Schema = .{ .tools = &.{
++        .{ .name = &a, .params = &.{} },
++        .{ .name = &b, .params = &.{} },
++        .{ .name = &short, .params = &.{} },
++        .{ .name = &long, .params = &.{} },
++    } };
++    try expectForced(s.cursor(&.{ tool_call, 10 }), null);
++    try expectForced(s.cursor(&.{ tool_call, 10, 11 }), tool_call_end); // no parameters: the call closes
++    try expectForced(s.cursor(&.{ tool_call, 20 }), null); // `20` alone or `20 21`
++    try expectForced(s.cursor(&.{ tool_call, 20, 21 }), tool_call_end);
++}
++
++test "GLM tool drafts: a piece longer than the cursor holds forces nothing and the call still parses after it" {
++    const s = &test_schema;
++    var c = s.cursor(&.{tool_call});
++    for (0..max_piece + 3) |i| c.advance(@intCast(60000 + i));
++    try expectForced(c, null);
++    c.advance(arg_key);
++    try expectForced(c, null);
++    c.advance(5);
++    c.advance(arg_key_end);
++    try expectForced(c, arg_value);
++}
++
++// a stand-in tokenizer: one token a byte (the real one is checked on the model's tokenizer.json where it is present)
++fn bytesEncode(_: *anyopaque, a: Allocator, text: []const u8) anyerror![]const u32 {
++    const out = try a.alloc(u32, text.len);
++    for (out, text) |*o, c| o.* = c;
++    return out;
++}
++
++test "GLM tool drafts: a rendered prompt's tool list: names, keys in written order, required ones marked, wrappers read through" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var dummy: u8 = 0;
++    const enc: Encoder = .{ .ctx = &dummy, .encode = bytesEncode };
++    const prompt =
++        \\<|system|>
++        \\# Tools
++        \\You are provided with function signatures within <tools></tools> XML tags:
++        \\<tools>
++        \\{"name": "read_file", "description": "Read a file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}
++        \\{"type": "function", "function": {"name": "run_shell", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout_s": {"type": "integer"}}, "required": ["command"]}}}
++        \\not json
++        \\{"name": "now"}
++        \\</tools>
++        \\<|user|>hi
++    ;
++    const s = try schemaOf(a, prompt, enc);
++    try testing.expectEqual(@as(usize, 3), s.tools.len);
++    try testing.expectEqualSlices(u32, &.{ 'r', 'e', 'a', 'd', '_', 'f', 'i', 'l', 'e' }, s.tools[0].name);
++    try testing.expectEqual(@as(usize, 1), s.tools[0].params.len);
++    try testing.expect(s.tools[0].params[0].required);
++    try testing.expectEqual(@as(usize, 2), s.tools[1].params.len);
++    try testing.expectEqualSlices(u32, &.{ 'c', 'o', 'm', 'm', 'a', 'n', 'd' }, s.tools[1].params[0].key);
++    try testing.expect(s.tools[1].params[0].required);
++    try testing.expect(!s.tools[1].params[1].required);
++    try testing.expectEqual(@as(usize, 0), s.tools[2].params.len);
++    // no block, or one left open: no tools
++    try testing.expectEqual(@as(usize, 0), (try schemaOf(a, "<|user|>hi", enc)).tools.len);
++    try testing.expectEqual(@as(usize, 0), (try schemaOf(a, "<tools>\n{\"name\": \"x\"}", enc)).tools.len);
++}
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index ce0dde5d..8b286ee4 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -27,6 +27,7 @@ const cuda_disk = @import("cuda_disk.zig");
+ const vision_offer = @import("cuda_vision_offer.zig");
+ const drafted = @import("cuda_drafted.zig");
+ const kv_pages = @import("cuda_kv_pool.zig");
++const glm_tools = @import("cuda_glm_tools.zig");
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+ const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native };
+ /// --record opens here (engines.zig refuses it for a backend without this).
+@@ -86,6 +87,7 @@ pub const Host = struct {
+     health: ?api.HealthSource = null,
+     recording: ?*record.Recording = null, // --record: the recorder in front of the family's backend
+     served: drafted.Served = .{ .backend = undefined, .facts = .{}, .stream_bytes = 0 }, // the family's backend, wrapped with --drafter's draft model when given
++    tools: ?*glm_tools.Tools = null, // GLM-5.3's tool list reader: each request's copy proposer carries its <tools> schema
+     fn followFamily(p: *anyopaque) anyerror!void {
+         const h: *Host = @ptrCast(@alignCast(p));
+         if (h.gpu) |g| try g.ctx.makeCurrent();
+@@ -128,6 +130,10 @@ pub const Host = struct {
+         h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
+         errdefer h.core.deinit();
+         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
++        if (h.tools) |t| {
++            t.min_match = h.host.min_match;
++            h.host.proposers = .{ .ctx = t, .make = glm_tools.Tools.make, .free = glm_tools.Tools.free };
++        }
+         h.host.on_thread = .{ .ctx = h, .run = initThread };
+         h.host.memory = if (h.gpu != null) .{ .read = family_memory.read } else null;
+         h.host.explain = explain;
+@@ -476,6 +482,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         std.log.info("recording each stream's rows under {s}/{s}", .{ dir, r.recorder.name });
+     }
+     errdefer if (h.recording) |r| r.free(gpa);
++    if (F == glm.native) h.tools = glm_tools.Tools.open(gpa, io, o.dir);
++    errdefer if (h.tools) |t| t.close();
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+     const admit: ?api.Admit = if (comptime !@hasDecl(F, "fits")) null else if (paged != null) .{ .ctx = loaded.ctx, .fits = F.fits } else null;
+     try h.serve(io, served.facts, loaded.rows, .{
+diff --git a/zig/src/native/cuda_glm_tools.zig b/zig/src/native/cuda_glm_tools.zig
+new file mode 100644
+index 00000000..770c67cd
+--- /dev/null
++++ b/zig/src/native/cuda_glm_tools.zig
+@@ -0,0 +1,79 @@
++//! GLM-5.3's tool list for its drafter (families/glm/tool_draft.zig): each request's prompt is read for its
++//! `<tools>` block, every tool's name and parameter keys tokenized as the model writes them after a tag, and the
++//! schema rides on the request's copy proposer (tool_carrier.zig). Rank 0 only: it selects the drafts.
++//! A prompt with no tool list, or one this does not read, drafts as before. TF_GLM_TOOL_DRAFTS=0: off.
++const std = @import("std");
++const core = @import("core");
++const lanes = @import("lanes");
++const glm = @import("glm_cuda");
++const Allocator = std.mem.Allocator;
++const tool_draft = glm.tool_draft;
++const Carrier = glm.tool_carrier.Carrier;
++
++const max_tools = 256;
++const head_tokens = 32768; // the prompt's first tokens read for the block (a tool list sits in the system part)
++
++pub const Tools = struct {
++    gpa: Allocator,
++    tok: core.tokenizer.Tokenizer,
++    min_match: i64 = 4, // the lane host's copy threshold, as its own SuffixLookup takes it
++
++    /// The tokenizer of `dir`, or null: switched off, a follower rank, or no tokenizer.json this reads.
++    pub fn open(gpa: Allocator, io: std.Io, dir: []const u8) ?*Tools {
++        if (!tool_draft.wanted()) return null;
++        if (std.c.getenv("TF_GLM_RANK")) |r| if (!std.mem.eql(u8, std.mem.span(r), "0")) return null;
++        const t = gpa.create(Tools) catch return null;
++        t.* = .{ .gpa = gpa, .tok = core.tokenizer.loadTokenizer(io, gpa, dir) catch |e| {
++            std.log.warn("glm tool drafts: no tokenizer from {s} ({s}); tool calls draft as before", .{ dir, @errorName(e) });
++            gpa.destroy(t);
++            return null;
++        } };
++        // the tags tool_draft.zig names must be this tokenizer's: another vocabulary keeps its tool calls as they were
++        const tags = [_]struct { text: []const u8, id: u32 }{
++            .{ .text = "<tool_call>", .id = tool_draft.tool_call },   .{ .text = "</tool_call>", .id = tool_draft.tool_call_end },
++            .{ .text = "<arg_key>", .id = tool_draft.arg_key },       .{ .text = "</arg_key>", .id = tool_draft.arg_key_end },
++            .{ .text = "<arg_value>", .id = tool_draft.arg_value },   .{ .text = "</arg_value>", .id = tool_draft.arg_value_end },
++        };
++        for (tags) |g| if (t.tok.specialTokenId(g.text) != g.id) {
++            std.log.info("glm tool drafts: off, this tokenizer's {s} is not token {d}", .{ g.text, g.id });
++            t.close();
++            return null;
++        };
++        std.log.info("glm tool drafts: a request's <tools> names and keys are drafted where they are forced (TF_GLM_TOOL_DRAFTS=0: off)", .{});
++        return t;
++    }
++
++    pub fn close(t: *Tools) void {
++        t.tok.deinit();
++        t.gpa.destroy(t);
++    }
++
++    pub fn make(ctx: *anyopaque, gpa: Allocator, prompt: []const u32, eos: []const u32) anyerror!lanes.proposer.Proposer {
++        _ = eos;
++        const t: *Tools = @ptrCast(@alignCast(ctx));
++        const w = try gpa.create(Carrier);
++        errdefer gpa.destroy(w);
++        w.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .inner = try lanes.SuffixLookup.init(gpa, .{ .min_match = t.min_match }) };
++        w.schema = t.read(w.arena.allocator(), prompt) catch .{};
++        return w.proposer();
++    }
++
++    pub fn free(ctx: *anyopaque, p: lanes.proposer.Proposer) void {
++        _ = ctx;
++        const w: *Carrier = @ptrCast(@alignCast(p.ptr));
++        const gpa = w.gpa;
++        w.deinit();
++        gpa.destroy(w);
++    }
++
++    /// The prompt's tool list as token sequences (empty: none found), allocated in `a`.
++    fn read(t: *const Tools, a: Allocator, prompt: []const u32) !tool_draft.Schema {
++        const text = try t.tok.decode(a, prompt[0..@min(prompt.len, head_tokens)], false);
++        return tool_draft.schemaOf(a, text, .{ .ctx = @constCast(t), .encode = encode });
++    }
++
++    fn encode(ctx: *anyopaque, a: Allocator, text: []const u8) anyerror![]const u32 {
++        const t: *const Tools = @ptrCast(@alignCast(ctx));
++        return t.tok.encodePlain(a, text);
++    }
++};
+diff --git a/zig/src/native/cuda_host_close.zig b/zig/src/native/cuda_host_close.zig
+index 2c1363ea..cfdc3a23 100644
+--- a/zig/src/native/cuda_host_close.zig
++++ b/zig/src/native/cuda_host_close.zig
+@@ -10,6 +10,7 @@ pub fn close(h: anytype) void {
+     if (h.store) |s| kv_pages.closeStore(h.gpa, s);
+     if (h.slide) |s| h.slide_free.?(h.gpa, s);
+     h.gpa.free(h.dir);
++    if (h.tools) |t| t.close();
+     h.served.close(h.gpa);
+     h.release(h.family);
+     if (h.gpu) |g| {
+-- 
+2.43.0
+

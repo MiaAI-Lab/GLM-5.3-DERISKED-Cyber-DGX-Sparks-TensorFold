@@ -1,0 +1,33 @@
+From 0cc2d4b21923c1d449f7094dc178e2ebf12e80ff Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:21:31 +0200
+Subject: [PATCH] 0306: glm_moe_dsa's latent rows stride 576 in the kv norm,
+ not 512
+
+prepareProfile's kv_a rmsnorm wrote s.lat at o_stride=lw (512) while the
+buffer is rows x (lw + rope) and kvRope/latentWriteFormat read it at
+rowW (576): every row past the first landed 64 elements off, and the
+cache write took the misaligned rows whole.
+
+Co-Authored-By: Devin <devin@cognition.ai>
+---
+ zig/src/families/glm/cuda_dsa_block.zig | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index 2366c1e..f88ee37 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -137,7 +137,8 @@ pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch,
+     const two_kw = if (has_ix) try projection.matmulTwo(set, stream, .{ l.proj, ix.kw }, .{ x, x }, .{ x_stride, x_stride }, .{ s.dp, s.ikr }, .{ width, kw_n }, .{ l.dims, l.dims }, s.mm_part, s.mm_part_bytes, rows) else false;
+     if (!two_kw) try projection.matmul(set, stream, l.proj, x, x_stride, s.dp, s.mm_part, rows, width, l.dims, false);
+     try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
+-    try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
++    // the latent rows are rowW apart (the roped tail lands at 512): their norm result strides as the buffer, not lw
++    try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.rowW(), s.xs_lat, l.eps, rows, l.lw);
+     stamp.end();
+     stamp = prof.span(profile, stream, .projections);
+     defer stamp.end();
+-- 
+2.43.0
+

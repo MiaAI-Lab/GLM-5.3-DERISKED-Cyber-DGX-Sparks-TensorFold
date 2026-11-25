@@ -1,0 +1,47 @@
+From 1973fcf6c1a0b35b9b579ada0955d5e87279a0d0 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:03:11 +0200
+Subject: [PATCH] glm_moe_dsa: size the BF16 latent cache at its 576-wide rows
+
+The cache was capacity * 512 * 2 bytes, but latentWriteFormat strides its
+rows at 576, so past 8/9 of the context the writes ran into the layer's ik.
+Snapshot shapes take the same row width.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_disk_image.zig | 2 +-
+ zig/src/families/glm/cuda_state.zig      | 4 +++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_disk_image.zig b/zig/src/families/glm/cuda_disk_image.zig
+index 0f8d501..81ade99 100644
+--- a/zig/src/families/glm/cuda_disk_image.zig
++++ b/zig/src/families/glm/cuda_disk_image.zig
+@@ -76,7 +76,7 @@ pub const Shape = struct {
+             .prefix = first - base,
+             .tail = end - st.mtp_pos_dev,
+             .layers = @intCast(st.caches.len),
+-            .latent = c.kv_lora * @as(u32, if (fp8) 1 else 2),
++            .latent = if (fp8) c.kv_lora else (c.kv_lora + c.rope) * 2, // glm_moe_dsa's BF16 rows carry the rope plane
+             .scales = fp8,
+             .ring_rows = @intCast(st.ring_rows),
+             .ring_row = @intCast(st.ring_row),
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 65fa9b1..ef92710 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -122,7 +122,9 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
+     errdefer sizes.deinit(gpa);
+     try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2 });
+     try sizes.appendSlice(gpa, &.{ nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4, nk * window_rows * s.kda.len() * 4 });
+-    const lc_bytes = try latent.cacheBytes(capacity, c.kv_lora, kv8);
++    // glm_moe_dsa's BF16 latent rows are kv_lora + rope (576) wide, as latentWriteFormat strides them; kv_lora alone
++    // left the last ninth of the context writing into the next cache (its ik)
++    const lc_bytes = try latent.cacheBytes(capacity, if (kv8) c.kv_lora else c.kv_lora + c.rope, kv8);
+     for (0..nd + 1) |j| {
+         const on: usize = @intFromBool(j < nd or head); // the last is the MTP layer's
+         try sizes.appendSlice(gpa, &.{ on * rows * lc_bytes, on * ik_rows * c.i_dim * 2, on * ring_rows * c.i_dim * 2, on * rows * pk_rows * c.i_dim * 2 });
+-- 
+2.43.0
+

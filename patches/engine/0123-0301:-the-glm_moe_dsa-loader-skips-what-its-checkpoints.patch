@@ -1,0 +1,83 @@
+From 0b65cd3037e1de094eb3386fab2469273b1d2d24 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:36:53 +0200
+Subject: [PATCH 2/3] 0301: the glm_moe_dsa loader skips what its checkpoints
+ lack
+
+dsa(): the indexer weights (wk, weights_proj, wq_b, k_norm) load on full layers
+only - a shared layer carries none and reuses the last full layer's token list;
+index_kpool_compress_gate/ape load for Flash's pooled keys alone (kpool > 1).
+layer(): the hc_* mHC tensors load for Flash alone (no_hc addrs stay 0; the
+forward branches on c.dsa before reading them). Everything else - embedding,
+norms, dense/moe/experts, MTP head, lm_head - names match the checkpoint as is.
+---
+ zig/src/families/glm/cuda_weights.zig | 43 +++++++++++++++++++--------
+ 1 file changed, 31 insertions(+), 12 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index fc97c66..4accd83 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -266,16 +266,32 @@ const Loader = struct {
+         const wv = try L.put("layers.{d}.dsa.absorb.wv", .{i});
+         const o = try formats.cutProj(L, prefix, i, &.{.{ .rel = "self_attn.o_proj", .cols = .{ h.lo * c.v_dim, h.hi * c.v_dim } }}, wants, "layers.{d}.dsa.o");
+         const iw: []const formats.Format = if (mtp) &.{ .bf16, .mxfp8 } else &.{.bf16};
+-        const kw = try formats.cutProj(L, prefix, i, &.{ .{ .rel = "self_attn.indexer.wk" }, .{ .rel = "self_attn.indexer.weights_proj" } }, iw, "layers.{d}.dsa.index.kw");
+-        const qb = try formats.cutProj(L, prefix, i, &.{.{ .rel = "self_attn.indexer.wq_b" }}, iw, "layers.{d}.dsa.index.qb");
+-        try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.weight", .{i}), .bf16);
+-        const ln_w = try L.put("layers.{d}.dsa.index.ln_w", .{i});
+-        try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.bias", .{i}), .bf16);
+-        const ln_b = try L.put("layers.{d}.dsa.index.ln_b", .{i});
+-        try L.whole(try L.get("layers.{d}.self_attn.indexer.index_kpool_compress_gate", .{i}), .bf16);
+-        const gate = try L.put("layers.{d}.dsa.index.gate", .{i});
+-        try L.whole(try L.get("layers.{d}.self_attn.indexer.index_kpool_compress_ape", .{i}), .bf16);
+-        const ape = try L.put("layers.{d}.dsa.index.ape", .{i});
++        // glm_moe_dsa computes its top-k on its full layers only (indexer_types): a shared layer carries no
++        // indexer tensors at all and reuses the last full layer's token list, so its index weights stay unset (0).
++        const full = mtp or c.ifull.isSet(i);
++        var kw: projection.Proj = undefined;
++        var qb: projection.Proj = undefined;
++        var ln_w: u64 = 0;
++        var ln_b: u64 = 0;
++        if (full) {
++            kw = try formats.cutProj(L, prefix, i, &.{ .{ .rel = "self_attn.indexer.wk" }, .{ .rel = "self_attn.indexer.weights_proj" } }, iw, "layers.{d}.dsa.index.kw");
++            qb = try formats.cutProj(L, prefix, i, &.{.{ .rel = "self_attn.indexer.wq_b" }}, iw, "layers.{d}.dsa.index.qb");
++            try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.weight", .{i}), .bf16);
++            ln_w = try L.put("layers.{d}.dsa.index.ln_w", .{i});
++            try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.bias", .{i}), .bf16);
++            ln_b = try L.put("layers.{d}.dsa.index.ln_b", .{i});
++        } else {
++            kw = .{ .bf16 = 0 };
++            qb = .{ .bf16 = 0 };
++        }
++        var gate: u64 = 0;
++        var ape: u64 = 0;
++        if (c.kpool > 1) { // Flash pools keys and compresses them through gate and ape; glm_moe_dsa's per-token keys have none
++            try L.whole(try L.get("layers.{d}.self_attn.indexer.index_kpool_compress_gate", .{i}), .bf16);
++            gate = try L.put("layers.{d}.dsa.index.gate", .{i});
++            try L.whole(try L.get("layers.{d}.self_attn.indexer.index_kpool_compress_ape", .{i}), .bf16);
++            ape = try L.put("layers.{d}.dsa.index.ape", .{i});
++        }
+         return .{
+             .proj = proj,
+             .q_norm = q_norm,
+@@ -596,10 +612,13 @@ const Loader = struct {
+         const c = &L.w.config;
+         const in_norm = try L.norm("layers.{d}.input_layernorm.weight", .{i}, "layers.{d}.in_norm");
+         const post_norm = try L.norm("layers.{d}.post_attention_layernorm.weight", .{i}, "layers.{d}.post_norm");
++        // glm_moe_dsa has no mHC residuals: the checkpoints carry no hc_* tensors, and the forward's
++        // hc launches branch on c.dsa before any of these addresses is read (the addrs stay 0).
++        const no_hc: Hc = .{ .fn_w = 0, .base = 0, .scale = 0 };
+         return .{
+             .index = i,
+-            .attn_hc = try L.hc(i, "attn"),
+-            .ffn_hc = try L.hc(i, "ffn"),
++            .attn_hc = if (c.dsa) no_hc else try L.hc(i, "attn"),
++            .ffn_hc = if (c.dsa) no_hc else try L.hc(i, "ffn"),
+             .in_norm = in_norm,
+             .post_norm = post_norm,
+             .mixer = switch (c.kind(i)) {
+-- 
+2.43.0
+
+

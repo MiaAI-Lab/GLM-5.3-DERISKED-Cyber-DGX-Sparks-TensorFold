@@ -1,0 +1,81 @@
+From c1fe9ffc9f9642bd8db2cb47b50a541a4572522a Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 02:42:11 +0200
+Subject: [PATCH] glm: MTP chains stop where the chained chance falls under
+ --mtp-confidence; cap 4
+
+The lanes keep a chain's drafts only while their chained chance stays at
+or above the floor (mtp_policy.prefix), but every chain step of the head
+still ran. The chain now stops at the first draft under the floor (every
+rank reads the same gathered chances); the later drafts read chance 0.
+The cap goes to 4: knapcio's six-Spark sweep of fixed depths (gr8 TP6
+recipe) peaked at 3 and lost a fifth at 7.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_engine.zig | 14 +++++++++++++-
+ zig/src/families/glm/cuda_native.zig |  1 +
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 040748a..3857981 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -29,7 +29,7 @@ pub const Options = @import("cuda_engine_types.zig").Options;
+ pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
+ 
+ /// The most drafts a chain holds (decode.DepthPolicy's top depth).
+-pub const max_drafts = 5; // glm_moe_dsa at TP6: windows of up to 6 rows cost little more than 2 (the lanes rule still picks the depth)
++pub const max_drafts = 4; // glm_moe_dsa at TP6 (a six-Spark sweep of fixed depths peaked at 3; 7 lost a fifth)
+ /// A greedy pick as it crosses ranks: (value, id) and padding, so the RoCE gather (16-byte packs) can carry it.
+ const pair_bytes = 16;
+ /// The rows one gather of greedy picks holds (cuda_engine_pick.greedyRows): a shared window's.
+@@ -90,6 +90,7 @@ pub const Engine = struct {
+     group: ?*const cuda.tp_group.Group = null, // the main stream's all-gathers (RoCE on two ranks); null: lib and comm
+     mesh: ?*@import("cuda_mesh.zig").Mesh = null, // TF_GLM_ROCE_MESH: decode all-gathers by RoCE writes (3+ ranks)
+     side_comm: cuda.nccl.Comm = null, // a prompt chunk's half exchanges on the side stream (fw.wholeDsaHalves), 3+ ranks
++    mtp_floor: f64 = 0, // --mtp-confidence on every rank: an MTP chain stops at the step whose chained chance falls under it
+     ce: ?*cuda.ce_push.Push = null, // TF_GLM_CE_EXCHANGE=1: a prompt chunk's split exchanges by copy engines (cuda_ce.zig)
+     images: ?*images_mod.Images = null, // --vision: a prompt pass's image rows (rank 0 encodes, the others receive)
+     packs: mm_mod.Packed = .{}, // the linears packed at load and their bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
+@@ -762,6 +763,7 @@ pub const Engine = struct {
+             try f.mtp(part, &.{hidden + s0 * D * 2});
+             try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + part.len);
+         }
++        var chain: f64 = 1; // the chances chained, as the lanes read them (a draft lands only if each one before it does)
+         for (0..depth) |j| {
+             if (chances != null and !e.structured and e.cur.sampling == null) {
+                 const p = try e.greedyChance(bm.logits);
+@@ -771,6 +773,16 @@ pub const Engine = struct {
+                 try e.draw(bm.logits, 1, e.cur.st.pos + 1 + j, 0, out[j..][0..1]);
+                 if (chances) |c| c[j] = 1; // a sampled or structured draft keeps chance 1: its window runs whole
+             }
++            if (chances) |c| chain *= c[j];
++            // --mtp-confidence: once the chain falls under the floor no later draft is kept (mtp_policy.prefix), so
++            // the head's further steps are skipped; every rank reads the same gathered chances, so all stop alike
++            if (chances != null and e.mtp_floor > 0 and chain < e.mtp_floor and j + 1 < depth) {
++                for (out[j + 1 .. depth], chances.?[j + 1 .. depth]) |*o, *c| {
++                    o.* = out[j];
++                    c.* = 0;
++                }
++                break;
++            }
+             if (j + 1 < depth) {
+                 try f.mtp(@ptrCast(out[j..][0..1]), &.{bm.fnormed});
+                 try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + 1);
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 22a8769..5963e99 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -239,6 +239,7 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
+     errdefer own.e.deinit();
+     // three ranks or more: a second communicator for a prompt chunk's half exchanges on the side stream, so the main
+     // stream's own collectives (the index split's gathers) never queue behind them (every rank splits, or none can)
++    own.e.mtp_floor = o.mtp_confidence orelse 0;
+     if (p.world >= 3) try own.group.lib.check(own.group.lib.api.ncclCommSplit(own.group.comm, 0, @intCast(p.rank), &own.e.side_comm, null), "ncclCommSplit");
+     if (o.vision) |lim| { // before the rooms: the tower's bytes count against rank 0's
+         var problem: []const u8 = "";
+-- 
+2.43.0
+

@@ -1,0 +1,62 @@
+From 7d91bac39b57ffaeacd8fe31f6ca4310494e81a5 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:06:41 +0200
+Subject: [PATCH] checkpoint: read a weight-map index up to 256 MiB (was 64
+ MiB)
+
+davidsyoung's GLM-5.3 EXL3 TR3 builds store every routed expert as four
+TP rank pieces, so their model.safetensors.index.json names ~1.2M tensors
+and is 82 MB. The three readers that take the index (CUDA memory
+admission, checkpoint identity, checkpoint open) refused it with
+StreamTooLong.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/core/checkpoint.zig          | 2 +-
+ zig/src/core/checkpoint_identity.zig | 2 +-
+ zig/src/native/cuda_memory.zig       | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/core/checkpoint.zig b/zig/src/core/checkpoint.zig
+index 93bc0cf..28be3e7 100644
+--- a/zig/src/core/checkpoint.zig
++++ b/zig/src/core/checkpoint.zig
+@@ -20,7 +20,7 @@ pub fn shardFiles(gpa: std.mem.Allocator, io: Io, dir: []const u8) ![][:0]u8 {
+     }
+     const index = try std.fs.path.join(gpa, &.{ dir, "model.safetensors.index.json" });
+     defer gpa.free(index);
+-    if (Io.Dir.cwd().readFileAlloc(io, index, gpa, .limited(1 << 26))) |text| {
++    if (Io.Dir.cwd().readFileAlloc(io, index, gpa, .limited(1 << 28))) |text| {
+         defer gpa.free(text);
+         const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+         defer parsed.deinit();
+diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_identity.zig
+index e7117f9..20b9249 100644
+--- a/zig/src/core/checkpoint_identity.zig
++++ b/zig/src/core/checkpoint_identity.zig
+@@ -30,7 +30,7 @@ pub fn identity(gpa: std.mem.Allocator, io: Io, dir: []const u8) ![32]u8 {
+ fn shards(a: std.mem.Allocator, io: Io, dir: []const u8, h: ?*Sha256) ![]const []const u8 {
+     var names: std.ArrayList([]const u8) = .empty;
+     const index = try std.fs.path.join(a, &.{ dir, "model.safetensors.index.json" });
+-    if (Io.Dir.cwd().readFileAlloc(io, index, a, .limited(1 << 26))) |text| {
++    if (Io.Dir.cwd().readFileAlloc(io, index, a, .limited(1 << 28))) |text| {
+         if (h) |x| x.update(text);
+         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+         const map = try index_format.weightMap(root);
+diff --git a/zig/src/native/cuda_memory.zig b/zig/src/native/cuda_memory.zig
+index aebbf76..acba4cd 100644
+--- a/zig/src/native/cuda_memory.zig
++++ b/zig/src/native/cuda_memory.zig
+@@ -16,7 +16,7 @@ pub fn weightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !u64 {
+ 
+ /// The files model.safetensors.index.json's weight map names, each once.
+ fn mapped(gpa: std.mem.Allocator, io: std.Io, d: std.Io.Dir) !u64 {
+-    const text = d.readFileAlloc(io, "model.safetensors.index.json", gpa, .limited(1 << 26)) catch |err| {
++    const text = d.readFileAlloc(io, "model.safetensors.index.json", gpa, .limited(1 << 28)) catch |err| {
+         if (err == error.FileNotFound) return error.NoIndex;
+         return err;
+     };
+-- 
+2.43.0
+

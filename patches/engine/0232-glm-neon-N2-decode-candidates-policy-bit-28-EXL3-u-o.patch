@@ -1,0 +1,335 @@
+From ecd89cfeabaa8189cf65ce7126a42e9d239d07e9 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:53:21 +0200
+Subject: [PATCH] glm: neon N2 decode candidates: policy bit 28 (EXL3 u-outer
+ grid forms + dependent combine), bit 29 (L2PF site o stopped before expand_v,
+ stops as a dependent launch)
+
+bit 28: tf_exl3_grouped_2_k8r8p_uo / k8r16p_uo (the k8r*p body with the grid's x and y swapped: the same bits) and
+tf_exl3_down_combine_ndp (tf_exl3_down_combine_nd waiting first, launched as a dependent)
+bit 29 (with bit 16): site o paced and stopped after the attention (forkV3 / At.stop), every stop by tf_glm_l2_epoch
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj5qARY3iLJfisqfnh
+---
+ zig/kernels/cuda/exl3_experts.cu        | 15 +++++++++++++
+ zig/kernels/cuda/glm_glue_l2.cuh        |  9 ++++++++
+ zig/src/cuda/exl3_experts.zig           | 23 +++++++++++++++-----
+ zig/src/families/glm/cuda_dsa_block.zig |  1 +
+ zig/src/families/glm/cuda_forward.zig   | 16 ++++++++++----
+ zig/src/families/glm/cuda_glue.zig      |  1 +
+ zig/src/families/glm/cuda_l2pf.zig      | 28 +++++++++++++++++++++++--
+ zig/src/families/glm/cuda_native.zig    |  2 ++
+ zig/src/families/glm/policy.zig         |  2 ++
+ 9 files changed, 86 insertions(+), 11 deletions(-)
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index b215ff970..33e627962 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -92,6 +92,15 @@ extern "C" __global__ void tf_exl3_grouped_2_k8r8p(tf_exl3::GroupedArgs a) {
+ extern "C" __global__ void tf_exl3_grouped_2_k8r16p(tf_exl3::GroupedArgs a) {
+     tf_exl3::grouped_body_v2<2, 4, 4, GROUPED_SHFL_PDL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+ }
++// neon rank #11 (GLM policy bit 28): the same two with the grid's x and y swapped (column blocks fastest, an expert's
++// blocks launched together): each block's (expert, column block, z) and its sums unchanged, the same bits
++// (night/neon/gputest t5_exl3.out: +0.4-8.2% gate/up, +3.9-4.7% down on GB10, cold weights)
++extern "C" __global__ void tf_exl3_grouped_2_k8r8p_uo(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body_v2<2, 4, 4, GROUPED_SHFL_PDL, 8, 8>(a, blockIdx.y, blockIdx.x, blockIdx.z);
++}
++extern "C" __global__ void tf_exl3_grouped_2_k8r16p_uo(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body_v2<2, 4, 4, GROUPED_SHFL_PDL, 8, 16>(a, blockIdx.y, blockIdx.x, blockIdx.z);
++}
+ 
+ namespace tf_exl3 {
+ 
+@@ -285,6 +294,12 @@ __device__ __forceinline__ void down_combine_body(const DownArgs& a) {
+ }
+ extern "C" __global__ void tf_exl3_down_combine(const DownArgs a) { down_combine_body<false>(a); }
+ extern "C" __global__ void tf_exl3_down_combine_nd(const DownArgs a) { down_combine_body<true>(a); }
++// neon rank #11 (bit 28): tf_exl3_down_combine_nd as a dependent launch: it waits for the down projection before any
++// read (z, pick, y, wts, extra) or store, the same bits
++extern "C" __global__ void tf_exl3_down_combine_ndp(const DownArgs a) {
++    tf_exl3::pdl_wait();
++    down_combine_body<true>(a);
++}
+ 
+ }  // namespace tf_exl3
+ 
+diff --git a/zig/kernels/cuda/glm_glue_l2.cuh b/zig/kernels/cuda/glm_glue_l2.cuh
+index 646868c9d..a71129cd2 100644
+--- a/zig/kernels/cuda/glm_glue_l2.cuh
++++ b/zig/kernels/cuda/glm_glue_l2.cuh
+@@ -49,3 +49,12 @@ extern "C" __global__ void __launch_bounds__(32)
+     }
+   }
+ }
++
++// tf_glm_l2_epoch (neon #5, policy bit 29): stopV2's store as a dependent launch. It lets the window's next dependent
++// launch start at once, then waits for the gather before it (the grid ahead) and writes `epoch` to `stop`: the paced
++// sites end as with the memset, and the chain of dependent launches is not broken by a memset node. Writes no tensor.
++extern "C" __global__ void __launch_bounds__(32) tf_glm_l2_epoch(uint32_t* stop, uint32_t epoch) {
++  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
++  asm volatile("griddepcontrol.wait;" ::: "memory");
++  if (threadIdx.x == 0) *reinterpret_cast<volatile uint32_t*>(stop) = epoch;
++}
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index 35247c54c..cd595441b 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -46,6 +46,9 @@ pub const Layer = struct {
+ /// GLM policy bit 19 (U3b): the forward now running asks combine to skip the fp32 slot rows nobody reads (set by the
+ /// GLM forward at its start, cleared at its end; one forward at a time a process).
+ pub var skip_dead_y: bool = false;
++/// GLM policy bit 28 (neon #11): mul1 read-once windows take the u-outer grid forms (tf_exl3_grouped_2_k8r*p_uo) and,
++/// with skip_dead_y, the combine as a dependent launch (tf_exl3_down_combine_ndp); set and cleared like skip_dead_y.
++pub var neon_uo: bool = false;
+ 
+ pub fn plan(k: usize, n: usize, gateup: bool) !u32 {
+     const cands = [_]usize{ if (gateup) 4 else 1, 2, 1 };
+@@ -130,6 +133,8 @@ pub const Experts = struct {
+     gateup: Function,
+     down_combine: Function,
+     down_combine_nd: ?Function = null, // tf_exl3_down_combine_nd: GLM policy bit 19 (skip_dead_y)
++    grouped_p_m1_uo: ?[2]Function = null, // neon bit 28: grouped_p_m1 with the grid's x and y swapped
++    down_combine_ndp: ?Function = null, // neon bit 28: tf_exl3_down_combine_nd as a dependent launch
+     prompt: prompt.Kernels = undefined,
+     plan_rotate: Function = undefined,
+     plan_finish: Function = undefined,
+@@ -181,6 +186,12 @@ pub const Experts = struct {
+         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
+         e.down_combine = try e.mod.function("tf_exl3_down_combine");
+         e.down_combine_nd = e.mod.function("tf_exl3_down_combine_nd") catch null;
++        e.grouped_p_m1_uo = blk: {
++            const a8 = e.mod.function("tf_exl3_grouped_2_k8r8p_uo") catch break :blk null;
++            const a16 = e.mod.function("tf_exl3_grouped_2_k8r16p_uo") catch break :blk null;
++            break :blk .{ a8, a16 };
++        };
++        e.down_combine_ndp = e.mod.function("tf_exl3_down_combine_ndp") catch null;
+         return e;
+     }
+ 
+@@ -265,7 +276,7 @@ pub const Experts = struct {
+         gu.add(i32d(l.gu_stride));
+         gu.add(@as(i32, 0));
+         gu.add(@as(i32, -1));
+-        try launch_.launch(gt.f, .{ .grid = .{ .x = @intCast(g.maxu), .y = @intCast(g.w / (gt.nt * 16)), .z = @intCast(2 * g.g_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 }, .pdl = chain }, s, &gu);
++        try launch_.launch(gt.f, .{ .grid = if (gt.uo) .{ .x = @intCast(g.w / (gt.nt * 16)), .y = @intCast(g.maxu), .z = @intCast(2 * g.g_sk * g.mt) } else .{ .x = @intCast(g.maxu), .y = @intCast(g.w / (gt.nt * 16)), .z = @intCast(2 * g.g_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 }, .pdl = chain }, s, &gu);
+ 
+         var ep: launch_.Args = .{};
+         ep.add(sc.z);
+@@ -304,7 +315,7 @@ pub const Experts = struct {
+         dn.add(@as(i32, 0));
+         dn.add(@as(i32, 0));
+         dn.add(@as(i32, -1));
+-        try launch_.launch(dt.f, .{ .grid = .{ .x = @intCast(g.maxu), .y = @intCast(g.d / (dt.nt * 16)), .z = @intCast(g.d_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 }, .pdl = chain }, s, &dn);
++        try launch_.launch(dt.f, .{ .grid = if (dt.uo) .{ .x = @intCast(g.d / (dt.nt * 16)), .y = @intCast(g.maxu), .z = @intCast(g.d_sk * g.mt) } else .{ .x = @intCast(g.maxu), .y = @intCast(g.d / (dt.nt * 16)), .z = @intCast(g.d_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 }, .pdl = chain }, s, &dn);
+     }
+ 
+     /// The grouped kernel for a projection of `rows` rows and its tiles a block. Only the block's column span, the width
+@@ -315,11 +326,12 @@ pub const Experts = struct {
+     /// A projection the loader verified 4-bit takes the read-once loads at every window to 32 rows (exl3r's cold-weight
+     /// bench, sm_120, 400 W: gate/up -1, -5, -3, -10, -12% and down -2, -1, -7, -6, -14% at 1, 2, 4, 8, 16 rows).
+     /// `pdl`: the kernel waits before it reads the grid before's outputs, so it may launch as a dependent.
+-    fn tilesFor(e: *const Experts, l: Layer, rows: usize, which: enum { gate_up, down }) struct { f: Function, nt: usize, pdl: bool = false } {
++    fn tilesFor(e: *const Experts, l: Layer, rows: usize, which: enum { gate_up, down }) struct { f: Function, nt: usize, pdl: bool = false, uo: bool = false } {
+         const n = if (which == .gate_up) l.width else l.dims;
+         const m1 = l.codebook == .mul1 and e.mul1_fast; // mul1: the same forms at CB 2 (tf_exl3_grouped_2_*)
+         if (!(l.codebook == .mcg or m1) or rows > 32 or n % 64 != 0) return .{ .f = e.grouped[@backingInt(l.codebook)], .nt = 8 };
+         const k2 = if (which == .gate_up) l.uniform_k2_gu else l.uniform_k2_d;
++        if (e.shfl and k2 == 8 and m1 and e.pdl and neon_uo) if (e.grouped_p_m1_uo) |uo| return .{ .f = uo[@intFromBool(rows > 8)], .nt = 4, .pdl = true, .uo = true };
+         if (e.shfl and k2 == 8) return .{ .f = (if (e.pdl) (if (m1) e.grouped_p_m1 else e.grouped_p) else (if (m1) e.grouped_s_m1 else e.grouped_s))[@intFromBool(rows > 8)], .nt = 4, .pdl = e.pdl };
+         if (rows <= 8 and (k2 == 6 or k2 == 8)) return .{ .f = (if (m1) e.grouped_r8_m1 else e.grouped_r8)[@intFromBool(k2 == 8)], .nt = 4 };
+         const four = switch (which) {
+@@ -349,8 +361,9 @@ pub const Experts = struct {
+         cb.add(i32d(g.slots));
+         cb.add(extra);
+         cb.add(i32d(wslots));
+-        const f = if (skip_dead_y and wts != 0) (e.down_combine_nd orelse e.down_combine) else e.down_combine;
+-        try launch_.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(g.d / 128), .z = 1 }, .block = .{ .x = @intCast(32 * g.slots), .y = 1, .z = 1 } }, s, &cb);
++        const ndp = if (neon_uo and skip_dead_y and wts != 0) e.down_combine_ndp else null;
++        const f = ndp orelse if (skip_dead_y and wts != 0) (e.down_combine_nd orelse e.down_combine) else e.down_combine;
++        try launch_.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(g.d / 128), .z = 1 }, .block = .{ .x = @intCast(32 * g.slots), .y = 1, .z = 1 }, .pdl = ndp != null }, s, &cb);
+     }
+ };
+ 
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index db241b3c1..61e93a7b1 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -132,6 +132,7 @@ pub fn bodyRows(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch
+     try prepareRows(k.set, stream, l, s, x, x_stride, rows, sparseRows(l, host_pos, rows), k.prof, proj_done, qi_rows);
+     if (o_site) |at| try at.fork(stream);
+     try attend(k, stream, l, c, s, 0, rows, pos, host_pos, nch, part_rows);
++    if (o_site) |at| try at.stop(stream); // policy bit 29 (neon #5): site o ends here, before expand_v
+     const stamp = prof.span(k.prof, stream, .projections);
+     defer stamp.end();
+     try latent.expandV(k.set, stream, s.ol, l.wv, s.vn, rows, l.heads, l.dv, l.lw);
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index b13bc26f9..f8c5be345 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -306,6 +306,12 @@ pub const Forward = struct {
+         return if (@import("policy.zig").on(f.policy, .l2pf_v2) and p.hasV2()) f.m.glue.l2_paced_stop else null;
+     }
+ 
++    /// Policy bit 29 (neon #5, with bit 16): glue.l2_epoch, the stops as a dependent launch and site o stoppable.
++    pub fn l2Epoch(f: *const Forward) ?cuda.Function {
++        if (f.prefetchV2() == null or !@import("policy.zig").on(f.policy, .l2pf_v3)) return null;
++        return f.m.glue.l2_epoch;
++    }
++
+     pub fn set(f: *const Forward) glue.Set {
+         return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .pdl_dsa = policy_mod.on(f.policy, .dsa_pdl) and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split, .hc_part = f.m.hc_part, .dscore = if (f.m.dscore) |*x| x else null, .policy = f.policy | f.m.index_boot, .x8 = if (f.m.x8) |*x| x else null };
+     }
+@@ -427,7 +433,7 @@ pub const Forward = struct {
+                     if (b.prefill) try x.prompt(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, done, di, nx) else try x.decode(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, done, di);
+                 } else if (kv_attn.wanted(f, r)) try kv_attn.single(f, r, a, di, rows, nch, k) else {
+                     const done = try f.splitProj(r, a, rows, l.index);
+-                    try dsa_block.bodyPre(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, if (f.prefetch()) |pf| .{ .l2 = pf, .layer = l.index, .v2 = f.prefetchV2() } else null, done);
++                    try dsa_block.bodyPre(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, if (f.prefetch()) |pf| .{ .l2 = pf, .layer = l.index, .v2 = f.prefetchV2(), .epoch = f.l2Epoch() } else null, done);
+                 }
+                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
+             },
+@@ -453,7 +459,7 @@ pub const Forward = struct {
+         const v2 = f.prefetchV2(); // policy bit 16: site q (the indexer's and kv_b's next weights) beside this gather
+         if (v2) |sf| try f.prefetch().?.forkV2(f.stream, j, .q, sf);
+         try m.allGatherBytes(mine, base, sbytes, f.stream.handle);
+-        if (v2 != null) try f.prefetch().?.stopV2(f.stream);
++        if (v2 != null) try f.prefetch().?.stopV3(f.stream, f.l2Epoch());
+         const total = a.q_lora + a.rowW();
+         var u: cuda.Args = .{};
+         inline for (.{ base, r.b.dsa.dp, @as(c_int, @intCast(rows)), @as(c_int, @intCast(a.dec_cw)), @as(c_int, @intCast(total)), @as(i64, @intCast(total)) }) |v| u.add(v);
+@@ -623,6 +629,8 @@ pub const Forward = struct {
+         defer policy_mod.live = 0;
+         cuda.exl3_experts.skip_dead_y = policy_mod.on(f.policy, .down_nodead);
+         defer cuda.exl3_experts.skip_dead_y = false;
++        cuda.exl3_experts.neon_uo = policy_mod.on(f.policy, .exl3_uo);
++        defer cuda.exl3_experts.neon_uo = false;
+         for (f.ranks) |r| {
+             if (R == 0 or R > r.b.rows) return error.BadWindow;
+             if (r.segs.len == 0) {
+@@ -930,7 +938,7 @@ pub const Forward = struct {
+             if (f.prof) |p| p.mark(f.stream, .mla);
+             if (pf) |p| if (v2) |sf| try p.forkV2(f.stream, j, .f, sf) else try p.fork(f.stream, j, .f);
+             try f.reduceDsa(R);
+-            if (v2 != null) try pf.?.stopV2(f.stream);
++            if (v2 != null) try pf.?.stopV3(f.stream, f.l2Epoch());
+             try f.hdump(j, 0, R);
+             prof_mod.context(f.prof, j, null, .ffn);
+             for (f.ranks) |r| {
+@@ -942,7 +950,7 @@ pub const Forward = struct {
+             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared);
+             if (pf) |p| if (v2) |sf| try p.forkV2(f.stream, j, .n, sf) else try p.fork(f.stream, j, .n);
+             try f.reduceDsa(R);
+-            if (v2 != null) try pf.?.stopV2(f.stream);
++            if (v2 != null) try pf.?.stopV3(f.stream, f.l2Epoch());
+             try f.hdump(j, 1, R);
+             if (f.prof) |p| p.mark(f.stream, .gather_b);
+             // DSpark's taps: the layer's whole residual rows (decode never scatters; a prompt's scatter path gathers
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index d70b9ad41..9bba266fe 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -129,6 +129,7 @@ pub const Kernels = struct {
+     router_fused: cuda.Function, // policy bit 14 (neon #13): a prompt's router slices summed in one launch (glm_glue_bmm.cuh)
+     dsa_scores_w8: cuda.Function, // policy bit 11 (neon #1): 8 warps a CTA, a prompt row a warp, 64-key blocks shared (glm_dsa_scores_rows.cuh)
+     dsa_scores_r8: cuda.Function, // policy bit 25 (U6.2): 8 prompt rows a CTA on shared key blocks (glm_dsa_scores_rows.cuh)
++    l2_epoch: cuda.Function, // policy bit 29 (neon #5): a site's stop as a dependent launch (glm_glue_l2.cuh)
+     l2_paced_stop: cuda.Function, // TF_GLM_L2PF policy bit 16: a paced site that stops at its gather's end (glm_glue_l2.cuh)
+     unblock: cuda.Function, // a split [q_a | kv_a]'s gathered column slots back into rows (glm_glue_msa.cuh)
+     msa_w576: cuda.Function, // glm_glue_msa.cuh: a prompt row a block over its token list, the rank's heads one m16 tile
+diff --git a/zig/src/families/glm/cuda_l2pf.zig b/zig/src/families/glm/cuda_l2pf.zig
+index fa7c5f793..e165bbd74 100644
+--- a/zig/src/families/glm/cuda_l2pf.zig
++++ b/zig/src/families/glm/cuda_l2pf.zig
+@@ -344,6 +344,12 @@ pub const L2pf = struct {
+     /// Policy bit 16's site `site` of layer `j`: its table; the paced sites by `stop_fn` (glue.l2_paced_stop), which
+     /// ends once `stopV2` has run on `main` after the gather.
+     pub fn forkV2(p: *const L2pf, main: cuda.Stream, j: usize, site: Site, stop_fn: cuda.Function) !void {
++        return p.forkV3(main, j, site, stop_fn, false);
++    }
++
++    /// forkV2 with `paced_o` (policy bit 29, neon #5): site o paced and stoppable too (stopV2 after the attention, before
++    /// expand_v), instead of read whole beside expand_v and o_proj.
++    pub fn forkV3(p: *const L2pf, main: cuda.Stream, j: usize, site: Site, stop_fn: cuda.Function, paced_o: bool) !void {
+         if (j * 4 >= p.spans2.len) return;
+         const sp = p.spans2[j * 4 + @backingInt(site)];
+         if (sp.rows == 0) return;
+@@ -353,7 +359,7 @@ pub const L2pf = struct {
+         a.add(p.rows2.?.ptr + @as(u64, sp.at) * 16);
+         a.add(@as(c_int, @intCast(sp.rows)));
+         a.add(chunk);
+-        if (site != .o and p.o.pace_gbps > 0) {
++        if ((site != .o or paced_o) and p.o.pace_gbps > 0) {
+             p.epoch.* +%= 1;
+             a.add(@as(u64, @max(1, (chunk + p.o.pace_gbps / 2) / p.o.pace_gbps)));
+             a.add(p.stop.?.ptr);
+@@ -367,7 +373,19 @@ pub const L2pf = struct {
+ 
+     /// Policy bit 16: the gather beside the last paced site has ended on `main`; that site stops prefetching.
+     pub fn stopV2(p: *const L2pf, main: cuda.Stream) !void {
++        return p.stopV3(main, null);
++    }
++
++    /// stopV2 by `epoch_fn` (policy bit 29: glue.l2_epoch, a one-thread dependent launch that keeps the window's chain
++    /// of dependent launches unbroken) when given, else the memset.
++    pub fn stopV3(p: *const L2pf, main: cuda.Stream, epoch_fn: ?cuda.Function) !void {
+         const st = p.stop orelse return;
++        if (epoch_fn) |f| {
++            var a: cuda.Args = .{};
++            a.add(st.ptr);
++            a.add(p.epoch.*);
++            return cuda.launch.launch(f, .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 }, .pdl = true }, main, &a);
++        }
+         try p.d.check(p.d.api.cuMemsetD32Async(st.ptr, p.epoch.*, 1, main.handle), "cuMemsetD32Async");
+     }
+ 
+@@ -383,11 +401,17 @@ pub const At = struct {
+     l2: *const L2pf,
+     layer: usize,
+     v2: ?cuda.Function = null, // policy bit 16: its table (glue.l2_paced_stop)
++    epoch: ?cuda.Function = null, // policy bit 29 (neon #5, with bit 16): site o paced, stopped after the attention by this kernel
+ 
+     pub fn fork(at: At, main: cuda.Stream) !void {
+-        if (at.v2) |f| return at.l2.forkV2(main, at.layer, .o, f);
++        if (at.v2) |f| return at.l2.forkV3(main, at.layer, .o, f, at.epoch != null);
+         return at.l2.fork(main, at.layer, .o);
+     }
++
++    /// Bit 29: the attention has run; site o stops before expand_v.
++    pub fn stop(at: At, main: cuda.Stream) !void {
++        if (at.v2 != null) if (at.epoch) |f| try at.l2.stopV3(main, f);
++    }
+ };
+ 
+ fn Env(comptime pairs: anytype) type {
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index aaa275016..cc2871476 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -561,6 +561,8 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+     b.offered |= policy.bit(.mm8_tiles); // 12 (neon #2): glm_mm8_p128x64 / p64x128 (cuda_mm prompt_tiles)
+     b.offered |= policy.bit(.msa_f3); // 13 (neon #9): tf_glm_msa_w576_i8_f3 / dense_i8_f3
+     b.offered |= policy.bit(.router_fused); // 14 (neon #13): tf_glm_router_fused
++    b.offered |= policy.bit(.exl3_uo); // 28 (neon #11): falls back to the unchanged forms where the kernels are absent
++    if (b.offered & policy.bit(.l2pf_v2) != 0) b.offered |= policy.bit(.l2pf_v3); // 29 (neon #5): with bit 16's table
+     b.offered |= policy.bit(.scores_w8); // 11 (neon #1): tf_glm_dsa_scores_w8 (with bit 24)
+     std.log.info("request policies on (TF_GLM_POLICY_REQUESTS=1): default 0x{x}, offered 0x{x}", .{ b.default & b.offered, b.offered });
+     return b;
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+index fc8d10855..d712d801b 100644
+--- a/zig/src/families/glm/policy.zig
++++ b/zig/src/families/glm/policy.zig
+@@ -22,6 +22,8 @@ pub const Bit = enum(u5) {
+     msg_cuts = 9, // prompt chunks also cut at the server's message starts (TF_GLM_MSG_CUTS=1); slot resume may stand there
+     index_scan_split = 10, // with bits 2 and 3: a long decode window's index scan and top-2048 split over the ranks' key blocks
+     // the neon run's candidates (night/neon): bits 11-15 and 28-31, each off unless a request (or the default) asks
++    l2pf_v3 = 29, // neon #5: with bit 16, site o paced and stopped before expand_v; the stops as a dependent launch
++    exl3_uo = 28, // neon #11: mul1 decode experts on the u-outer grid forms + the dependent combine (with bit 19)
+     router_fused = 14, // neon #13: a prompt's router on tf_glm_router_fused (slices summed in registers, no slice partials)
+     msa_f3 = 13, // neon #9: a prompt's int8 sparse/dense attention on tf_glm_msa_w576_i8_f3 / dense_i8_f3
+     mm8_tiles = 12, // neon #2: 8-bit prompt linears on glm_mm8_p128x64 / p64x128 by shape (cuda_mm promptTile)
+-- 
+2.43.0
+

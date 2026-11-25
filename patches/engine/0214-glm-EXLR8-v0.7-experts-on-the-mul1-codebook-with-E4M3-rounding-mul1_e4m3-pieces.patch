@@ -1,0 +1,1016 @@
+From a2f8a9abda87bc6377e5cdc4ef01264a88822803 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Thu, 19 Nov 2026 10:51:17 +0200
+Subject: [PATCH] glm: EXLR8 v0.7 experts on the mul1 codebook with E4M3
+ rounding (mul1_e4m3 pieces)
+
+kindlingai's EXLR8 release v0.7 (https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4, format https://github.com/kindlingai/exlr8)
+re-encodes every routed and shared expert in the mul1 codebook, with every value rounded to E4M3 as in the earlier release's mcg
+codebook. Patch 0205 read the earlier release through the mcg_e4m3 decode; this patch adds the mul1 one.
+
+Kernel: exl3_decode.cuh gains CB_MUL1_E4M3 (build define TF_EXL3_MUL1_E4M3, set in the existing e4m3 expert and linear images):
+the mul1 hash and single-rounded fp16 multiply-add as before, then the fp16 pair is rounded to E4M3 and back (round to nearest even,
+saturating finite; the hardware cvt on sm_89 and up, an integer emulation proved exhaustively on older targets). mcg decoding and
+images without the define are unchanged. zig/tests/exl3_mul1_e4m3_check.cu decodes all 65,536 states in both slots and compares
+bit for bit with a host reference following kindlingai's reference loader (value rounded once to fp16, then to E4M3): 0 of 262,144
+differ; the unrounded decode differs on 262,126 of 262,144 (the control).
+
+Loader: the converter's rank pieces mark the codebook with a mul1_e4m3 tensor (0x83DCD12D) where 0205's pieces carry mcg_e4m3;
+cuda_exl3.zig, config.zig, cuda_x8.zig, cuda_weights.zig and cuda_ranks.zig accept it (e4m3 set, Layer.codebook = mul1), refuse a layer
+that mixes the two codebooks, and put the codebook in the rank agreement. Prompt expert kernels stay mcg-only, so mul1 layers prompt
+through the grouped kernels (the host gate refuses them in exl3_prompt.zig). Host tests: test-glm-exl3-host 24/24.
+
+Grouping of prompt picks past 64 KiB: tf_exl3_group staged rows * slots * 4 B of picks in shared memory, 128 KiB for a 4,096-row chunk at 8
+slots, which fails to launch on GB10 (CUDA_ERROR_INVALID_VALUE, 64 KiB opted in). mcg layers prompt through the prompt kernels, so only
+mul1 layers (which prompt through the grouped path) reached it: an 8,192-token prompt took the server down. The kernel now reads the picks
+from global memory when they do not fit (GroupArgs.use_global, set by Experts.group); the same grouping, the same words.
+---
+ zig/build/cuda_kernels.zig               |   4 +-
+ zig/kernels/cuda/exl3_decode.cuh         |  74 ++++++++-
+ zig/kernels/cuda/exl3_experts.cu         |   5 +
+ zig/src/cuda/exl3_experts.zig            |   7 +-
+ zig/src/families/glm/config.zig          |  17 ++-
+ zig/src/families/glm/cuda_exl3.zig       |  44 +++---
+ zig/src/families/glm/cuda_exl3_test.zig  | 134 ++++++++++++++--
+ zig/src/families/glm/cuda_forward.zig    |   3 +-
+ zig/src/families/glm/cuda_ranks.zig      |  29 +++-
+ zig/src/families/glm/cuda_ranks_test.zig |  30 +++-
+ zig/src/families/glm/cuda_weights.zig    |  13 +-
+ zig/src/families/glm/cuda_x8.zig         |  98 +++++++++---
+ zig/tests/exl3_mul1_e4m3_check.cu        | 187 +++++++++++++++++++++++
+ 13 files changed, 575 insertions(+), 70 deletions(-)
+ create mode 100644 zig/tests/exl3_mul1_e4m3_check.cu
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 5173a73fe..c9be19f7e 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -105,8 +105,8 @@ pub const kernels = [_]Kernel{
+     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
+     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
+     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
+-    .{ .name = "exl3_experts_e4m3", .src = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr", "-DTF_EXL3_MCG_E4M3=1" } }, // the same kernels on EXLR8's E4M3 mcg values (patch 0205)
+-    .{ .name = "exl3_linear_e4m3", .src = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr", "-DTF_EXL3_MCG_E4M3=1" } }, // the EXL3 linear on EXLR8's E4M3 mcg values: EXLR8 dense trellis decode rows (patch 0205b)
++    .{ .name = "exl3_experts_e4m3", .src = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr", "-DTF_EXL3_MCG_E4M3=1", "-DTF_EXL3_MUL1_E4M3=1" } }, // the same kernels on EXLR8's E4M3 values: mcg (patch 0205) and v0.7's mul1 with the format's E4M3 rounding
++    .{ .name = "exl3_linear_e4m3", .src = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr", "-DTF_EXL3_MCG_E4M3=1", "-DTF_EXL3_MUL1_E4M3=1" } }, // the EXL3 linear on EXLR8's E4M3 values: mcg dense trellis decode rows (patch 0205b) and v0.7's mul1 with the rounding
+     .{ .name = "exlr8_recon", .flags = &.{ "-O3", "--fmad=false" } }, // ours: EXLR8 trellis matrices rebuilt as bf16 rows for prompt GEMMs (patch 0205b)
+     .{ .name = "exl3_candidate", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // #806's EXL3 tiles: Dense's candidate
+     .{ .name = "glm_vision", .flags = &.{"-O3"} }, // ours: GLM's image tower steps around cuBLASLt (norms, rotary, softmax, merger)
+diff --git a/zig/kernels/cuda/exl3_decode.cuh b/zig/kernels/cuda/exl3_decode.cuh
+index 4925bdc22..9ed1d94c9 100644
+--- a/zig/kernels/cuda/exl3_decode.cuh
++++ b/zig/kernels/cuda/exl3_decode.cuh
+@@ -10,7 +10,7 @@ namespace tf_exl3 {
+ 
+ // CB_MCG_E4M3: EXLR8 (kindlingai's exlr8-e4m3-v2 scheme): the mcg codebook value rounded to E4M3 (nearest even), the
+ // format's weight values; tiles, streams and placement are EXL3's, so only the value step differs (patch 0205).
+-enum Codebook : int { CB_3INST = 0, CB_MCG = 1, CB_MUL1 = 2, CB_MCG_E4M3 = 3 };
++enum Codebook : int { CB_3INST = 0, CB_MCG = 1, CB_MUL1 = 2, CB_MCG_E4M3 = 3, CB_MUL1_E4M3 = 4 };
+ 
+ // TF_EXL3_MCG_E4M3=1 builds a module whose every mcg decode is EXLR8's (the exl3_experts_e4m3 image, patch 0205): the
+ // same kernels, the mcg sum taken at 2^-8 (xor MCG_XOR) and finished by mcg_e4m3_finish. 0 (every other image): unchanged.
+@@ -19,6 +19,13 @@ enum Codebook : int { CB_3INST = 0, CB_MCG = 1, CB_MUL1 = 2, CB_MCG_E4M3 = 3 };
+ #endif
+ constexpr uint32_t MCG_XOR = TF_EXL3_MCG_E4M3 ? 0x1B601B60u : 0x3B603B60u;
+ 
++// TF_EXL3_MUL1_E4M3=1 (the e4m3 images, beside TF_EXL3_MCG_E4M3) builds the module for EXLR8 v0.7's mul1 experts too
++// (FORMAT.md's mul1 codebook): decode2<CB_MUL1> aliases to decode2<CB_MUL1_E4M3>, mul1's value with the format's E4M3
++// rounding, the way TF_EXL3_MCG_E4M3 aliases CB_MCG. 0 (every other image): CB_MUL1 stays the unrounded EXL3 mul1.
++#ifndef TF_EXL3_MUL1_E4M3
++#define TF_EXL3_MUL1_E4M3 0
++#endif
++
+ // An mcg pair summed at 2^-8 (xor 0x1B60), rounded to E4M3 at bit 7 (nearest even, subnormals included) and scaled back
+ // by 2^8: exlr8.cu's tf_exlr8_pair after its sum.
+ __device__ __forceinline__ uint32_t mcg_e4m3_finish(uint32_t b) {
+@@ -27,6 +34,57 @@ __device__ __forceinline__ uint32_t mcg_e4m3_finish(uint32_t b) {
+     return *reinterpret_cast<const uint32_t*>(&r);
+ }
+ 
++// One fp16 lane rounded to E4M3 and back to fp16, the value the format stores: nearest even on the E4M3 grid,
++// subnormals included, saturating at +-448 like cvt.rn.satfinite. Below sm_89 (the release fatbins also carry
++// sm_80/86, where the e4m3 conversions do not assemble) the same rounding in integers: the significand rounded to
++// four bits at bit 7 with the carry into the next binade, the subnormal grid of 2^-9 steps under 2^-6, the
++// satfinite clamp of the top binade's non-finite code. Proved bit-exact against the hardware path, CUDA's host
++// conversion and a first-principles reference for all 65536 fp16 patterns (tests/exl3_mul1_e4m3_check.cu).
++__device__ __forceinline__ uint16_t e4m3_round1(uint16_t h) {
++    const uint16_t s = h & 0x8000u;
++    const uint32_t a = h & 0x7fffu;
++    if (a >= 0x7C00u) return (uint16_t)(a > 0x7C00u ? (s | 0x7E00u) : (s | 0x5F00u));   // nan; +-inf satfinite -> +-448
++    if (a < 0x0400u) return s;   // an fp16 subnormal is under half the smallest E4M3 subnormal (2^-10): zero
++    const uint32_t f16e = a >> 10, sig = (a & 0x3FFu) | 0x400u;   // value = sig · 2^(f16e - 25)
++    uint32_t code;
++    if (f16e >= 9) {   // 2^-6 and up: the E4M3 normals, four significand bits at bit 7
++        uint32_t q = sig >> 7, r = sig & 0x7Fu;
++        if (r > 0x40u || (r == 0x40u && (q & 1u))) q++;   // nearest even; q = 16 carries into the next binade
++        const int e = (int)f16e - 15 + (q == 16u ? 1 : 0);
++        if (q == 16u) q = 8u;
++        if (e > 8 || (e == 8 && q == 15u)) return (uint16_t)(s | 0x5F00u);   // satfinite: 480 and up clamp to 448
++        code = ((uint32_t)(e + 7) << 3) | (q & 7u);
++    } else {   // under 2^-6: the E4M3 subnormals, 2^-9 steps (8 of them is 2^-6, the smallest normal)
++        const uint32_t sh = 16u - f16e;   // 1 - e, e = f16e - 15 <= -7
++        uint32_t q = sig >> sh, r = sig & ((1u << sh) - 1u);
++        if (r > (1u << (sh - 1)) || (r == (1u << (sh - 1)) && (q & 1u))) q++;   // nearest even at 2^-9
++        code = q;
++    }
++    if (code < 8u) {   // subnormal: code · 2^-9, exact in fp16
++        if (code == 0u) return s;
++        const uint32_t hb = 31u - __clz(code);
++        return (uint16_t)(s | ((hb + 6u) << 10) | ((code - (1u << hb)) << (10 - hb)));
++    }
++    return (uint16_t)(s | (((code >> 3) + 8u) << 10) | ((code & 7u) << 7));   // 1.m · 2^(field - 7), exact
++}
++
++// A mul1 pair's fp16 values rounded to E4M3 (nearest even, subnormals included, saturating at +-448) and back to
++// fp16: FORMAT.md's Decode rounding ("v -> E4M3 (nearest even, clamp +-448) -> fp32"), which every codebook's value
++// takes. sm_89 up (the e4m3 images' SASS from sm_120 on; the target is sm_121) takes the hardware conversions, lane
++// for lane; older targets e4m3_round1 per lane.
++__device__ __forceinline__ uint32_t mul1_e4m3_finish(uint32_t hh) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
++    unsigned short e2;
++    asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(e2) : "r"(hh));
++    uint32_t r;
++    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(e2));
++    return r;
++#else
++    const uint16_t lo = e4m3_round1((uint16_t)hh), hi = e4m3_round1((uint16_t)(hh >> 16));
++    return (uint32_t)lo | ((uint32_t)hi << 16);
++#endif
++}
++
+ // 32-bit words of a tile: 256 values of K2 / 2 bits.
+ template <int K2>
+ __host__ __device__ constexpr int tile_words() {
+@@ -108,7 +166,19 @@ __device__ __forceinline__ void lane_states(const uint32_t (&w)[lane_words<K2>()
+ // Two codebook values from two 16-bit states, as a half2 in a uint32 (the first state in the low half).
+ template <int CB>
+ __device__ __forceinline__ uint32_t decode2(uint32_t s0, uint32_t s1) {
+-    if constexpr (CB == CB_MUL1) {
++    if constexpr (CB == CB_MUL1_E4M3 || (CB == CB_MUL1 && TF_EXL3_MUL1_E4M3)) {
++        // mul1 with the format's E4M3 rounding (EXLR8 v0.7's experts; the e4m3 images, TF_EXL3_MUL1_E4M3): the mul1
++        // value as below, then mul1_e4m3_finish. FORMAT.md's Codebook rounds every codebook's value to E4M3, and
++        // mul1's fp16 operation order matters because of that rounding — the __hfma2 is the definition's single
++        // fp16 rounding of (1024 + Σb)·c + d (exl3_format.zig's codebookValue does it as one float64 multiply-add).
++        const uint32_t x0 = s0 * 0x83DCD12Du, x1 = s1 * 0x83DCD12Du;
++        const uint32_t h0 = __dp4a(x0, 0x01010101u, 0x6400u);    // fp16 bits of 1024 + the byte sum
++        const uint32_t h1 = __dp4a(x1, 0x01010101u, 0x6400u);
++        const uint32_t hh = (h0 & 0xffffu) | (h1 << 16);
++        const half2 r = __hfma2(*reinterpret_cast<const half2*>(&hh), __half2half2(__ushort_as_half(0x1eee)),
++                                __half2half2(__ushort_as_half(0xc931)));
++        return mul1_e4m3_finish(*reinterpret_cast<const uint32_t*>(&r));
++    } else if constexpr (CB == CB_MUL1) {
+         const uint32_t x0 = s0 * 0x83DCD12Du, x1 = s1 * 0x83DCD12Du;
+         const uint32_t h0 = __dp4a(x0, 0x01010101u, 0x6400u);    // fp16 bits of 1024 + the byte sum
+         const uint32_t h1 = __dp4a(x1, 0x01010101u, 0x6400u);
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index 0bcdba5aa..41cbd8b1c 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -76,11 +76,16 @@ struct GroupArgs {
+     int* ucount; // int32 [1]
+     int* members; // int32 [nexp_max, maxm]
+     int rows, slots, experts, maxm;
++    int use_global; // 1: the picks do not fit the block's shared memory (rows * slots * 4 B over 64 KiB, a 4,096-row prompt chunk): read them from `pick`
+ };
+ 
+ extern "C" __global__ void __launch_bounds__(GROUP_THREADS) tf_exl3_group(const GroupArgs a) {
+     extern __shared__ int sh_pick[];
+     const int n = a.rows * a.slots;
++    if (a.use_global) {  // the same grouping on the picks in global memory (L1/L2 cached): the same words as the shared path
++        group_rows(a.pick, n, a.slots, a.experts, a.maxm, a.uids, a.ucount, a.members);
++        return;
++    }
+     for (int i = threadIdx.x; i < n; i += GROUP_THREADS) sh_pick[i] = a.pick[i];
+     __syncthreads();
+     group_rows(sh_pick, n, a.slots, a.experts, a.maxm, a.uids, a.ucount, a.members);
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index e65157e1f..3ff8228a6 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -195,7 +195,12 @@ pub const Experts = struct {
+         a.add(i32d(g.slots));
+         a.add(i32d(l.experts));
+         a.add(i32d(rows));
+-        try launch_.launch(e.group_fn, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 }, .shared = @intCast(rows * g.slots * 4) }, s, &a);
++        // picks past the block's 64 KiB of dynamic shared memory (rows * slots * 4 B: a 4,096-row chunk at 8 slots is 128 KiB, which
++        // launches with CUDA_ERROR_INVALID_VALUE on GB10) are read from global memory
++        const pick_bytes = rows * g.slots * 4;
++        const use_global = pick_bytes > 64 * 1024;
++        a.add(i32d(if (use_global) 1 else 0));
++        try launch_.launch(e.group_fn, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 }, .shared = @intCast(if (use_global) 0 else pick_bytes) }, s, &a);
+     }
+ 
+     /// Rotate in, grouped gate/up, SwiGLU, grouped down: the down partials in sc.z from picks already grouped in sc
+diff --git a/zig/src/families/glm/config.zig b/zig/src/families/glm/config.zig
+index f9210c369..f6491d8b2 100644
+--- a/zig/src/families/glm/config.zig
++++ b/zig/src/families/glm/config.zig
+@@ -7,6 +7,10 @@ pub const max_layers = 96;
+ 
+ pub const Kind = enum { kda, mla };
+ 
++/// The E4M3 codebook a quantization_config names: "mcg_e4m3" (patch 0205's EXLR8 conversion, mcg rounded to E4M3) or
++/// "mul1_e4m3" (v0.7's, mul1 rounded to E4M3; exlr8_pieces.py writes the pieces and the markers its config names).
++pub const Exl3Book = enum { none, mcg_e4m3, mul1_e4m3 };
++
+ /// List entries a decode attention block takes: the same at every window width, so every row's sums keep one order.
+ pub const attn_span = 128;
+ 
+@@ -17,7 +21,8 @@ pub const Config = struct {
+     vocab: u32 = 154880,
+     head_unit: u32 = 64, // the vocabulary's TP cut in whole units: 128 for EXL3, whose matrices split at 128 columns
+     exl3: bool = false, // routed experts in EXL3 (quant_method "exl3", Mia-AiLab's checkpoint), the rest bf16
+-    exl3_e4m3: bool = false, // EXL3 experts on EXLR8's E4M3 mcg values (quantization_config "codebook": "mcg_e4m3", 0205)
++    exl3_e4m3: bool = false, // EXL3 experts on EXLR8's E4M3 values (quantization_config "codebook": "mcg_e4m3" for 0205's mcg conversion, "mul1_e4m3" for v0.7's mul1 one)
++    exl3_book: Exl3Book = .none, // which E4M3 codebook the config named: the experts' markers must agree with it, per layer (cuda_weights)
+     fp8: bool = false, // routed experts and the quantized linears in block FP8 (quant_method "fp8", e4m3, 128 x 128 scales), the rest bf16
+     eps: f32 = 1e-5,
+     dense_layers: u32 = 3,
+@@ -207,7 +212,15 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
+     if (root.get("quantization_config")) |q| if (q == .object) if (q.object.get("quant_method")) |m| if (m == .string and std.mem.eql(u8, m.string, "exl3")) {
+         c.head_unit = 128;
+         c.exl3 = true;
+-        if (q.object.get("codebook")) |cb| c.exl3_e4m3 = cb == .string and std.mem.eql(u8, cb.string, "mcg_e4m3");
++        if (q.object.get("codebook")) |cb| if (cb == .string) {
++            if (std.mem.eql(u8, cb.string, "mcg_e4m3")) {
++                c.exl3_e4m3 = true;
++                c.exl3_book = .mcg_e4m3;
++            } else if (std.mem.eql(u8, cb.string, "mul1_e4m3")) {
++                c.exl3_e4m3 = true;
++                c.exl3_book = .mul1_e4m3;
++            }
++        };
+     };
+     // block FP8 (unsloth's and Z.AI's layout): the table sits at the root or under text_config
+     for ([_]?std.json.Value{ root.get("quantization_config"), t.get("quantization_config") }) |qv| if (qv) |q| if (q == .object) if (q.object.get("quant_method")) |m| if (m == .string and std.mem.eql(u8, m.string, "fp8")) {
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index 5d8c750bb..94f8a83bc 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -75,9 +75,10 @@ pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why
+     }
+     // a checkpoint's "codebook" names its default; the per-expert markers decide (a resumed encode can mix them by layer)
+     const book = q.get("codebook") orelse return; // absent (EXL3-K4-v1): the markers say
+-    // "mcg_e4m3": EXLR8 pieces (patch 0205), the mcg codebook rounded to E4M3; the engine then loads the E4M3 image
+-    if (book != .string or !(std.mem.eql(u8, book.string, "mcg") or std.mem.eql(u8, book.string, "mul1") or std.mem.eql(u8, book.string, "mcg_e4m3"))) {
+-        why.set("EXL3 codebook {f}: the CUDA family reads \"mcg\", \"mul1\" or \"mcg_e4m3\"", .{std.json.fmt(book, .{})});
++    // "mcg_e4m3"/"mul1_e4m3": EXLR8 pieces (patch 0205's mcg conversion, v0.7's mul1 one from night/gr8x/x8/exlr8_pieces.py),
++    // that codebook rounded to E4M3; the engine then loads the E4M3 image, whose kernels round both
++    if (book != .string or !(std.mem.eql(u8, book.string, "mcg") or std.mem.eql(u8, book.string, "mul1") or std.mem.eql(u8, book.string, "mcg_e4m3") or std.mem.eql(u8, book.string, "mul1_e4m3"))) {
++        why.set("EXL3 codebook {f}: the CUDA family reads \"mcg\", \"mul1\", \"mcg_e4m3\" or \"mul1_e4m3\"", .{std.json.fmt(book, .{})});
+         return error.UnsupportedQuant;
+     }
+ }
+@@ -102,8 +103,9 @@ pub const Experts = struct {
+     uniform_d: u32 = 8,
+     shx: bool, // every expert's gate and up share one input rotation: a prompt rotates a row once, not once a pick
+     codebook: core.exl3_load.Codebook = .mcg, // the layer's (every expert and projection of it on the same one)
+-    // EXLR8 (kindlingai's exlr8-e4m3-v2, as rank pieces from night/gr8x/x8/exlr8_pieces.py): mcg values rounded to E4M3,
+-    // marked `mcg_e4m3` (the mcg multiplier) instead of `mcg`; codebook stays .mcg, the kernels take CB_MCG_E4M3 (0205)
++    // EXLR8 (kindlingai's exlr8-e4m3-v2, as rank pieces from night/gr8x/x8/exlr8_pieces.py): the layer's codebook's values
++    // rounded to E4M3, marked with that codebook's multiplier under its own name (`mcg_e4m3` on 0205's pieces, `mul1_e4m3` on
++    // v0.7's) instead of a plain marker; codebook says which, the kernels take CB_MCG_E4M3 / CB_MUL1_E4M3 on the E4M3 image
+     e4m3: bool = false,
+ 
+     /// The gate, up and down width tables.
+@@ -205,24 +207,30 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+                     seen = mk.codebook;
+                 }
+             }
+-            // EXLR8's marker: the mcg multiplier under its own name, so no EXL3 build can be read as EXLR8 or back
+-            const e4: ?core.checkpoint.Tensor = if (pieced)
+-                (if (try L.has("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}.mcg_e4m3", .{ i, e, pr })) try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}.mcg_e4m3", .{ i, e, pr }) else null)
+-            else
+-                (if (try L.has("layers.{d}.mlp.experts.{d}." ++ proj ++ ".mcg_e4m3", .{ i, e })) try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".mcg_e4m3", .{ i, e }) else null);
+-            if (e4) |marker| {
+-                if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
+-                    std.mem.readInt(u32, marker.bytes[0..4], .little) != core.exl3_load.markers[0].value or seen != null)
+-                    return error.UnreadableExl3;
+-                seen = .mcg;
++            // EXLR8's markers: a codebook's multiplier under its own name, so no EXL3 build can be read as EXLR8 or back:
++            // `mcg_e4m3` (patch 0205's pieces) and `mul1_e4m3` (v0.7's, the mul1 multiplier). One a projection; it sets
++            // e4m3 and the codebook it names (the E4M3 image's kernels round both codebooks).
++            var exlr8: ?core.exl3_load.Codebook = null;
++            inline for ([_][]const u8{ "mcg_e4m3", "mul1_e4m3" }, 0..) |name, mi| {
++                const got: ?core.checkpoint.Tensor = if (pieced)
++                    (if (try L.has("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}." ++ name, .{ i, e, pr })) try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}." ++ name, .{ i, e, pr }) else null)
++                else
++                    (if (try L.has("layers.{d}.mlp.experts.{d}." ++ proj ++ "." ++ name, .{ i, e })) try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ "." ++ name, .{ i, e }) else null);
++                if (got) |marker| {
++                    if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
++                        std.mem.readInt(u32, marker.bytes[0..4], .little) != core.exl3_load.markers[mi].value or seen != null or exlr8 != null)
++                        return error.UnreadableExl3;
++                    seen = core.exl3_load.markers[mi].codebook;
++                    exlr8 = seen;
++                }
+             }
+-            if (pi == 0 and e == 0) out.e4m3 = e4 != null else if ((e4 != null) != out.e4m3) {
+-                std.log.warn("layer {d}: EXLR8 (mcg_e4m3) and EXL3 experts mixed in one layer", .{i}); // refused below its caller's error
++            if (pi == 0 and e == 0) out.e4m3 = exlr8 != null else if ((exlr8 != null) != out.e4m3) {
++                std.log.warn("layer {d}: EXLR8 (mcg_e4m3/mul1_e4m3) and EXL3 experts mixed in one layer", .{i}); // refused below its caller's error
+                 return error.UnreadableExl3;
+             }
+             const cb = seen orelse return error.UnreadableExl3;
+             if (pi == 0 and e == 0) out.codebook = cb else if (cb != out.codebook) {
+-                std.log.err("layer {d}: experts on more than one EXL3 codebook; GLM's CUDA experts take one a layer", .{i});
++                std.log.warn("layer {d}: experts on more than one EXL3 codebook; GLM's CUDA experts take one a layer", .{i});
+                 return error.UnreadableExl3;
+             }
+             if (pieced) { // the rank's piece, whole
+diff --git a/zig/src/families/glm/cuda_exl3_test.zig b/zig/src/families/glm/cuda_exl3_test.zig
+index 82e61390c..40d5fdd1b 100644
+--- a/zig/src/families/glm/cuda_exl3_test.zig
++++ b/zig/src/families/glm/cuda_exl3_test.zig
+@@ -28,16 +28,18 @@ test "GLM EXL3: Mia-AiLab's 4-bit block and a mixed block without bits pass; oth
+     try testing.expect(!x3.isExl3(gpa, "{\"quantization_config\": {\"quant_method\": \"modelopt\"}}"));
+     try testing.expect(!x3.isExl3(gpa, "{}"));
+     try testing.expectError(error.UnsupportedQuant, x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 9, \"codebook\": \"mcg\"}}", &why));
+-    try testing.expectEqualStrings("EXL3 at 9 bits: the CUDA family reads mcg experts of 1 to 8 whole bits", why.text());
++    try testing.expectEqualStrings("EXL3 at 9 bits: the CUDA family reads mcg or mul1 experts of 1 to 8 whole bits", why.text());
+     try testing.expectError(error.UnsupportedQuant, x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 3.5, \"codebook\": \"mcg\"}}", &why));
+-    try testing.expectEqualStrings("EXL3 at 3.5 bits: the CUDA family reads mcg experts of 1 to 8 whole bits", why.text());
++    try testing.expectEqualStrings("EXL3 at 3.5 bits: the CUDA family reads mcg or mul1 experts of 1 to 8 whole bits", why.text());
+     try testing.expectError(error.UnsupportedQuant, x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": \"4\", \"codebook\": \"mcg\"}}", &why));
+     try testing.expectError(error.UnsupportedQuant, x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"avg_bits\": 0.5, \"codebook\": \"mcg\"}}", &why));
+-    try testing.expectEqualStrings("EXL3 averaging 0.5 bits: the CUDA family reads mcg experts of 1 to 8 bits", why.text());
+-    try testing.expectError(error.UnsupportedQuant, x3.admit(gpa, "{\"text_config\": {\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mul1\"}}}", &why));
+-    try testing.expectEqualStrings("EXL3 codebook \"mul1\": the CUDA family reads \"mcg\"", why.text());
+-    try testing.expectError(error.UnsupportedQuant, x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"avg_bits\": 3.5}}", &why));
+-    try testing.expectEqualStrings("EXL3 codebook null: the CUDA family reads \"mcg\"", why.text());
++    try testing.expectEqualStrings("EXL3 averaging 0.5 bits: the CUDA family reads mcg or mul1 experts of 1 to 8 bits", why.text());
++    try x3.admit(gpa, "{\"text_config\": {\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mul1\"}}}", &why); // mul1 is read now; text_config's block still counts
++    try testing.expectError(error.UnsupportedQuant, x3.admit(gpa, "{\"text_config\": {\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mul1_e2m3\"}}}", &why));
++    try testing.expectEqualStrings("EXL3 codebook \"mul1_e2m3\": the CUDA family reads \"mcg\", \"mul1\", \"mcg_e4m3\" or \"mul1_e4m3\"", why.text());
++    try x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"avg_bits\": 3.5}}", &why); // no codebook: the markers say
++    try testing.expectError(error.UnsupportedQuant, x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"avg_bits\": 3.5, \"codebook\": null}}", &why));
++    try testing.expectEqualStrings("EXL3 codebook null: the CUDA family reads \"mcg\", \"mul1\", \"mcg_e4m3\" or \"mul1_e4m3\"", why.text());
+ }
+ 
+ test "GLM EXL3: a trellis's last dimension gives whole-bit mcg widths from 1 to 8; half steps and wider are refused" {
+@@ -375,6 +377,37 @@ fn markE4m3(m: *Mock, i: u32, e: usize, p: usize, both: bool) !void {
+     try m.add(try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.mcg_e4m3", .{ i, e, projs[p] }), t.dtype, t.shape[0..t.rank], t.bytes);
+ }
+ 
++/// Expert `e`'s projection `p`'s marker (`mcg`, or the EXLR8 one a previous mark left) replaced by EXLR8's `name`
++/// holding `value`: patch 0205's mcg pieces, or v0.7's mul1 ones (exlr8_pieces.py).
++fn markExlr8(m: *Mock, i: u32, e: usize, p: usize, comptime name: []const u8, value: u32) !void {
++    var v: [4]u8 = undefined;
++    std.mem.writeInt(u32, &v, value, .little);
++    var buf: [128]u8 = undefined;
++    var nb: [128]u8 = undefined;
++    for ([_][]const u8{ "mcg_e4m3", "mul1_e4m3", "mcg" }) |old| {
++        const old_name = try std.fmt.bufPrint(&buf, "layers.{d}.mlp.experts.{d}.{s}.{s}", .{ i, e, projs[p], old });
++        if (m.tensors.get(old_name)) |t| {
++            _ = m.tensors.remove(old_name);
++            try m.add(try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}." ++ name, .{ i, e, projs[p] }), t.dtype, t.shape[0..t.rank], &v);
++            return;
++        }
++    }
++    return error.NoMarker;
++}
++
++/// Expert `e`'s projection `p`'s rank-piece marker (`rank{rank}.mcg_e4m3`, as synthPieces writes it) replaced by EXLR8's
++/// `name` holding `value`: a declared file of one rank's pieces with v0.7's mul1 markers (exlr8_pieces.py).
++fn markPieceExlr8(m: *Mock, i: u32, e: usize, p: usize, rank: i32, comptime name: []const u8, value: u32) !void {
++    var v: [4]u8 = undefined;
++    std.mem.writeInt(u32, &v, value, .little);
++    var buf: [160]u8 = undefined;
++    var nb: [160]u8 = undefined;
++    const old = try std.fmt.bufPrint(&buf, "layers.{d}.mlp.experts.{d}.{s}.rank{d}.mcg_e4m3", .{ i, e, projs[p], rank });
++    const t = m.tensors.get(old) orelse return error.NoMarker;
++    _ = m.tensors.remove(old);
++    try m.add(try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.rank{d}." ++ name, .{ i, e, projs[p], rank }), t.dtype, t.shape[0..t.rank], &v);
++}
++
+ test "GLM EXL3: EXLR8 pieces (mcg_e4m3 markers) load as mcg with e4m3 set, the same bytes; EXL3 layers keep e4m3 off" {
+     const gpa = testing.allocator;
+     var prng = std.Random.DefaultPrng.init(205);
+@@ -434,6 +467,62 @@ test "GLM EXL3: a layer mixing EXLR8 and EXL3 experts, a projection with both ma
+     }
+ }
+ 
++test "GLM EXL3: v0.7's EXLR8 pieces (mul1_e4m3 markers) load as mul1 with e4m3 set, the same bytes" {
++    const gpa = testing.allocator;
++    var prng = std.Random.DefaultPrng.init(207);
++    const count = 3;
++    const k8: [count]u32 = @splat(8);
++    const k2s: [3][]const u32 = .{ &k8, &k8, &k8 };
++    const cut: Span = .{ .lo = 128, .hi = 256 };
++    var m = Mock.init(gpa);
++    defer m.deinit();
++    try synth(&m, prng.random(), 6, count, 256, 256, k2s, false);
++    for (0..count) |e| for (0..3) |p| try markExlr8(&m, 6, e, p, "mul1_e4m3", core.exl3_load.markers[1].value);
++    const w = try x3.load(&m, 6, count, 256, 256, cut);
++    try testing.expect(w.e4m3);
++    try testing.expectEqual(core.exl3_load.Codebook.mul1, w.codebook);
++    try expectUploads(&m, w, 6, count, 256, 256, cut, k2s); // the bytes the plain-marker load gives, mul1 markers or not
++    const l = x3.layer(w, count, 256, cut.len(), 10);
++    try testing.expectEqual(@as(u3, 2), @backingInt(l.codebook)); // grouped[2]: tilesFor sends mul1 layers to the grouped kernel
++    try testing.expect(!cuda.exl3_experts.prompt.eligible(l)); // the prompt kernels stay mcg-only: a mul1 layer takes the grouped path
++}
++
++test "GLM EXL3: a layer mixing the two EXLR8 codebooks, a projection with both EXLR8 markers, or a wrong mul1_e4m3 value is refused" {
++    std.testing.log_level = .err; // the refused layer's codebook mix is logged as an error, as it is meant to be
++    defer std.testing.log_level = .warn;
++    const gpa = testing.allocator;
++    var prng = std.Random.DefaultPrng.init(2071);
++    const count = 3;
++    const k8: [count]u32 = @splat(8);
++    const k2s: [3][]const u32 = .{ &k8, &k8, &k8 };
++    const cut: Span = .{ .lo = 0, .hi = 128 };
++    { // expert 0 on 0205's mcg pieces, the rest on v0.7's mul1 ones: one codebook a layer, as today
++        var m = Mock.init(gpa);
++        defer m.deinit();
++        try synth(&m, prng.random(), 2, count, 256, 256, k2s, false);
++        for (0..3) |p| try markExlr8(&m, 2, 0, p, "mcg_e4m3", core.exl3_load.markers[0].value);
++        for (1..count) |e| for (0..3) |p| try markExlr8(&m, 2, e, p, "mul1_e4m3", core.exl3_load.markers[1].value);
++        try testing.expectError(error.UnreadableExl3, x3.load(&m, 2, count, 256, 256, cut));
++    }
++    { // both EXLR8 markers on one projection
++        var m = Mock.init(gpa);
++        defer m.deinit();
++        try synth(&m, prng.random(), 2, count, 256, 256, k2s, false);
++        for (0..count) |e| for (0..3) |p| try markE4m3(&m, 2, e, p, false);
++        var v: [4]u8 = undefined;
++        std.mem.writeInt(u32, &v, core.exl3_load.markers[1].value, .little);
++        try m.add("layers.2.mlp.experts.0.gate_proj.mul1_e4m3", .i32, &.{}, &v);
++        try testing.expectError(error.UnreadableExl3, x3.load(&m, 2, count, 256, 256, cut));
++    }
++    { // a mul1_e4m3 marker holding the mcg multiplier
++        var m = Mock.init(gpa);
++        defer m.deinit();
++        try synth(&m, prng.random(), 2, count, 256, 256, k2s, false);
++        for (0..count) |e| for (0..3) |p| try markExlr8(&m, 2, e, p, "mul1_e4m3", core.exl3_load.markers[0].value);
++        try testing.expectError(error.UnreadableExl3, x3.load(&m, 2, count, 256, 256, cut));
++    }
++}
++
+ /// Layer `i` stored as one rank's pieces (EXLR8 files): every expert's projections as `.rank{rank}.*` with mcg_e4m3
+ /// markers, piece width `w`, and the declaration [rank, ranks].
+ fn synthPieces(m: *Mock, rng: std.Random, i: u32, count: usize, dims: usize, w: usize, rank: i32, ranks: i32) !void {
+@@ -487,28 +576,45 @@ test "GLM EXL3: one rank's declared EXLR8 pieces load whole on that rank, and ar
+     }
+ }
+ 
+-test "GLM EXL3: admission takes EXLR8's codebook mcg_e4m3 and still refuses other names" {
++test "GLM EXL3: one rank's declared v0.7 pieces (mul1_e4m3 markers) load whole as mul1 with e4m3 set" {
++    const gpa = testing.allocator;
++    var prng = std.Random.DefaultPrng.init(2072);
++    const count = 2;
++    var m = Mock.init(gpa);
++    defer m.deinit();
++    try synthPieces(&m, prng.random(), 3, count, 256, 128, 2, 4); // rank 2 of 4: the share [256, 384) is piece 2's
++    for (0..count) |e| for (0..3) |p| try markPieceExlr8(&m, 3, e, p, 2, "mul1_e4m3", core.exl3_load.markers[1].value);
++    const w = try x3.load(&m, 3, count, 256, 512, .{ .lo = 256, .hi = 384 });
++    try testing.expect(w.e4m3);
++    try testing.expectEqual(core.exl3_load.Codebook.mul1, w.codebook);
++}
++
++test "GLM EXL3: admission takes EXLR8's codebooks mcg_e4m3 and mul1_e4m3 and still refuses other names" {
+     const gpa = testing.allocator;
+     var why: modelopt.Why = .{};
+     try x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg_e4m3\"}}", &why);
++    try x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mul1_e4m3\"}}", &why);
+     try testing.expectError(error.UnsupportedQuant, x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg_e5m2\"}}", &why));
++    try testing.expectError(error.UnsupportedQuant, x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mul1_e2m3\"}}", &why));
+ }
+ 
+-test "GLM EXL3: a config whose codebook is mcg_e4m3 (EXLR8 pieces, patch 0205) sets exl3_e4m3; mcg, mul1 or none do not" {
++test "GLM EXL3: a config whose codebook is mcg_e4m3 or mul1_e4m3 (EXLR8 pieces, 0205 / v0.7) sets exl3_e4m3 and names the book; mcg, mul1 or none do not" {
+     const gpa = testing.allocator;
+     const base = try config.dsaText(gpa, 4, &.{0});
+     defer gpa.free(base);
+     try testing.expect(base[base.len - 1] == '}');
+-    for ([_]struct { q: []const u8, exl3: bool, e4: bool }{
+-        .{ .q = "", .exl3 = false, .e4 = false },
+-        .{ .q = ", \"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4}", .exl3 = true, .e4 = false },
+-        .{ .q = ", \"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg\"}", .exl3 = true, .e4 = false },
+-        .{ .q = ", \"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg_e4m3\"}", .exl3 = true, .e4 = true },
++    for ([_]struct { q: []const u8, exl3: bool, e4: bool, book: config.Exl3Book }{
++        .{ .q = "", .exl3 = false, .e4 = false, .book = .none },
++        .{ .q = ", \"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4}", .exl3 = true, .e4 = false, .book = .none },
++        .{ .q = ", \"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg\"}", .exl3 = true, .e4 = false, .book = .none },
++        .{ .q = ", \"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg_e4m3\"}", .exl3 = true, .e4 = true, .book = .mcg_e4m3 },
++        .{ .q = ", \"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mul1_e4m3\"}", .exl3 = true, .e4 = true, .book = .mul1_e4m3 },
+     }) |case| {
+         const text = try std.mem.concat(gpa, u8, &.{ base[0 .. base.len - 1], case.q, "}" });
+         defer gpa.free(text);
+         const c = try config.parse(gpa, text);
+         try testing.expectEqual(case.exl3, c.exl3);
+         try testing.expectEqual(case.e4, c.exl3_e4m3);
++        try testing.expectEqual(case.book, c.exl3_book);
+     }
+ }
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 89bda2d89..68262ace1 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -90,7 +90,8 @@ pub const Modules = struct {
+     shared_writes: bool = true, // TF_GLM_SHARED_WRITES=0: a batched shared window's cache writes and KDA row copies per segment (the same bits)
+     hc_part: glue.PartTable = .{}, // TF_GLM_HC_PART: hc_pre's decode-dot blocks by rows (default 2:16); 0: tf_glm_hc_partial8's 16 a row (the same bits)
+ 
+-    /// `e4m3`: the checkpoint's EXL3 experts are EXLR8's (config "codebook": "mcg_e4m3"): their module rounds mcg to E4M3.
++    /// `e4m3`: the checkpoint's EXL3 experts are EXLR8's (config "codebook": "mcg_e4m3" for 0205's mcg conversion,
++    /// "mul1_e4m3" for v0.7's mul1 one): their module rounds that codebook's values to E4M3.
+     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context, e4m3: bool) !Modules {
+         const k = cuda.kernels;
+         var m: Modules = undefined;
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index 3ffbaa688..4f64fb6c0 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -449,8 +449,10 @@ pub fn artifact(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![32]u8 {
+ 
+ /// The digest an EXLR8 rank-piece checkpoint (patch 0205) sends instead: its shards differ by rank by design (each box
+ /// holds its own pieces and shared-expert rows), so the ranks agree on the conversion they come from, exlr8-set.json
+-/// (release, revision, profile, ranks, converter): identical on every box by construction, domain-separated from
+-/// `artifact`'s digests. Each rank's own data is checked where it loads (the pieces' [rank, ranks] declaration).
++/// (release, revision, profile, ranks, converter) and config.json's quantization_config codebook — which codebook the
++/// E4M3 experts decode ("mcg_e4m3" on 0205's conversion, "mul1_e4m3" on v0.7's): identical on every box by construction,
++/// domain-separated from `artifact`'s digests. Each rank's own data is checked where it loads (the pieces' [rank, ranks]
++/// declaration, and the markers against the config's codebook).
+ pub fn exlr8Set(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize) ![32]u8 {
+     const path = try std.fs.path.join(gpa, &.{ dir, "exlr8-set.json" });
+     defer gpa.free(path);
+@@ -468,10 +470,31 @@ pub fn exlr8Set(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, world: usiz
+             return error.BadExlr8Set;
+         }
+     }
++    const cfg_path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++    defer gpa.free(cfg_path);
++    const cfg = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, gpa, .limited(1 << 24));
++    defer gpa.free(cfg);
++    const book = try exlr8Book(gpa, cfg); // a static name: the digest covers the codebook the conversion's config names
+     var h = std.crypto.hash.sha2.Sha256.init(.{});
+-    h.update("tensorfold exlr8 rank-piece set v1\x00");
++    h.update("tensorfold exlr8 rank-piece set v2\x00");
++    h.update(book);
++    h.update("\x00");
+     h.update(text);
+     var out: [32]u8 = undefined;
+     h.final(&out);
+     return out;
+ }
++
++/// config.json's quantization_config codebook, which must name one of the E4M3 conversions this engine reads; the
++/// returned slice is one of the static names.
++fn exlr8Book(gpa: std.mem.Allocator, config_json: []const u8) ![]const u8 {
++    const parsed = std.json.parseFromSlice(std.json.Value, gpa, config_json, .{}) catch return error.BadExlr8Set;
++    defer parsed.deinit();
++    if (parsed.value != .object) return error.BadExlr8Set;
++    const q = parsed.value.object.get("quantization_config") orelse return error.BadExlr8Set;
++    if (q != .object) return error.BadExlr8Set;
++    const cb = q.object.get("codebook") orelse return error.BadExlr8Set;
++    if (cb != .string) return error.BadExlr8Set;
++    for ([_][]const u8{ "mcg_e4m3", "mul1_e4m3" }) |name| if (std.mem.eql(u8, cb.string, name)) return name;
++    return error.BadExlr8Set;
++}
+diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
+index b5066205c..f53e98d91 100644
+--- a/zig/src/families/glm/cuda_ranks_test.zig
++++ b/zig/src/families/glm/cuda_ranks_test.zig
+@@ -455,7 +455,7 @@ test "TF_GLM_L2PF: read with the settings, carried in the fingerprint, and ranks
+     try std.testing.expectEqual(Mismatch{ .field = .l2pf, .rank = 1 }, mismatch(&all).?);
+ }
+ 
+-test "GLM EXL3: EXLR8 rank-piece checkpoints agree on their exlr8-set.json, whatever their shard bytes; a different set disagrees" {
++test "GLM EXL3: EXLR8 rank-piece checkpoints agree on their exlr8-set.json and config codebook, whatever their shard bytes; a different set or codebook disagrees" {
+     const a = std.testing.allocator;
+     const io = std.testing.io;
+     var tmp = std.testing.tmpDir(.{});
+@@ -464,15 +464,12 @@ test "GLM EXL3: EXLR8 rank-piece checkpoints agree on their exlr8-set.json, what
+     try digestFixture(io, tmp.dir, "r1/model", 2); // another rank's pieces: other bytes
+     try digestFixture(io, tmp.dir, "x/model", 2);
+     const set = "{\"format\": \"tensorfold exlr8 rank pieces v1\", \"release\": \"kindlingai/glm-5.3-exlr8-k2-k3-k4@a36ae468\", \"profile\": \"up1\", \"ranks\": 2}";
+-    for ([_][]const u8{ "r0/model", "r1/model" }) |sub| {
++    const other = "{\"format\": \"tensorfold exlr8 rank pieces v1\", \"release\": \"kindlingai/glm-5.3-exlr8-k2-k3-k4@b17d0c55\", \"profile\": \"up1\", \"ranks\": 2}"; // another conversion of the same weights: a different set disagrees
++    for ([_][]const u8{ "r0/model", "r1/model", "x/model" }) |sub| { // the conversion's config: its codebook is part of the agreement
+         var d = try tmp.dir.openDir(io, sub, .{});
+         defer d.close(io);
+-        try d.writeFile(io, .{ .sub_path = "exlr8-set.json", .data = set });
+-    }
+-    {
+-        var d = try tmp.dir.openDir(io, "x/model", .{});
+-        defer d.close(io);
+-        try d.writeFile(io, .{ .sub_path = "exlr8-set.json", .data = "{\"format\": \"tensorfold exlr8 rank pieces v1\", \"release\": \"another\", \"ranks\": 2}" });
++        try d.writeFile(io, .{ .sub_path = "exlr8-set.json", .data = if (std.mem.eql(u8, sub, "x/model")) other else set });
++        try d.writeFile(io, .{ .sub_path = "config.json", .data = "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg_e4m3\"}}" });
+     }
+     var paths: [3][:0]u8 = undefined;
+     for ([_][]const u8{ "r0/model", "r1/model", "x/model" }, &paths) |sub, *p| p.* = try tmp.dir.realPathFileAlloc(io, sub, a);
+@@ -483,6 +480,23 @@ test "GLM EXL3: EXLR8 rank-piece checkpoints agree on their exlr8-set.json, what
+     all[1] = Fingerprint.of(2, 1, .{}, 8192, true, h, h, try ranks.exlr8Set(a, io, paths[2], 2));
+     try std.testing.expectEqual(Mismatch{ .field = .checkpoint, .rank = 1 }, mismatch(&all).?);
+     try std.testing.expect(!std.mem.eql(u8, &(try ranks.exlr8Set(a, io, paths[0], 2)), &(try artifact(a, io, paths[0]))));
++    { // the same set, but one box's config names the other E4M3 codebook (v0.7's mul1): the ranks disagree
++        var d = try tmp.dir.openDir(io, "r1/model", .{});
++        defer d.close(io);
++        try d.writeFile(io, .{ .sub_path = "config.json", .data = "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mul1_e4m3\"}}" });
++        const r1 = try tmp.dir.realPathFileAlloc(io, "r1/model", a);
++        defer a.free(r1);
++        const mixed = [_]Fingerprint{ all[0], Fingerprint.of(2, 1, .{}, 8192, true, h, h, try ranks.exlr8Set(a, io, r1, 2)) };
++        try std.testing.expectEqual(Mismatch{ .field = .checkpoint, .rank = 1 }, mismatch(&mixed).?);
++    }
++    { // a config whose codebook is not one of the E4M3 conversions this engine reads: refused
++        var d = try tmp.dir.openDir(io, "r1/model", .{});
++        defer d.close(io);
++        try d.writeFile(io, .{ .sub_path = "config.json", .data = "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg\"}}" });
++        const r1 = try tmp.dir.realPathFileAlloc(io, "r1/model", a);
++        defer a.free(r1);
++        try std.testing.expectError(error.BadExlr8Set, ranks.exlr8Set(a, io, r1, 2));
++    }
+     const root = try tmp.dir.realPathFileAlloc(io, ".", a); // no exlr8-set.json there
+     defer a.free(root);
+     try std.testing.expectError(error.FileNotFound, ranks.exlr8Set(a, io, root, 2));
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 127712533..5e26ba9b5 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -658,6 +658,13 @@ const Loader = struct {
+         const gate = try x8.mat(L, "layers.{d}.mlp.shared_experts.gate_proj.rank{d}", .{ i, pr }, .whole);
+         const up = try x8.mat(L, "layers.{d}.mlp.shared_experts.up_proj.rank{d}", .{ i, pr }, .whole);
+         const down = try x8.mat(L, "layers.{d}.mlp.shared_experts.down_proj.rank{d}", .{ i, pr }, .whole);
++        // the pieces' markers must name the codebook the config names (v0.7's shared expert is mul1, 0205's was mcg):
++        // a box whose shared pieces come from the other conversion would decode the wrong hash silently
++        const book: cuda.exl3.Codebook = if (L.w.config.exl3_book == .mul1_e4m3) .mul1 else .mcg;
++        if (gate.codebook != book or up.codebook != book or down.codebook != book) {
++            std.log.err("layer {d}: the shared expert's EXLR8 pieces decode {s}, config.json's quantization_config codebook says {s}", .{ i, if (gate.codebook == .mul1) "mul1_e4m3" else "mcg_e4m3", @tagName(L.w.config.exl3_book) });
++            return error.UnreadableExlr8;
++        }
+         const d = L.w.config.hidden;
+         if (gate.n != sh.len() or up.n != sh.len() or gate.k != d or up.k != d or down.k != sh.len() or down.n != d) {
+             std.log.err("layer {d}: the shared expert's EXLR8 pieces are {d} x {d} / {d} x {d}; this rank's share is {d} of {d} rows", .{ i, gate.k, gate.n, down.k, down.n, sh.len(), d });
+@@ -688,8 +695,10 @@ const Loader = struct {
+             routed = if (f8) try L.fp8Experts(i) else try L.nvfp4Experts(i);
+         } else if (c.exl3) { // the MTP layer's experts too
+             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
+-            if (x3.?.e4m3 != c.exl3_e4m3) { // the kernel image follows the config; the pieces must agree with it
+-                std.log.err("layer {d}: experts marked {s}, config.json's quantization_config codebook says {s}", .{ i, if (x3.?.e4m3) "mcg_e4m3 (EXLR8)" else "mcg/mul1", if (c.exl3_e4m3) "mcg_e4m3" else "none" });
++            // the kernel image follows the config; the pieces must agree with it, the codebook it names included
++            // (a stale box's mcg_e4m3 pieces under a mul1_e4m3 config would otherwise decode the wrong hash silently)
++            if (x3.?.e4m3 != c.exl3_e4m3 or (c.exl3_e4m3 and x3.?.codebook != if (c.exl3_book == .mul1_e4m3) core.exl3_load.Codebook.mul1 else core.exl3_load.Codebook.mcg)) {
++                std.log.err("layer {d}: experts marked {s}, config.json's quantization_config codebook says {s}", .{ i, if (x3.?.e4m3) (if (x3.?.codebook == .mul1) "mul1_e4m3 (EXLR8, v0.7)" else "mcg_e4m3 (EXLR8)") else "mcg/mul1 (no E4M3)", @tagName(c.exl3_book) });
+                 return error.UnreadableExl3;
+             }
+             // 0205: EXLR8 routed experts run on the E4M3 image (part 2); the converted checkpoint's shared expert and
+diff --git a/zig/src/families/glm/cuda_x8.zig b/zig/src/families/glm/cuda_x8.zig
+index a11266321..7645b582d 100644
+--- a/zig/src/families/glm/cuda_x8.zig
++++ b/zig/src/families/glm/cuda_x8.zig
+@@ -1,10 +1,13 @@
+ //! kindlingai's EXLR8 dense trellis matrices (format exlr8-v2: q_b and o_proj, the dense MLP of layers 0-2 and the
+ //! shared expert's halves) on CUDA as they are stored (patch 0205b), not rounded to bf16 at conversion. EXLR8 trellis
+-//! tiles are EXL3 tiles whose mcg values are rounded to E4M3 (patch 0205), so night/gr8x/x8b/exlr8_native.py writes each
+-//! matrix as one EXL3 trellis [K/16][N/16][16 bits] with fp16 suh [K] and svh [N] and the marker `mcg_e4m3`.
+-//! Decode windows run TensorFold's EXL3 linear (kernels/cuda/exl3_linear.cu) on its E4M3 image (exl3_linear_e4m3);
+-//! prompt chunks rebuild the matrix as bf16 rows (kernels/cuda/exlr8_recon.cu, exact before one rounding: the bf16 X8's
+-//! converter wrote) for the tiled bf16 GEMM. Only a checkpoint whose config says codebook "mcg_e4m3" probes for these.
++//! tiles are EXL3 tiles whose values are rounded to E4M3 (patch 0205), so the converters write each matrix as one EXL3
++//! trellis [K/16][N/16][16 bits] with fp16 suh [K] and svh [N] and the marker of its codebook: `mcg_e4m3` (exlr8_native.py,
++//! the as-stored dense trellis, which stays mcg) or `mul1_e4m3` (exlr8_pieces.py, v0.7's shared-expert pieces).
++//! Decode windows run TensorFold's EXL3 linear (kernels/cuda/exl3_linear.cu) on its E4M3 image (exl3_linear_e4m3), which
++//! rounds both codebooks; prompt chunks of an mcg matrix rebuild it as bf16 rows (kernels/cuda/exlr8_recon.cu, exact
++//! before one rounding: the bf16 X8's converter wrote) for the tiled bf16 GEMM — a mul1 matrix never takes the rebuild
++//! (its kernels decode mcg only) and runs the decode linear at every size. Only a checkpoint whose config says codebook
++//! "mcg_e4m3" or "mul1_e4m3" probes for these.
+ //!
+ //! X18 (patch x18): with the interim lane's dense packing on (TF_GLM_DENSE_BITS=8, tiled), a prompt chunk instead rebuilds the
+ //! matrix straight into the int8 tiles + fp16 scales glm_mm8_128s2 reads (kernels/cuda/exlr8_recon.cu's tf_x8_recon_q8: the same
+@@ -22,7 +25,9 @@ const exl3 = @import("cuda_exl3.zig");
+ 
+ const Linear = cuda.exl3.Linear;
+ 
+-/// EXLR8's marker on a converted matrix: the mcg multiplier, under its own name (no EXL3 build carries it).
++/// EXLR8's markers on a converted matrix: a codebook's multiplier under its own name (no EXL3 build carries either).
++/// `mcg_e4m3` (the mcg multiplier) is patch 0205's, what exlr8_native.py writes for the as-stored dense trellis (which
++/// stays mcg); `mul1_e4m3` (the mul1 multiplier) is v0.7's, what exlr8_pieces.py writes for the shared expert's pieces.
+ pub const marker_value: u32 = core.exl3_load.markers[0].value;
+ 
+ /// One matrix on the device: trellis int16 [k/16][n/16][16 bits] (tile (tk, tn) at tk * n/16 + tn), fp16 suh, svh.
+@@ -33,11 +38,12 @@ pub const Mat = struct {
+     k: usize,
+     n: usize,
+     bits: u32,
++    codebook: cuda.exl3.Codebook = .mcg, // the marker's codebook (the E4M3 image rounds it)
+ 
+-    /// TensorFold's EXL3 linear's view: the "stored" layout, mcg codebook (the E4M3 image rounds it).
++    /// TensorFold's EXL3 linear's view: the "stored" layout, the marker's codebook (the E4M3 image rounds it).
+     pub fn weight(m: Mat) cuda.exl3.Weight {
+         const st = cuda.exl3.strides(m.k, m.n, 2 * m.bits, false);
+-        return .{ .trellis = m.t, .suh = m.suh, .svh = m.svh, .k = @intCast(m.k), .n = @intCast(m.n), .halves = 2 * m.bits, .codebook = .mcg, .stride_k = st.k, .stride_nb = st.nb };
++        return .{ .trellis = m.t, .suh = m.suh, .svh = m.svh, .k = @intCast(m.k), .n = @intCast(m.n), .halves = 2 * m.bits, .codebook = m.codebook, .stride_k = st.k, .stride_nb = st.nb };
+     }
+ 
+     pub fn trellisBytes(m: Mat) usize {
+@@ -58,6 +64,10 @@ pub const Proj = struct {
+     pub fn k(p: Proj) usize {
+         return p.a.k;
+     }
++    /// Whether every matrix of `p` is stored on the mcg codebook: the prompt rebuild's kernels decode mcg only.
++    pub fn mcgStored(p: Proj) bool {
++        return p.a.codebook == .mcg and (if (p.b) |b| b.codebook == .mcg else true);
++    }
+     pub fn bytes(p: Proj) usize {
+         return p.a.trellisBytes() + if (p.b) |b| b.trellisBytes() else 0;
+     }
+@@ -242,8 +252,10 @@ pub fn matmul(set: glue.Set, s: cuda.Stream, p: *const Proj, x: u64, x_stride: u
+     const r = set.x8 orelse return error.FormatNotLoaded;
+     if (m == 0) return;
+     // A prompt chunk of any size takes the int8 tiles when q8 prompt mode is on (the interim lane's packed int8 GEMM runs a
+-    // 1-16 row tail too); with the kill switch it keeps the decode linear for 1-16 rows.
+-    if (set.prompt and (m > recon_rows or (r.q8 and set.mm != null))) return prompt(set, r, s, p, x, x_stride, out, part, m, wide);
++    // 1-16 row tail too); with the kill switch it keeps the decode linear for 1-16 rows. The rebuild kernels decode mcg
++    // only (exlr8.cu's tf_exlr8_decode), so a mul1 matrix (v0.7's shared-expert pieces, exlr8_pieces.py) never takes them:
++    // it runs the E4M3 decode linear at every size, whose mul1 path rounds the values (TF_EXL3_MUL1_E4M3) as its marker says.
++    if (set.prompt and p.mcgStored() and (m > recon_rows or (r.q8 and set.mm != null))) return prompt(set, r, s, p, x, x_stride, out, part, m, wide);
+     const l = r.lanes[@intFromBool(p.side)];
+     const eb: usize = if (wide) 4 else 2;
+     var at: usize = 0;
+@@ -433,17 +445,27 @@ pub fn sharedAsStored(L: anytype, i: u32) !bool {
+     return true;
+ }
+ 
+-/// Whether `module` (under the loader's prefix and the layer) is an EXLR8 matrix: its mcg_e4m3 marker is present.
++/// Whether `module` (under the loader's prefix and the layer) is an EXLR8 matrix: one of its codebook markers
++/// (`mcg_e4m3`, or `mul1_e4m3` on v0.7's shared-expert pieces) is present.
+ pub fn present(L: anytype, comptime module: []const u8, args: anytype) !bool {
+-    return L.has(module ++ ".mcg_e4m3", args);
++    return (try L.has(module ++ ".mcg_e4m3", args)) or (try L.has(module ++ ".mul1_e4m3", args));
+ }
+ 
+-/// Stored matrix `module` cut to this rank as `cut`, uploaded: trellis, suh, svh (each its own buffer). A refusal is
++/// Stored matrix `module` cut to this rank as `cut`, uploaded: trellis, suh, svh (each its own buffer). The marker
++/// present names the stored codebook (`mcg_e4m3`: mcg, the as-stored dense trellis; `mul1_e4m3`: mul1, v0.7's shared
++/// expert's pieces) and must hold that codebook's multiplier; both, or the wrong value, are refused. A refusal is
+ /// logged as a warning naming the tensor; the load then fails with error.UnreadableExlr8.
+ pub fn mat(L: anytype, comptime module: []const u8, args: anytype, cut: Cut) !Mat {
+-    const mk = try L.get(module ++ ".mcg_e4m3", args);
+-    if (mk.dtype != .i32 or mk.numel() != 1 or mk.bytes.len != 4 or std.mem.readInt(u32, mk.bytes[0..4], .little) != marker_value) {
+-        std.log.warn("{s}: an EXLR8 matrix's marker is int32 0x{x}", .{ L.last, marker_value });
++    const mcg = try L.has(module ++ ".mcg_e4m3", args);
++    const mul1 = try L.has(module ++ ".mul1_e4m3", args);
++    if (mcg and mul1) {
++        std.log.warn("{s}: an EXLR8 matrix carries both codebook markers (mcg_e4m3 and mul1_e4m3)", .{L.last});
++        return error.UnreadableExlr8;
++    }
++    const mk = if (mul1) try L.get(module ++ ".mul1_e4m3", args) else try L.get(module ++ ".mcg_e4m3", args);
++    const want: u32 = if (mul1) core.exl3_load.markers[1].value else marker_value;
++    if (mk.dtype != .i32 or mk.numel() != 1 or mk.bytes.len != 4 or std.mem.readInt(u32, mk.bytes[0..4], .little) != want) {
++        std.log.warn("{s}: an EXLR8 matrix's marker is int32 0x{x}", .{ L.last, want });
+         return error.UnreadableExlr8;
+     }
+     const suh = try L.get(module ++ ".suh", args);
+@@ -490,7 +512,7 @@ pub fn mat(L: anytype, comptime module: []const u8, args: anytype, cut: Cut) !Ma
+     const sp = try L.put("x8." ++ module ++ ".suh", args);
+     try L.host.appendSlice(L.gpa, if (cut == .outs) svh.bytes[lo * 2 .. hi * 2] else svh.bytes);
+     const vp = try L.put("x8." ++ module ++ ".svh", args);
+-    return .{ .t = tp, .suh = sp, .svh = vp, .k = k, .n = n, .bits = bits };
++    return .{ .t = tp, .suh = sp, .svh = vp, .k = k, .n = n, .bits = bits, .codebook = if (mul1) .mul1 else .mcg };
+ }
+ 
+ /// A projection kept for the weights' lifetime (Weights.x8s owns it).
+@@ -626,6 +648,48 @@ test "GLM X8: an EXLR8 matrix keeps a rank's tile columns for an output cut and
+     }
+ }
+ 
++test "GLM X8: a mul1_e4m3 matrix (v0.7's shared-expert pieces) is an EXLR8 matrix of the mul1 codebook; both markers or a wrong value are refused" {
++    const a = std.testing.allocator;
++    const K = 128;
++    const N = 128;
++    const tile = 32 * 4; // 4 bits
++    const tb = try a.alloc(u8, K / 16 * (N / 16) * tile);
++    defer a.free(tb);
++    @memset(tb, 7);
++    const suh: [K * 2]u8 = @splat(0);
++    const svh: [N * 2]u8 = @splat(0);
++    const mcg = std.mem.toBytes(@as(u32, marker_value));
++    const mul1 = std.mem.toBytes(@as(u32, core.exl3_load.markers[1].value));
++    const trellis = tensor(.i16, &.{ K / 16, N / 16, 16 * 4 }, tb);
++    const suh_t = tensor(.f16, &.{K}, &suh);
++    const svh_t = tensor(.f16, &.{N}, &svh);
++    { // exlr8_pieces.py's v0.7 shared-expert pieces: accepted, and the mat keeps the mul1 codebook
++        const names = [_][]const u8{ "m.trellis", "m.suh", "m.svh", "m.mul1_e4m3" };
++        const ts = [_]core.checkpoint.Tensor{ trellis, suh_t, svh_t, tensor(.i32, &.{}, &mul1) };
++        var f: Fake = .{ .gpa = a, .names = &names, .tensors = &ts };
++        defer f.deinit();
++        try std.testing.expect(try present(&f, "m", .{}));
++        const m = try mat(&f, "m", .{}, .whole);
++        try std.testing.expectEqual(cuda.exl3.Codebook.mul1, m.codebook);
++        try std.testing.expectEqual(cuda.exl3.Codebook.mul1, m.weight().codebook); // the E4M3 linear decodes mul1
++        try std.testing.expect((Proj{ .a = m }).mcgStored() == false); // never takes the mcg-only prompt rebuild
++    }
++    { // both codebook markers on one matrix: refused
++        const names = [_][]const u8{ "m.trellis", "m.suh", "m.svh", "m.mcg_e4m3", "m.mul1_e4m3" };
++        const ts = [_]core.checkpoint.Tensor{ trellis, suh_t, svh_t, tensor(.i32, &.{}, &mcg), tensor(.i32, &.{}, &mul1) };
++        var f: Fake = .{ .gpa = a, .names = &names, .tensors = &ts };
++        defer f.deinit();
++        try std.testing.expectError(error.UnreadableExlr8, mat(&f, "m", .{}, .whole));
++    }
++    { // the mul1 name holding the mcg multiplier: refused
++        const names = [_][]const u8{ "m.trellis", "m.suh", "m.svh", "m.mul1_e4m3" };
++        const ts = [_]core.checkpoint.Tensor{ trellis, suh_t, svh_t, tensor(.i32, &.{}, &mcg) };
++        var f: Fake = .{ .gpa = a, .names = &names, .tensors = &ts };
++        defer f.deinit();
++        try std.testing.expectError(error.UnreadableExlr8, mat(&f, "m", .{}, .whole));
++    }
++}
++
+ test "GLM X8: the scratch a projection needs covers both halves of a [gate | up] stack and its widest call" {
+     var most: Most = .{};
+     const g: Mat = .{ .t = 0, .suh = 0, .svh = 0, .k = 6144, .n = 512, .bits = 4 };
+diff --git a/zig/tests/exl3_mul1_e4m3_check.cu b/zig/tests/exl3_mul1_e4m3_check.cu
+new file mode 100644
+index 000000000..0c54cfaaf
+--- /dev/null
++++ b/zig/tests/exl3_mul1_e4m3_check.cu
+@@ -0,0 +1,187 @@
++// EXLR8 v0.7 (mul1 experts): in the e4m3 images' build (TF_EXL3_MCG_E4M3=1 and, new, TF_EXL3_MUL1_E4M3=1), the mul1
++// decode sites round to E4M3 the way FORMAT.md's Codebook and Decode sections define ("v -> E4M3 (nearest even,
++// clamp +-448) -> fp32"): decode2<CB_MUL1> (exl3_decode.cuh, aliased to CB_MUL1_E4M3 by the define — the grouped
++// experts' path, tf_exl3_grouped_2) and decode2<CB_MUL1_E4M3> itself must equal, bit for bit for all 65,536 states
++// in both slots of a pair, a host reference implementing FORMAT.md's mul1 literally: x = (state·0x83DCD12D) mod 2^32,
++// v = fp16(1024 + Σb)·c + d with c = fp16 0x1EEE, d = fp16 0xC931 in the definition's fp16 operation order (one fp16
++// rounding — exact in float, as exl3_format.zig's codebookValue does it in float64), then the E4M3 round-trip through
++// CUDA's host conversions (satfinite E4M3). Host pre-checks prove the rounding step itself before the device run:
++// a first-principles E4M3 RNE reference agrees with CUDA's host conversion on every finite fp16 pattern, and so does
++// the device fallback's integer algorithm (exl3_decode.cuh's e4m3_round1, the sub-sm_89 path of mul1_e4m3_finish;
++// its host copy here must stay in step with it). Controls: the unrounded mul1 must differ from the reference on most
++// states (the rounding is active, not vacuous), the decoded values must be non-zero (mul1's constants put v at
++// (Σb − 510)·c, never near zero), and mcg must be untouched: decode2<CB_MCG> still equals exlr8.cu's tf_exlr8_pair.
++// Built without TF_EXL3_MUL1_E4M3=1 (the pre-change e4m3 image) the decode2<CB_MUL1> check must fail (the control:
++// CB_MUL1 is then the unrounded EXL3 mul1).
++// nvcc -O2 -std=c++17 --expt-relaxed-constexpr -arch=sm_121 -I kernels/cuda -DTF_EXL3_MCG_E4M3=1 -DTF_EXL3_MUL1_E4M3=1 tests/exl3_mul1_e4m3_check.cu
++// (from zig/; the control, which must fail the decode2<CB_MUL1> check, drops -DTF_EXL3_MUL1_E4M3=1)
++#include <cstdio>
++#include <cstdlib>
++#include <cuda_fp8.h>
++#include "exl3_experts.cu"  // the experts module as built (its grouped and prompt headers in their context)
++#include "exlr8.cu"
++
++// ---- the E4M3 round-trip, three ways on the host ----
++
++// A first-principles E4M3 RNE reference: the nearest of the 127 finite codes (ties to the even mantissa lsb),
++// subnormals m·2^-9 under 2^-6, satfinite clamp to +-448 above.
++static uint16_t e4m3_roundtrip_ref(uint16_t h) {
++    const uint16_t s = h & 0x8000u;
++    const uint32_t a = h & 0x7FFFu;
++    if (a >= 0x7C00u) return (uint16_t)(a > 0x7C00u ? (s | 0x7E00u) : (s | 0x5F00u));  // nan; +-inf satfinite
++    const double v = __half2float(__ushort_as_half(h));
++    const double av = v < 0 ? -v : v;
++    uint32_t best = 0;
++    double bestd = 1e300;
++    for (uint32_t c = 0; c <= 126; ++c) {
++        const double val = c < 8 ? ldexp((double)c, -9) : ldexp((double)(8 + (c & 7)), (int)(c >> 3) - 10);
++        const double dist = av > val ? av - val : val - av;
++        if (dist < bestd || (dist == bestd && (c & 1) == 0 && (best & 1) == 1)) {
++            bestd = dist;
++            best = c;
++        }
++    }
++    if (best < 8) {  // subnormal: best·2^-9, exact in fp16
++        if (best == 0) return s;
++        uint32_t hb = 0;
++        while ((1u << (hb + 1)) <= best) ++hb;
++        return (uint16_t)(s | ((hb + 6u) << 10) | ((best - (1u << hb)) << (10 - hb)));
++    }
++    return (uint16_t)(s | (((best >> 3) + 8u) << 10) | ((best & 7u) << 7));  // 1.m·2^(field-7), exact in fp16
++}
++
++// The same through CUDA's host conversions (the documented RNE satfinite E4M3).
++static uint16_t e4m3_roundtrip_cuda(uint16_t h) {
++    const float f = __half2float(__ushort_as_half(h));
++    const __nv_fp8_storage_t e = __nv_cvt_float_to_fp8(f, __NV_SATFINITE, __NV_E4M3);
++    return __half_as_ushort(__half(__nv_cvt_fp8_to_halfraw(e, __NV_E4M3)));
++}
++
++// A host copy of exl3_decode.cuh's e4m3_round1 (mul1_e4m3_finish's sub-sm_89 fallback): keep the two in step.
++static uint16_t e4m3_round1_host(uint16_t h) {
++    const uint16_t s = h & 0x8000u;
++    const uint32_t a = h & 0x7FFFu;
++    if (a >= 0x7C00u) return (uint16_t)(a > 0x7C00u ? (s | 0x7E00u) : (s | 0x5F00u));
++    if (a < 0x0400u) return s;
++    const uint32_t f16e = a >> 10, sig = (a & 0x3FFu) | 0x400u;
++    uint32_t code;
++    if (f16e >= 9) {
++        uint32_t q = sig >> 7, r = sig & 0x7Fu;
++        if (r > 0x40u || (r == 0x40u && (q & 1u))) q++;
++        const int e = (int)f16e - 15 + (q == 16u ? 1 : 0);
++        if (q == 16u) q = 8u;
++        if (e > 8 || (e == 8 && q == 15u)) return (uint16_t)(s | 0x5F00u);
++        code = ((uint32_t)(e + 7) << 3) | (q & 7u);
++    } else {
++        const uint32_t sh = 16u - f16e;
++        uint32_t q = sig >> sh, r = sig & ((1u << sh) - 1u);
++        if (r > (1u << (sh - 1)) || (r == (1u << (sh - 1)) && (q & 1u))) q++;
++        code = q;
++    }
++    if (code < 8u) {
++        if (code == 0u) return s;
++        uint32_t hb = 0;
++        while ((1u << (hb + 1)) <= code) ++hb;
++        return (uint16_t)(s | ((hb + 6u) << 10) | ((code - (1u << hb)) << (10 - hb)));
++    }
++    return (uint16_t)(s | (((code >> 3) + 8u) << 10) | ((code & 7u) << 7));
++}
++
++// FORMAT.md's mul1, literally, on the host: the byte sum, fp16(1024 + Σb), the definition's fp16 operation order —
++// h·c + d with one fp16 rounding, exact in float (h·c = hM·2^-18, h < 2^11 and M the 11-bit significand of c, and
++// d = N·2^-7: the exact sum K·2^-18 has |K| < 2^23, so every float step is exact and __float2half_rn rounds once) —
++// then the E4M3 round-trip through CUDA's host conversion.
++static uint16_t mul1_ref(uint16_t state) {
++    const uint32_t x = (uint32_t)state * 0x83DCD12Du;
++    const unsigned sum = (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + ((x >> 24) & 255u);
++    const float h = __half2float(__float2half_rn((float)(1024 + sum)));
++    const float c = __half2float(__ushort_as_half(0x1EEE)), d = __half2float(__ushort_as_half(0xC931));
++    // exact in fp32 (see below); kindlingai's reference loader (loader/exlr8.py) rounds this sum ONCE to fp16
++    // ((1024 + byte_sum) * C + D).half(), then to E4M3: the fp16 rounding must not be skipped.
++    const float v = __half2float(__float2half_rn(h * c + d));
++    const __nv_fp8_storage_t e = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
++    return __half_as_ushort(__half(__nv_cvt_fp8_to_halfraw(e, __NV_E4M3)));
++}
++
++// The unrounded mul1 (the pre-change decode2<CB_MUL1> body), for the control that the rounding is active.
++__device__ __forceinline__ uint32_t mul1_raw(uint32_t s0, uint32_t s1) {
++    const uint32_t x0 = s0 * 0x83DCD12Du, x1 = s1 * 0x83DCD12Du;
++    const uint32_t h0 = __dp4a(x0, 0x01010101u, 0x6400u);
++    const uint32_t h1 = __dp4a(x1, 0x01010101u, 0x6400u);
++    const uint32_t hh = (h0 & 0xffffu) | (h1 << 16);
++    const half2 r = __hfma2(*reinterpret_cast<const half2*>(&hh), __half2half2(__ushort_as_half(0x1eee)),
++                            __half2half2(__ushort_as_half(0xc931)));
++    return *reinterpret_cast<const uint32_t*>(&r);
++}
++
++// Every 16-bit state in both slots of a pair (two partners a state, so a defect limited to one state or one slot is
++// caught): the aliased decode2<CB_MUL1> and the explicit decode2<CB_MUL1_E4M3> against the host reference; the raw
++// decode against the rounded one (the rounding must change most states); and mcg against tf_exlr8_pair (untouched).
++__global__ void sites(const uint16_t* ref, unsigned* bad, unsigned* raw_diff, unsigned* zeros) {
++    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= 65536) return;
++    const unsigned partners[2] = {i ^ 0xA5A5u, __brev(i) >> 16};
++    for (unsigned p : partners) {
++        for (int slot = 0; slot < 2; ++slot) {
++            const unsigned s0 = slot ? p : i, s1 = slot ? i : p;
++            const uint32_t want = (uint32_t)ref[s1] << 16 | ref[s0];
++            if (tf_exl3::decode2<tf_exl3::CB_MUL1>(s0, s1) != want) atomicAdd(bad, 1u);
++            if (tf_exl3::decode2<tf_exl3::CB_MUL1_E4M3>(s0, s1) != want) atomicAdd(bad + 1, 1u);
++            if (mul1_raw(s0, s1) != tf_exl3::decode2<tf_exl3::CB_MUL1_E4M3>(s0, s1)) atomicAdd(raw_diff, 1u);
++            if ((tf_exl3::decode2<tf_exl3::CB_MUL1_E4M3>(s0, s1) & 0x7FFF7FFFu) == 0) atomicAdd(zeros, 1u);
++        }
++    }
++    const __half2 r = tf_exlr8_pair(i, partners[0]);
++    const uint32_t want = *reinterpret_cast<const uint32_t*>(&r);
++    if (tf_exl3::decode2<tf_exl3::CB_MCG>(i, partners[0]) != want) atomicAdd(bad + 2, 1u);
++}
++
++int main() {
++    // The rounding step itself, exhaustively over every finite fp16 pattern (both signs), before anything runs:
++    // the first-principles reference and the fallback's algorithm must both match CUDA's host conversion.
++    long ref_vs_cuda = 0, emul_vs_cuda = 0;
++    for (uint32_t h = 0; h < 0x7C00u; ++h)
++        for (int sign = 0; sign < 2; ++sign) {
++            const uint16_t bits = (uint16_t)(h | (sign ? 0x8000u : 0u));
++            const uint16_t rc = e4m3_roundtrip_cuda(bits);
++            ref_vs_cuda += e4m3_roundtrip_ref(bits) != rc;
++            emul_vs_cuda += e4m3_round1_host(bits) != rc;
++        }
++    printf("host E4M3 RNE round-trip over all finite fp16: %ld of 63488 differ from CUDA's conversion (reference), "
++           "%ld (the fallback's algorithm)\n",
++           ref_vs_cuda, emul_vs_cuda);
++    long hbits_bad = 0;
++    for (unsigned sum = 0; sum <= 1020; ++sum)
++        hbits_bad += __half_as_ushort(__float2half_rn((float)(1024 + sum))) != (uint16_t)(0x6400u | sum);
++    printf("fp16(1024 + sum) = bits 0x6400 | sum: %ld of 1021 wrong\n", hbits_bad);
++
++    uint16_t ref[65536];
++    for (uint32_t i = 0; i < 65536; ++i) ref[i] = mul1_ref((uint16_t)i);
++
++    uint16_t* dref;
++    unsigned* dout;
++    unsigned hbad[3] = {0, 0, 0}, hraw = 0, hzeros = 0;
++    if (cudaMalloc(&dref, sizeof ref) != cudaSuccess || cudaMalloc(&dout, sizeof hbad + 8) != cudaSuccess) return 2;
++    cudaMemcpy(dref, ref, sizeof ref, cudaMemcpyHostToDevice);
++    cudaMemset(dout, 0, sizeof hbad + 8);
++    sites<<<256, 256>>>(dref, dout, dout + 3, dout + 4);
++    if (cudaDeviceSynchronize() != cudaSuccess) { printf("FAIL launch\n"); return 2; }
++    cudaMemcpy(hbad, dout, sizeof hbad, cudaMemcpyDeviceToHost);
++    cudaMemcpy(&hraw, dout + 3, 4, cudaMemcpyDeviceToHost);
++    cudaMemcpy(&hzeros, dout + 4, 4, cudaMemcpyDeviceToHost);
++
++    int fails = 0;
++    printf("decode2<CB_MUL1> (exl3_decode.cuh, aliased by TF_EXL3_MUL1_E4M3) %s: %u of 262144 differ from the reference\n",
++           hbad[0] == 0 ? "PASS" : "FAIL", hbad[0]);
++    printf("decode2<CB_MUL1_E4M3> (exl3_decode.cuh) %s: %u of 262144 differ from the reference\n",
++           hbad[1] == 0 ? "PASS" : "FAIL", hbad[1]);
++    printf("decode2<CB_MCG> still EXLR8's (TF_EXL3_MCG_E4M3) %s: %u of 65536 differ from tf_exlr8_pair\n",
++           hbad[2] == 0 ? "PASS" : "FAIL", hbad[2]);
++    printf("control, the unrounded mul1 differs from the reference on %u of 262144 pairs %s\n", hraw,
++           hraw > 131072 ? "(PASS)" : "(FAIL: the rounding is not active)");
++    printf("control, %u zero values %s\n", hzeros, hzeros == 0 ? "(PASS)" : "(FAIL)");
++    fails += ref_vs_cuda != 0 || emul_vs_cuda != 0 || hbits_bad != 0;
++    fails += hbad[0] != 0 || hbad[1] != 0 || hbad[2] != 0 || hraw <= 131072 || hzeros != 0;
++    printf("TF_EXL3_MUL1_E4M3=%d TF_EXL3_MCG_E4M3=%d: %d failing checks\n", TF_EXL3_MUL1_E4M3, TF_EXL3_MCG_E4M3, fails);
++    return fails ? 1 : 0;
++}
+-- 
+2.43.0
+

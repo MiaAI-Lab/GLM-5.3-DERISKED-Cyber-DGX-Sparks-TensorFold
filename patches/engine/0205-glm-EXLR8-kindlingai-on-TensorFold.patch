@@ -1,0 +1,1295 @@
+From 1dfa75c97df24d25dff4fc44eb69e7a71ff1c6ad Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Tue, 17 Nov 2026 17:21:07 +0200
+Subject: [PATCH 1/9] exl3: CB_MCG_E4M3, the mcg codebook rounded to E4M3
+ (EXLR8's weight values), checked bit for bit against exlr8.cu
+
+---
+ zig/kernels/cuda/exl3_decode.cuh | 18 +++++-
+ zig/tests/exl3_e4m3_check.cu     | 97 ++++++++++++++++++++++++++++++++
+ 2 files changed, 114 insertions(+), 1 deletion(-)
+ create mode 100644 zig/tests/exl3_e4m3_check.cu
+
+diff --git a/zig/kernels/cuda/exl3_decode.cuh b/zig/kernels/cuda/exl3_decode.cuh
+index b271bbbd7..44f5d3943 100644
+--- a/zig/kernels/cuda/exl3_decode.cuh
++++ b/zig/kernels/cuda/exl3_decode.cuh
+@@ -8,7 +8,9 @@
+ 
+ namespace tf_exl3 {
+ 
+-enum Codebook : int { CB_3INST = 0, CB_MCG = 1, CB_MUL1 = 2 };
++// CB_MCG_E4M3: EXLR8 (kindlingai's exlr8-e4m3-v2 scheme): the mcg codebook value rounded to E4M3 (nearest even), the
++// format's weight values; tiles, streams and placement are EXL3's, so only the value step differs (patch 0205).
++enum Codebook : int { CB_3INST = 0, CB_MCG = 1, CB_MUL1 = 2, CB_MCG_E4M3 = 3 };
+ 
+ // 32-bit words of a tile: 256 values of K2 / 2 bits.
+ template <int K2>
+@@ -99,6 +101,20 @@ __device__ __forceinline__ uint32_t decode2(uint32_t s0, uint32_t s1) {
+         const half2 r = __hfma2(*reinterpret_cast<const half2*>(&hh), __half2half2(__ushort_as_half(0x1eee)),
+                                 __half2half2(__ushort_as_half(0xc931)));
+         return *reinterpret_cast<const uint32_t*>(&r);
++    } else if constexpr (CB == CB_MCG_E4M3) {
++        // The mcg sum at 2^-8 (xor 0x1B60): E4M3 normals then map onto fp16 normals and E4M3 subnormals (steps of 2^-9)
++        // onto fp16 values whose bit 7 is E4M3's last mantissa bit, so nearest even at bit 7 is E4M3's rounding,
++        // subnormals included; times 2^8 back, exact. The same operations as exlr8.cu's tf_exlr8_pair.
++        uint32_t x0 = s0 * 0xCBAC1FEDu, x1 = s1 * 0xCBAC1FEDu;
++        x0 = (x0 & 0x8FFF8FFFu) ^ 0x1B601B60u;
++        x1 = (x1 & 0x8FFF8FFFu) ^ 0x1B601B60u;
++        const uint32_t lo = __byte_perm(x0, x1, 0x5410);
++        const uint32_t hi = __byte_perm(x0, x1, 0x7632);
++        const half2 sum = __hadd2(*reinterpret_cast<const half2*>(&lo), *reinterpret_cast<const half2*>(&hi));
++        const uint32_t b = *reinterpret_cast<const uint32_t*>(&sum);
++        const uint32_t q = (b + 0x003F003Fu + ((b >> 7) & 0x00010001u)) & 0xFF80FF80u;
++        const half2 r = __hmul2(*reinterpret_cast<const half2*>(&q), __half2half2(__ushort_as_half(0x5C00)));
++        return *reinterpret_cast<const uint32_t*>(&r);
+     } else {
+         uint32_t x0, x1;
+         if constexpr (CB == CB_MCG) {
+diff --git a/zig/tests/exl3_e4m3_check.cu b/zig/tests/exl3_e4m3_check.cu
+new file mode 100644
+index 000000000..dc98ec1a3
+--- /dev/null
++++ b/zig/tests/exl3_e4m3_check.cu
+@@ -0,0 +1,97 @@
++// X8 (patch 0205): EXL3's tile decode with CB_MCG_E4M3 equals TensorFold's EXLR8 reference decode (exlr8.cu,
++// tf_exlr8_decode) bit for bit, on random tiles at K = 2, 3, 4 and on real tiles of kindlingai's EXLR8 release
++// (glm-5.3-exlr8-k2-k3-k4, layer 3, K4). Control: CB_MCG (unrounded) must differ from the reference, and most values
++// must be non-zero, so the comparison is not vacuous. Build: nvcc -O2 -std=c++17 -arch=sm_121 -I kernels/cuda
++// tests/exl3_e4m3_check.cu; run: exl3_e4m3_check [real_k4.bin] (two K4 halves of the release, e.g. layer 3).
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++#include "exl3_decode.cuh"
++#include "exlr8.cu"
++
++using namespace tf_exl3;
++
++// Each block: one tile, 32 lanes; out[tile][lane][8] fp16 bits of the EXL3 path (CB) and of the EXLR8 reference.
++template <int K, int CB>
++__global__ void both(const uint8_t* W, unsigned tiles, uint16_t* exl3, uint16_t* ref) {
++    const unsigned t = blockIdx.x, lane = threadIdx.x;
++    if (t >= tiles) return;
++    const uint32_t* tile = reinterpret_cast<const uint32_t*>(W + (uint64_t)t * 32 * K);
++    uint32_t w[lane_words<2 * K>()];
++    load_lane_words<2 * K>(tile, lane, w);
++    uint32_t b0[2], b1[2];
++    decode_lane<2 * K, CB>(w, lane, b0, b1);
++    const uint32_t v[4] = {b0[0], b0[1], b1[0], b1[1]};
++    uint16_t* o = exl3 + ((uint64_t)t * 32 + lane) * 8;
++    for (int i = 0; i < 4; ++i) { o[2 * i] = v[i] & 0xffffu; o[2 * i + 1] = v[i] >> 16; }
++    __half r[8];
++    tf_exlr8_decode<K>(tile, lane, r);
++    uint16_t* q = ref + ((uint64_t)t * 32 + lane) * 8;
++    for (int n = 0; n < 8; ++n) q[n] = __half_as_ushort(r[n]);
++}
++
++#define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { printf("CUDA %s at %d\n", cudaGetErrorString(e), __LINE__); exit(2); } } while (0)
++
++template <int K, int CB>
++static long mismatches(const std::vector<uint8_t>& bytes, long* nonzero) {
++    const unsigned tiles = bytes.size() / (32 * K);
++    uint8_t* dW; uint16_t *dA, *dB;
++    CK(cudaMalloc(&dW, bytes.size()));
++    CK(cudaMalloc(&dA, (size_t)tiles * 256 * 2));
++    CK(cudaMalloc(&dB, (size_t)tiles * 256 * 2));
++    CK(cudaMemcpy(dW, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
++    both<K, CB><<<tiles, 32>>>(dW, tiles, dA, dB);
++    CK(cudaGetLastError());
++    CK(cudaDeviceSynchronize());
++    std::vector<uint16_t> a((size_t)tiles * 256), b((size_t)tiles * 256);
++    CK(cudaMemcpy(a.data(), dA, a.size() * 2, cudaMemcpyDeviceToHost));
++    CK(cudaMemcpy(b.data(), dB, b.size() * 2, cudaMemcpyDeviceToHost));
++    cudaFree(dW); cudaFree(dA); cudaFree(dB);
++    long bad = 0, nz = 0;
++    for (size_t i = 0; i < a.size(); ++i) { bad += a[i] != b[i]; nz += (b[i] & 0x7fff) != 0; }
++    if (nonzero) *nonzero = nz;
++    return bad;
++}
++
++static std::vector<uint8_t> random_bytes(size_t n, unsigned seed) {
++    std::vector<uint8_t> v(n);
++    uint64_t x = 0x9E3779B97F4A7C15ull ^ seed;
++    for (auto& c : v) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; c = (uint8_t)x; }
++    return v;
++}
++
++static int fails = 0, checks = 0;
++static void expect(bool ok, const char* what, long a, long b) {
++    ++checks;
++    printf("%s %s (%ld / %ld)\n", ok ? "PASS" : "FAIL", what, a, b);
++    if (!ok) ++fails;
++}
++
++int main(int argc, char** argv) {
++    long nz = 0, total;
++    // random tiles: 4096 a width, every state pattern the stream can make
++    auto r2 = random_bytes(4096 * 64, 2), r3 = random_bytes(4096 * 96, 3), r4 = random_bytes(4096 * 128, 4);
++    total = 4096L * 256;
++    expect(mismatches<2, CB_MCG_E4M3>(r2, &nz) == 0 && nz > total / 2, "K2 random: E4M3 path == EXLR8 reference", nz, total);
++    expect(mismatches<3, CB_MCG_E4M3>(r3, &nz) == 0 && nz > total / 2, "K3 random: E4M3 path == EXLR8 reference", nz, total);
++    expect(mismatches<4, CB_MCG_E4M3>(r4, &nz) == 0 && nz > total / 2, "K4 random: E4M3 path == EXLR8 reference", nz, total);
++    // controls: the unrounded mcg path differs (ignoring the variant would be caught)
++    expect(mismatches<4, CB_MCG>(r4, nullptr) > total / 4, "control: CB_MCG differs from the EXLR8 values", 0, total);
++    if (argc > 1) {
++        FILE* f = fopen(argv[1], "rb");
++        if (!f) { printf("FAIL cannot open %s\n", argv[1]); return 1; }
++        std::vector<uint8_t> real;
++        uint8_t buf[1 << 16];
++        size_t n;
++        while ((n = fread(buf, 1, sizeof buf, f)) > 0) real.insert(real.end(), buf, buf + n);
++        fclose(f);
++        const long tiles = real.size() / 128;
++        long bad = mismatches<4, CB_MCG_E4M3>(real, &nz);
++        expect(bad == 0 && nz > tiles * 128, "real EXLR8 K4 tiles (layer 3, two rank-0 halves): E4M3 path == reference", nz, tiles * 256);
++    } else {
++        printf("SKIP real tiles (no file)\n");
++    }
++    printf("%d checks, %d failed\n", checks, fails);
++    return fails ? 1 : 0;
++}
+-- 
+2.43.0
+
+
+From 6f4f1b50c41c3d44a83bc1d6f7145f52f07d9744 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Tue, 17 Nov 2026 17:27:08 +0200
+Subject: [PATCH 2/9] exl3 E4M3 check: every state in both slots, the real
+ halves' size and provenance
+
+---
+ zig/tests/exl3_e4m3_check.cu | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/zig/tests/exl3_e4m3_check.cu b/zig/tests/exl3_e4m3_check.cu
+index dc98ec1a3..5bb37549a 100644
+--- a/zig/tests/exl3_e4m3_check.cu
++++ b/zig/tests/exl3_e4m3_check.cu
+@@ -2,7 +2,8 @@
+ // tf_exlr8_decode) bit for bit, on random tiles at K = 2, 3, 4 and on real tiles of kindlingai's EXLR8 release
+ // (glm-5.3-exlr8-k2-k3-k4, layer 3, K4). Control: CB_MCG (unrounded) must differ from the reference, and most values
+ // must be non-zero, so the comparison is not vacuous. Build: nvcc -O2 -std=c++17 -arch=sm_121 -I kernels/cuda
+-// tests/exl3_e4m3_check.cu; run: exl3_e4m3_check [real_k4.bin] (two K4 halves of the release, e.g. layer 3).
++// tests/exl3_e4m3_check.cu; run: exl3_e4m3_check [real_k4.bin]: two whole K4 halves of the release (layer 3: gate e0 h1,
++// down e7 h5), whose provenance night/gr8x/x8/verify_halves.py proves against the release index's xxhash64 checksums.
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -31,6 +32,23 @@ __global__ void both(const uint8_t* W, unsigned tiles, uint16_t* exl3, uint16_t*
+     for (int n = 0; n < 8; ++n) q[n] = __half_as_ushort(r[n]);
+ }
+ 
++// Every 16-bit state in both slots of a pair: decode2<CB_MCG_E4M3>(s0, s1) against tf_exlr8_pair(s0, s1), two partners
++// a state (s ^ 0xA5A5 and the reversed bits), so a defect limited to one state or one slot is caught.
++__global__ void states(unsigned* bad) {
++    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= 65536) return;
++    const unsigned partners[2] = {i ^ 0xA5A5u, __brev(i) >> 16};
++    for (unsigned p : partners) {
++        for (int slot = 0; slot < 2; ++slot) {
++            const unsigned s0 = slot ? p : i, s1 = slot ? i : p;
++            const uint32_t a = decode2<CB_MCG_E4M3>(s0, s1);
++            const __half2 r = tf_exlr8_pair(s0, s1);
++            const uint32_t b = *reinterpret_cast<const uint32_t*>(&r);
++            if (a != b) atomicAdd(bad, 1u);
++        }
++    }
++}
++
+ #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { printf("CUDA %s at %d\n", cudaGetErrorString(e), __LINE__); exit(2); } } while (0)
+ 
+ template <int K, int CB>
+@@ -70,7 +88,15 @@ static void expect(bool ok, const char* what, long a, long b) {
+ 
+ int main(int argc, char** argv) {
+     long nz = 0, total;
+-    // random tiles: 4096 a width, every state pattern the stream can make
++    {
++        unsigned* d; unsigned h = 0;
++        CK(cudaMalloc(&d, 4)); CK(cudaMemset(d, 0, 4));
++        states<<<256, 256>>>(d);
++        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
++        CK(cudaMemcpy(&h, d, 4, cudaMemcpyDeviceToHost)); cudaFree(d);
++        expect(h == 0, "all 65,536 states in both slots: decode2<CB_MCG_E4M3> == tf_exlr8_pair", (long)h, 4L * 65536);
++    }
++    // random tiles: 4096 a width (stream layout and lane placement; the states test above covers every value)
+     auto r2 = random_bytes(4096 * 64, 2), r3 = random_bytes(4096 * 96, 3), r4 = random_bytes(4096 * 128, 4);
+     total = 4096L * 256;
+     expect(mismatches<2, CB_MCG_E4M3>(r2, &nz) == 0 && nz > total / 2, "K2 random: E4M3 path == EXLR8 reference", nz, total);
+@@ -86,6 +112,7 @@ int main(int argc, char** argv) {
+         size_t n;
+         while ((n = fread(buf, 1, sizeof buf, f)) > 0) real.insert(real.end(), buf, buf + n);
+         fclose(f);
++        if (real.size() != 2u * 3072 * 128) { printf("FAIL %s is %zu bytes, not two whole K4 halves (786,432)\n", argv[1], real.size()); return 1; }
+         const long tiles = real.size() / 128;
+         long bad = mismatches<4, CB_MCG_E4M3>(real, &nz);
+         expect(bad == 0 && nz > tiles * 128, "real EXLR8 K4 tiles (layer 3, two rank-0 halves): E4M3 path == reference", nz, tiles * 256);
+-- 
+2.43.0
+
+
+From 2f6e49b0ade3d2695d5c1403ad9ddcbefc8928f7 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Tue, 17 Nov 2026 17:38:36 +0200
+Subject: [PATCH 3/9] glm: EXLR8 expert pieces (mcg_e4m3 markers) detected as
+ mcg + e4m3; refused until the E4M3 expert kernels (0205 part 2)
+
+---
+ zig/src/families/glm/cuda_exl3.zig      | 15 ++++++
+ zig/src/families/glm/cuda_exl3_test.zig | 69 +++++++++++++++++++++++++
+ zig/src/families/glm/cuda_weights.zig   |  4 ++
+ 3 files changed, 88 insertions(+)
+
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index dd04c9f1d..892d88cfe 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -101,6 +101,9 @@ pub const Experts = struct {
+     uniform_d: u32 = 8,
+     shx: bool, // every expert's gate and up share one input rotation: a prompt rotates a row once, not once a pick
+     codebook: core.exl3_load.Codebook = .mcg, // the layer's (every expert and projection of it on the same one)
++    // EXLR8 (kindlingai's exlr8-e4m3-v2, as rank pieces from night/gr8x/x8/exlr8_pieces.py): mcg values rounded to E4M3,
++    // marked `mcg_e4m3` (the mcg multiplier) instead of `mcg`; codebook stays .mcg, the kernels take CB_MCG_E4M3 (0205)
++    e4m3: bool = false,
+ 
+     /// The gate, up and down width tables.
+     pub fn tables(w: Experts) [3]u64 {
+@@ -182,6 +185,18 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+                     seen = mk.codebook;
+                 }
+             }
++            // EXLR8's marker: the mcg multiplier under its own name, so no EXL3 build can be read as EXLR8 or back
++            const e4 = (if (pieced) L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}.mcg_e4m3", .{ i, e, pr }) else L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".mcg_e4m3", .{ i, e })) catch null;
++            if (e4) |marker| {
++                if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
++                    std.mem.readInt(u32, marker.bytes[0..4], .little) != core.exl3_load.markers[0].value or seen != null)
++                    return error.UnreadableExl3;
++                seen = .mcg;
++            }
++            if (pi == 0 and e == 0) out.e4m3 = e4 != null else if ((e4 != null) != out.e4m3) {
++                std.log.warn("layer {d}: EXLR8 (mcg_e4m3) and EXL3 experts mixed in one layer", .{i}); // refused below its caller's error
++                return error.UnreadableExl3;
++            }
+             const cb = seen orelse return error.UnreadableExl3;
+             if (pi == 0 and e == 0) out.codebook = cb else if (cb != out.codebook) {
+                 std.log.err("layer {d}: experts on more than one EXL3 codebook; GLM's CUDA experts take one a layer", .{i});
+diff --git a/zig/src/families/glm/cuda_exl3_test.zig b/zig/src/families/glm/cuda_exl3_test.zig
+index baf76cc4b..c27f07cfc 100644
+--- a/zig/src/families/glm/cuda_exl3_test.zig
++++ b/zig/src/families/glm/cuda_exl3_test.zig
+@@ -359,3 +359,72 @@ test "GLM EXL3: scratch covers the path each layer takes: the prompt kernels' wh
+         try testing.expectEqual([3]usize{ 4, 4, 4 }, most[1..4].*);
+     }
+ }
++
++/// Expert `e`'s marker of projection `p` renamed from `.mcg` to EXLR8's `.mcg_e4m3` (same value), or both kept (`both`).
++fn markE4m3(m: *Mock, i: u32, e: usize, p: usize, both: bool) !void {
++    var buf: [128]u8 = undefined;
++    const old = try std.fmt.bufPrint(&buf, "layers.{d}.mlp.experts.{d}.{s}.mcg", .{ i, e, projs[p] });
++    const t = m.tensors.get(old).?;
++    if (!both) _ = m.tensors.remove(old);
++    var nb: [128]u8 = undefined;
++    try m.add(try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.mcg_e4m3", .{ i, e, projs[p] }), t.dtype, t.shape[0..t.rank], t.bytes);
++}
++
++test "GLM EXL3: EXLR8 pieces (mcg_e4m3 markers) load as mcg with e4m3 set, the same bytes; EXL3 layers keep e4m3 off" {
++    const gpa = testing.allocator;
++    var prng = std.Random.DefaultPrng.init(205);
++    const count = 3;
++    const k8: [count]u32 = @splat(8);
++    const k2s: [3][]const u32 = .{ &k8, &k8, &k8 };
++    const cut: Span = .{ .lo = 128, .hi = 256 };
++    {
++        var m0 = Mock.init(gpa);
++        defer m0.deinit();
++        var p0 = std.Random.DefaultPrng.init(205);
++        try synth(&m0, p0.random(), 6, count, 256, 256, k2s, false);
++        const plain = try x3.load(&m0, 6, count, 256, 256, cut);
++        try testing.expect(!plain.e4m3);
++    }
++    var m = Mock.init(gpa);
++    defer m.deinit();
++    try synth(&m, prng.random(), 6, count, 256, 256, k2s, false);
++    for (0..count) |e| for (0..3) |p| try markE4m3(&m, 6, e, p, false);
++    const w = try x3.load(&m, 6, count, 256, 256, cut);
++    try testing.expect(w.e4m3);
++    try testing.expectEqual(core.exl3_load.Codebook.mcg, w.codebook);
++    try expectUploads(&m, w, 6, count, 256, 256, cut, k2s);
++}
++
++test "GLM EXL3: a layer mixing EXLR8 and EXL3 experts, a projection with both markers, or a wrong EXLR8 value is refused" {
++    const gpa = testing.allocator;
++    var prng = std.Random.DefaultPrng.init(2051);
++    const count = 3;
++    const k8: [count]u32 = @splat(8);
++    const k2s: [3][]const u32 = .{ &k8, &k8, &k8 };
++    const cut: Span = .{ .lo = 0, .hi = 128 };
++    { // expert 1 alone EXLR8
++        var m = Mock.init(gpa);
++        defer m.deinit();
++        try synth(&m, prng.random(), 2, count, 256, 256, k2s, false);
++        for (0..3) |p| try markE4m3(&m, 2, 1, p, false);
++        try testing.expectError(error.UnreadableExl3, x3.load(&m, 2, count, 256, 256, cut));
++    }
++    { // both markers on expert 0's gate
++        var m = Mock.init(gpa);
++        defer m.deinit();
++        try synth(&m, prng.random(), 2, count, 256, 256, k2s, false);
++        for (0..count) |e| for (0..3) |p| try markE4m3(&m, 2, e, p, e == 0 and p == 0);
++        try testing.expectError(error.UnreadableExl3, x3.load(&m, 2, count, 256, 256, cut));
++    }
++    { // an EXLR8 marker with another value
++        var m = Mock.init(gpa);
++        defer m.deinit();
++        try synth(&m, prng.random(), 2, count, 256, 256, k2s, false);
++        for (0..count) |e| for (0..3) |p| try markE4m3(&m, 2, e, p, false);
++        const t = m.tensors.getPtr("layers.2.mlp.experts.2.down_proj.mcg_e4m3").?;
++        var bad: [4]u8 = undefined;
++        std.mem.writeInt(u32, &bad, core.exl3_load.markers[1].value, .little);
++        t.bytes = try m.arena.allocator().dupe(u8, &bad);
++        try testing.expectError(error.UnreadableExl3, x3.load(&m, 2, count, 256, 256, cut));
++    }
++}
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index cd8d89fee..9c9bea628 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -630,6 +630,10 @@ const Loader = struct {
+             routed = if (f8) try L.fp8Experts(i) else try L.nvfp4Experts(i);
+         } else if (c.exl3) { // the MTP layer's experts too
+             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
++            if (x3.?.e4m3) { // patch 0205 part 1 detects EXLR8 pieces; the E4M3 expert kernels are part 2
++                std.log.err("layer {d}: EXLR8 experts (mcg_e4m3); this build has no E4M3 expert kernels yet (patch 0205 part 2)", .{i});
++                return error.UnreadableExl3;
++            }
+         } else if (c.fp8) {
+             routed = try L.fp8Experts(i);
+         } else routed = try L.nvfp4Experts(i);
+-- 
+2.43.0
+
+
+From f94188d9270e2b1e08d6fed6ed6ed161bd87ab4a Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Tue, 17 Nov 2026 17:50:53 +0200
+Subject: [PATCH 4/9] glm: a rank's declared EXL3 pieces (experts.pieces [rank,
+ ranks]) load only on that rank; optional markers probed without
+ missing-tensor errors
+
+---
+ zig/src/families/glm/cuda_exl3.zig      | 22 +++++++++-
+ zig/src/families/glm/cuda_exl3_test.zig | 57 +++++++++++++++++++++++++
+ zig/src/families/glm/cuda_weights.zig   |  6 +++
+ 3 files changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index 892d88cfe..106cf3a91 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -155,12 +155,27 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+     var pr: usize = 0;
+     if (pieced) {
+         var pieces: usize = 0;
+-        while (pieces < 16) : (pieces += 1) _ = L.get("layers.{d}.mlp.experts.0.gate_proj.rank{d}.trellis", .{ i, pieces }) catch break;
++        // A file of one rank's pieces (night/gr8x/x8/exlr8_pieces.py) declares them: int32 [rank, ranks]. It holds only
++        // that rank's pieces, so the process must be that rank; without the declaration, count the pieces present.
++        var declared: ?usize = null;
++        if (try L.has("layers.{d}.mlp.experts.pieces", .{i})) {
++            const t = try L.get("layers.{d}.mlp.experts.pieces", .{i});
++            if (t.dtype != .i32 or t.numel() != 2 or t.bytes.len != 8) return error.UnreadableExl3;
++            const r = std.mem.readInt(i32, t.bytes[0..4], .little);
++            const n = std.mem.readInt(i32, t.bytes[4..8], .little);
++            if (n < 1 or n > 16 or r < 0 or r >= n) return error.UnreadableExl3;
++            declared = @intCast(r);
++            pieces = @intCast(n);
++        } else while (pieces < 16) : (pieces += 1) _ = L.get("layers.{d}.mlp.experts.0.gate_proj.rank{d}.trellis", .{ i, pieces }) catch break;
+         if (pieces == 0 or width * pieces != inter or cut.lo % width != 0) {
+             std.log.err("layer {d}: experts stored as {d} rank pieces; this rank's share ({d} of {d} rows) is not one piece: serve this build at TP={d}", .{ i, pieces, width, inter, pieces });
+             return error.UnreadableExl3;
+         }
+         pr = cut.lo / width;
++        if (declared) |r| if (r != pr) {
++            std.log.warn("layer {d}: these expert files hold rank {d}'s pieces; this process is rank {d} (give each rank its own file)", .{ i, r, pr });
++            return error.UnreadableExl3;
++        };
+     }
+     inline for (mats, .{ "gate_proj", "up_proj", "down_proj" }, .{ "gt", "ut", "dt" }, .{ "suh_g", "suh_u", "suh_d" }, .{ "svh_g", "svh_u", "svh_d" }, 0..) |m, proj, tw, su, sv, pi| {
+         const kt = (if (m.by_cols) m.k else width) / 16; // the rank's tiles
+@@ -186,7 +201,10 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+                 }
+             }
+             // EXLR8's marker: the mcg multiplier under its own name, so no EXL3 build can be read as EXLR8 or back
+-            const e4 = (if (pieced) L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}.mcg_e4m3", .{ i, e, pr }) else L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".mcg_e4m3", .{ i, e })) catch null;
++            const e4: ?core.checkpoint.Tensor = if (pieced)
++                (if (try L.has("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}.mcg_e4m3", .{ i, e, pr })) try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}.mcg_e4m3", .{ i, e, pr }) else null)
++            else
++                (if (try L.has("layers.{d}.mlp.experts.{d}." ++ proj ++ ".mcg_e4m3", .{ i, e })) try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".mcg_e4m3", .{ i, e }) else null);
+             if (e4) |marker| {
+                 if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
+                     std.mem.readInt(u32, marker.bytes[0..4], .little) != core.exl3_load.markers[0].value or seen != null)
+diff --git a/zig/src/families/glm/cuda_exl3_test.zig b/zig/src/families/glm/cuda_exl3_test.zig
+index c27f07cfc..614eb994a 100644
+--- a/zig/src/families/glm/cuda_exl3_test.zig
++++ b/zig/src/families/glm/cuda_exl3_test.zig
+@@ -79,6 +79,10 @@ const Mock = struct {
+         m.host.clearRetainingCapacity();
+         return ptr;
+     }
++    pub fn has(m: *Mock, comptime fmt: []const u8, args: anytype) !bool {
++        var buf: [192]u8 = undefined;
++        return m.tensors.contains(try std.fmt.bufPrint(&buf, fmt, args));
++    }
+     fn add(m: *Mock, name: []const u8, dtype: core.checkpoint.DType, shape: []const usize, bytes: []const u8) !void {
+         const a = m.arena.allocator();
+         var t: Tensor = .{ .dtype = dtype, .rank = @intCast(shape.len), .shape = @splat(0), .bytes = try a.dupe(u8, bytes) };
+@@ -428,3 +432,56 @@ test "GLM EXL3: a layer mixing EXLR8 and EXL3 experts, a projection with both ma
+         try testing.expectError(error.UnreadableExl3, x3.load(&m, 2, count, 256, 256, cut));
+     }
+ }
++
++/// Layer `i` stored as one rank's pieces (EXLR8 files): every expert's projections as `.rank{rank}.*` with mcg_e4m3
++/// markers, piece width `w`, and the declaration [rank, ranks].
++fn synthPieces(m: *Mock, rng: std.Random, i: u32, count: usize, dims: usize, w: usize, rank: i32, ranks: i32) !void {
++    const a = m.arena.allocator();
++    for (projs, 0..) |proj, p| {
++        const k = if (p < 2) dims else w;
++        const n = if (p < 2) w else dims;
++        for (0..count) |e| {
++            var buf: [160]u8 = undefined;
++            const words = try a.alloc(u8, k / 16 * (n / 16) * 16 * 8);
++            rng.bytes(words);
++            try m.add(try std.fmt.bufPrint(&buf, "layers.{d}.mlp.experts.{d}.{s}.rank{d}.trellis", .{ i, e, proj, rank }), .i16, &.{ k / 16, n / 16, 64 }, words);
++            var marker: [4]u8 = undefined;
++            std.mem.writeInt(u32, &marker, core.exl3_load.markers[0].value, .little);
++            try m.add(try std.fmt.bufPrint(&buf, "layers.{d}.mlp.experts.{d}.{s}.rank{d}.mcg_e4m3", .{ i, e, proj, rank }), .i32, &.{}, &marker);
++            const suh = try a.alloc(u8, k * 2);
++            rng.bytes(suh);
++            try m.add(try std.fmt.bufPrint(&buf, "layers.{d}.mlp.experts.{d}.{s}.rank{d}.suh", .{ i, e, proj, rank }), .f16, &.{k}, suh);
++            const svh = try a.alloc(u8, n * 2);
++            rng.bytes(svh);
++            try m.add(try std.fmt.bufPrint(&buf, "layers.{d}.mlp.experts.{d}.{s}.rank{d}.svh", .{ i, e, proj, rank }), .f16, &.{n}, svh);
++        }
++    }
++    var decl: [8]u8 = undefined;
++    std.mem.writeInt(i32, decl[0..4], rank, .little);
++    std.mem.writeInt(i32, decl[4..8], ranks, .little);
++    var buf: [96]u8 = undefined;
++    try m.add(try std.fmt.bufPrint(&buf, "layers.{d}.mlp.experts.pieces", .{i}), .i32, &.{2}, &decl);
++}
++
++test "GLM EXL3: one rank's declared EXLR8 pieces load whole on that rank, and are refused on another rank" {
++    const gpa = testing.allocator;
++    var prng = std.Random.DefaultPrng.init(2052);
++    const count = 2;
++    { // rank 2 of 4, inter 512: the piece is 128 wide; cut [256, 384) is rank 2's share
++        var m = Mock.init(gpa);
++        defer m.deinit();
++        try synthPieces(&m, prng.random(), 3, count, 256, 128, 2, 4);
++        const w = try x3.load(&m, 3, count, 256, 512, .{ .lo = 256, .hi = 384 });
++        try testing.expect(w.e4m3);
++        const gt = m.find("layers.3.moe.exl3.gt").?;
++        var buf: [96]u8 = undefined;
++        const t0 = m.tensors.get(try std.fmt.bufPrint(&buf, "layers.3.mlp.experts.0.gate_proj.rank2.trellis", .{})).?;
++        try testing.expectEqualSlices(u8, t0.bytes, gt.bytes[0..t0.bytes.len]); // expert 0's piece, whole
++    }
++    { // the same file on rank 1's share
++        var m = Mock.init(gpa);
++        defer m.deinit();
++        try synthPieces(&m, prng.random(), 3, count, 256, 128, 2, 4);
++        try testing.expectError(error.UnreadableExl3, x3.load(&m, 3, count, 256, 512, .{ .lo = 128, .hi = 256 }));
++    }
++}
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 9c9bea628..41db12d9f 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -123,6 +123,12 @@ const Loader = struct {
+         return L.ck.get(L.last);
+     }
+ 
++    /// Whether tensor `fmt` exists, without `get`'s missing-tensor error line (optional markers).
++    pub fn has(L: *Loader, comptime fmt: []const u8, args: anytype) !bool {
++        var buf: [192]u8 = undefined;
++        return L.ck.has(try std.fmt.bufPrint(&buf, "{s}" ++ fmt, .{L.pfx} ++ args));
++    }
++
+     /// Hidden-size norm `fmt` uploaded as `up`: bf16 as stored, or kept float32 for the _f32w kernels.
+     pub fn norm(L: *Loader, comptime fmt: []const u8, args: anytype, comptime up: []const u8) !glue.Norm {
+         const t = try L.get(fmt, args);
+-- 
+2.43.0
+
+
+From e257fb2db8fd8813e8512f2d736785803e2cbb78 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Tue, 17 Nov 2026 17:52:44 +0200
+Subject: [PATCH 5/9] glm: EXL3 codebook markers probed with has (no
+ missing-tensor error lines); the EXLR8 refusal names the shared-expert loader
+ too
+
+---
+ zig/src/families/glm/cuda_exl3.zig    | 6 +++++-
+ zig/src/families/glm/cuda_weights.zig | 2 +-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index 106cf3a91..3cdf07e81 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -192,7 +192,11 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+             // the codebook marker (an i32 holding the codebook's multiplier): the layer's first sets it, the rest agree
+             var seen: ?core.exl3_load.Codebook = null;
+             inline for (core.exl3_load.markers) |mk| {
+-                const got = (if (pieced) L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}." ++ mk.name, .{ i, e, pr }) else L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ "." ++ mk.name, .{ i, e })) catch null;
++                // probed with `has` first: a codebook's absent marker is expected, not a missing tensor worth an error line
++                const got: ?core.checkpoint.Tensor = if (pieced)
++                    (if (try L.has("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}." ++ mk.name, .{ i, e, pr })) try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}." ++ mk.name, .{ i, e, pr }) else null)
++                else
++                    (if (try L.has("layers.{d}.mlp.experts.{d}." ++ proj ++ "." ++ mk.name, .{ i, e })) try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ "." ++ mk.name, .{ i, e }) else null);
+                 if (got) |marker| {
+                     if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
+                         std.mem.readInt(u32, marker.bytes[0..4], .little) != mk.value or seen != null)
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 41db12d9f..22f5f96b9 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -637,7 +637,7 @@ const Loader = struct {
+         } else if (c.exl3) { // the MTP layer's experts too
+             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
+             if (x3.?.e4m3) { // patch 0205 part 1 detects EXLR8 pieces; the E4M3 expert kernels are part 2
+-                std.log.err("layer {d}: EXLR8 experts (mcg_e4m3); this build has no E4M3 expert kernels yet (patch 0205 part 2)", .{i});
++                std.log.err("layer {d}: EXLR8 experts (mcg_e4m3); this build has no E4M3 expert kernels and no EXL3 shared-expert loader yet (patch 0205 parts 2-3)", .{i});
+                 return error.UnreadableExl3;
+             }
+         } else if (c.fp8) {
+-- 
+2.43.0
+
+
+From 57cc52e63d62c5567740ac86d9ec720b916a553f Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Tue, 17 Nov 2026 18:04:15 +0200
+Subject: [PATCH 6/9] glm/exl3: the exl3_experts_e4m3 image
+ (TF_EXL3_MCG_E4M3=1: every mcg decode site rounds to E4M3), chosen by config
+ codebook mcg_e4m3; pieces must agree
+
+---
+ zig/build/cuda_kernels.zig              |  1 +
+ zig/kernels/cuda/exl3_decode.cuh        | 22 ++++++++++---
+ zig/kernels/cuda/exl3_grouped.cuh       |  5 +--
+ zig/kernels/cuda/exl3_prompt.cuh        |  6 ++++
+ zig/src/cuda/exl3_experts.zig           | 11 ++++++-
+ zig/src/cuda/kernels.zig                |  1 +
+ zig/src/families/glm/config.zig         |  2 ++
+ zig/src/families/glm/cuda_engine.zig    |  2 +-
+ zig/src/families/glm/cuda_exl3.zig      |  5 +--
+ zig/src/families/glm/cuda_exl3_test.zig | 27 +++++++++++++++
+ zig/src/families/glm/cuda_forward.zig   |  7 ++--
+ zig/src/families/glm/cuda_weights.zig   |  8 +++--
+ zig/tests/exl3_e4m3_sites_check.cu      | 44 +++++++++++++++++++++++++
+ 13 files changed, 127 insertions(+), 14 deletions(-)
+ create mode 100644 zig/tests/exl3_e4m3_sites_check.cu
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 820c05907..017d2d1d1 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -104,6 +104,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
+     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
+     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
++    .{ .name = "exl3_experts_e4m3", .src = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr", "-DTF_EXL3_MCG_E4M3=1" } }, // the same kernels on EXLR8's E4M3 mcg values (patch 0205)
+     .{ .name = "exl3_candidate", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // #806's EXL3 tiles: Dense's candidate
+     .{ .name = "glm_vision", .flags = &.{"-O3"} }, // ours: GLM's image tower steps around cuBLASLt (norms, rotary, softmax, merger)
+     .{ .name = "glm_mm", .flags = &.{"-O3"} }, // ours: GLM's bf16 linears on tensor cores, weights tiled at load, row-stable
+diff --git a/zig/kernels/cuda/exl3_decode.cuh b/zig/kernels/cuda/exl3_decode.cuh
+index 44f5d3943..4925bdc22 100644
+--- a/zig/kernels/cuda/exl3_decode.cuh
++++ b/zig/kernels/cuda/exl3_decode.cuh
+@@ -12,6 +12,21 @@ namespace tf_exl3 {
+ // format's weight values; tiles, streams and placement are EXL3's, so only the value step differs (patch 0205).
+ enum Codebook : int { CB_3INST = 0, CB_MCG = 1, CB_MUL1 = 2, CB_MCG_E4M3 = 3 };
+ 
++// TF_EXL3_MCG_E4M3=1 builds a module whose every mcg decode is EXLR8's (the exl3_experts_e4m3 image, patch 0205): the
++// same kernels, the mcg sum taken at 2^-8 (xor MCG_XOR) and finished by mcg_e4m3_finish. 0 (every other image): unchanged.
++#ifndef TF_EXL3_MCG_E4M3
++#define TF_EXL3_MCG_E4M3 0
++#endif
++constexpr uint32_t MCG_XOR = TF_EXL3_MCG_E4M3 ? 0x1B601B60u : 0x3B603B60u;
++
++// An mcg pair summed at 2^-8 (xor 0x1B60), rounded to E4M3 at bit 7 (nearest even, subnormals included) and scaled back
++// by 2^8: exlr8.cu's tf_exlr8_pair after its sum.
++__device__ __forceinline__ uint32_t mcg_e4m3_finish(uint32_t b) {
++    const uint32_t q = (b + 0x003F003Fu + ((b >> 7) & 0x00010001u)) & 0xFF80FF80u;
++    const half2 r = __hmul2(*reinterpret_cast<const half2*>(&q), __half2half2(__ushort_as_half(0x5C00)));
++    return *reinterpret_cast<const uint32_t*>(&r);
++}
++
+ // 32-bit words of a tile: 256 values of K2 / 2 bits.
+ template <int K2>
+ __host__ __device__ constexpr int tile_words() {
+@@ -111,10 +126,9 @@ __device__ __forceinline__ uint32_t decode2(uint32_t s0, uint32_t s1) {
+         const uint32_t lo = __byte_perm(x0, x1, 0x5410);
+         const uint32_t hi = __byte_perm(x0, x1, 0x7632);
+         const half2 sum = __hadd2(*reinterpret_cast<const half2*>(&lo), *reinterpret_cast<const half2*>(&hi));
+-        const uint32_t b = *reinterpret_cast<const uint32_t*>(&sum);
+-        const uint32_t q = (b + 0x003F003Fu + ((b >> 7) & 0x00010001u)) & 0xFF80FF80u;
+-        const half2 r = __hmul2(*reinterpret_cast<const half2*>(&q), __half2half2(__ushort_as_half(0x5C00)));
+-        return *reinterpret_cast<const uint32_t*>(&r);
++        return mcg_e4m3_finish(*reinterpret_cast<const uint32_t*>(&sum));
++    } else if constexpr (CB == CB_MCG && TF_EXL3_MCG_E4M3) {
++        return decode2<CB_MCG_E4M3>(s0, s1);
+     } else {
+         uint32_t x0, x1;
+         if constexpr (CB == CB_MCG) {
+diff --git a/zig/kernels/cuda/exl3_grouped.cuh b/zig/kernels/cuda/exl3_grouped.cuh
+index 88a39a6b2..50e09ccb9 100644
+--- a/zig/kernels/cuda/exl3_grouped.cuh
++++ b/zig/kernels/cuda/exl3_grouped.cuh
+@@ -98,11 +98,12 @@ __device__ __forceinline__ void lane_states8(uint32_t w0, uint32_t w1, uint32_t
+ // decode2<CB_MCG> with its AND mask in a register `m` (0x8FFF8FFF): the same operations on the same values.
+ __device__ __forceinline__ uint32_t decode2_mcg(uint32_t s0, uint32_t s1, uint32_t m) {
+     uint32_t x0 = s0 * 0xCBAC1FEDu, x1 = s1 * 0xCBAC1FEDu;
+-    x0 = (x0 & m) ^ 0x3B603B60u;
+-    x1 = (x1 & m) ^ 0x3B603B60u;
++    x0 = (x0 & m) ^ MCG_XOR;
++    x1 = (x1 & m) ^ MCG_XOR;
+     const uint32_t lo = __byte_perm(x0, x1, 0x5410);
+     const uint32_t hi = __byte_perm(x0, x1, 0x7632);
+     const half2 r = __hadd2(*reinterpret_cast<const half2*>(&lo), *reinterpret_cast<const half2*>(&hi));
++    if constexpr (TF_EXL3_MCG_E4M3) return mcg_e4m3_finish(*reinterpret_cast<const uint32_t*>(&r));
+     return *reinterpret_cast<const uint32_t*>(&r);
+ }
+ 
+diff --git a/zig/kernels/cuda/exl3_prompt.cuh b/zig/kernels/cuda/exl3_prompt.cuh
+index 92476975f..0fabd422a 100644
+--- a/zig/kernels/cuda/exl3_prompt.cuh
++++ b/zig/kernels/cuda/exl3_prompt.cuh
+@@ -74,10 +74,16 @@ __device__ __forceinline__ void cp16s(uint32_t dst, const void* src, int n) {
+ __device__ __forceinline__ uint32_t mcg2(uint32_t s0, uint32_t s1) {
+     const uint32_t m = 0x8FFF8FFFu;
+     uint32_t x0, x1;
++#if TF_EXL3_MCG_E4M3
++    asm("lop3.b32 %0, %1, %2, 0x1B601B60, 0x6a;\n" : "=r"(x0) : "r"(s0 * 0xCBAC1FEDu), "r"(m));
++    asm("lop3.b32 %0, %1, %2, 0x1B601B60, 0x6a;\n" : "=r"(x1) : "r"(s1 * 0xCBAC1FEDu), "r"(m));
++#else
+     asm("lop3.b32 %0, %1, %2, 0x3B603B60, 0x6a;\n" : "=r"(x0) : "r"(s0 * 0xCBAC1FEDu), "r"(m));
+     asm("lop3.b32 %0, %1, %2, 0x3B603B60, 0x6a;\n" : "=r"(x1) : "r"(s1 * 0xCBAC1FEDu), "r"(m));
++#endif
+     const uint32_t lo = __byte_perm(x0, x1, 0x5410), hi = __byte_perm(x0, x1, 0x7632);
+     const half2 r = __hadd2(*reinterpret_cast<const half2*>(&lo), *reinterpret_cast<const half2*>(&hi));
++    if constexpr (TF_EXL3_MCG_E4M3) return mcg_e4m3_finish(*reinterpret_cast<const uint32_t*>(&r));
+     return *reinterpret_cast<const uint32_t*>(&r);
+ }
+ // A 4-bit tile's A fragment for this lane from its word w and the word of lane - 1, p: lane_states<8>'s eight states
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index 3aee81bf7..e65157e1f 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -124,9 +124,18 @@ pub const Experts = struct {
+     plan_finish: Function = undefined,
+ 
+     pub fn load(d: *const Driver) !Experts {
++        return loadImage(d, kernels.exl3_experts);
++    }
++
++    /// The same kernels built with TF_EXL3_MCG_E4M3=1: every mcg value rounded to E4M3 (EXLR8's, patch 0205).
++    pub fn loadE4m3(d: *const Driver) !Experts {
++        return loadImage(d, kernels.exl3_experts_e4m3);
++    }
++
++    fn loadImage(d: *const Driver, image: []const u8) !Experts {
+         if (!kernels.available) return error.BuiltWithoutKernels;
+         var e: Experts = .{
+-            .mod = try Module.load(d, kernels.exl3_experts),
++            .mod = try Module.load(d, image),
+             .group_fn = undefined,
+             .rot_in = undefined,
+             .grouped = undefined,
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 4e6338ca3..5ae4d2d86 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -77,6 +77,7 @@ pub const glm_dspark: []const u8 = if (available) &Blob("fatbin_glm_dspark").byt
+ pub const glm_kda: []const u8 = if (available) &Blob("fatbin_glm_kda").bytes else &.{};
+ pub const exl3_linear: []const u8 = if (available) &Blob("fatbin_exl3_linear").bytes else &.{};
+ pub const exl3_experts: []const u8 = if (available) &Blob("fatbin_exl3_experts").bytes else &.{};
++pub const exl3_experts_e4m3: []const u8 = if (available) &Blob("fatbin_exl3_experts_e4m3").bytes else &.{};
+ pub const exl3_candidate: []const u8 = if (available) &Blob("fatbin_exl3_candidate").bytes else &.{};
+ pub const torch_argmax: []const u8 = if (available) &Blob("fatbin_torch_argmax").bytes else &.{};
+ pub const torch_topk: []const u8 = if (available) &Blob("fatbin_torch_topk").bytes else &.{};
+diff --git a/zig/src/families/glm/config.zig b/zig/src/families/glm/config.zig
+index 3133a45cc..f9210c369 100644
+--- a/zig/src/families/glm/config.zig
++++ b/zig/src/families/glm/config.zig
+@@ -17,6 +17,7 @@ pub const Config = struct {
+     vocab: u32 = 154880,
+     head_unit: u32 = 64, // the vocabulary's TP cut in whole units: 128 for EXL3, whose matrices split at 128 columns
+     exl3: bool = false, // routed experts in EXL3 (quant_method "exl3", Mia-AiLab's checkpoint), the rest bf16
++    exl3_e4m3: bool = false, // EXL3 experts on EXLR8's E4M3 mcg values (quantization_config "codebook": "mcg_e4m3", 0205)
+     fp8: bool = false, // routed experts and the quantized linears in block FP8 (quant_method "fp8", e4m3, 128 x 128 scales), the rest bf16
+     eps: f32 = 1e-5,
+     dense_layers: u32 = 3,
+@@ -206,6 +207,7 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
+     if (root.get("quantization_config")) |q| if (q == .object) if (q.object.get("quant_method")) |m| if (m == .string and std.mem.eql(u8, m.string, "exl3")) {
+         c.head_unit = 128;
+         c.exl3 = true;
++        if (q.object.get("codebook")) |cb| c.exl3_e4m3 = cb == .string and std.mem.eql(u8, cb.string, "mcg_e4m3");
+     };
+     // block FP8 (unsloth's and Z.AI's layout): the table sits at the root or under text_config
+     for ([_]?std.json.Value{ root.get("quantization_config"), t.get("quantization_config") }) |qv| if (qv) |q| if (q == .object) if (q.object.get("quant_method")) |m| if (m == .string and std.mem.eql(u8, m.string, "fp8")) {
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 0d53c687c..deb983562 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -203,7 +203,7 @@ pub const Engine = struct {
+         const spans = try gpa.alloc(shard.Span, world);
+         errdefer gpa.free(spans);
+         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
+-        var m = try fw.Modules.load(d, ctx);
++        var m = try fw.Modules.load(d, ctx, c.exl3_e4m3);
+         errdefer m.deinit();
+         const pair = prompt_pair.wanted(o.settings.pair, world);
+         var pieces = try fw.Pieces.init(d, o.settings.pieces, pair);
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index 3cdf07e81..2a02a1f68 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -75,8 +75,9 @@ pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why
+     }
+     // a checkpoint's "codebook" names its default; the per-expert markers decide (a resumed encode can mix them by layer)
+     const book = q.get("codebook") orelse return; // absent (EXL3-K4-v1): the markers say
+-    if (book != .string or !(std.mem.eql(u8, book.string, "mcg") or std.mem.eql(u8, book.string, "mul1"))) {
+-        why.set("EXL3 codebook {f}: the CUDA family reads \"mcg\" or \"mul1\"", .{std.json.fmt(book, .{})});
++    // "mcg_e4m3": EXLR8 pieces (patch 0205), the mcg codebook rounded to E4M3; the engine then loads the E4M3 image
++    if (book != .string or !(std.mem.eql(u8, book.string, "mcg") or std.mem.eql(u8, book.string, "mul1") or std.mem.eql(u8, book.string, "mcg_e4m3"))) {
++        why.set("EXL3 codebook {f}: the CUDA family reads \"mcg\", \"mul1\" or \"mcg_e4m3\"", .{std.json.fmt(book, .{})});
+         return error.UnsupportedQuant;
+     }
+ }
+diff --git a/zig/src/families/glm/cuda_exl3_test.zig b/zig/src/families/glm/cuda_exl3_test.zig
+index 614eb994a..82e61390c 100644
+--- a/zig/src/families/glm/cuda_exl3_test.zig
++++ b/zig/src/families/glm/cuda_exl3_test.zig
+@@ -7,6 +7,7 @@ const modelopt = core.modelopt;
+ const Tensor = core.checkpoint.Tensor;
+ const Span = @import("cuda_shard.zig").Span;
+ const testing = std.testing;
++const config = @import("config.zig");
+ 
+ test "GLM EXL3: Mia-AiLab's 4-bit block and a mixed block without bits pass; other widths and codebooks are refused by name" {
+     const gpa = testing.allocator;
+@@ -485,3 +486,29 @@ test "GLM EXL3: one rank's declared EXLR8 pieces load whole on that rank, and ar
+         try testing.expectError(error.UnreadableExl3, x3.load(&m, 3, count, 256, 512, .{ .lo = 128, .hi = 256 }));
+     }
+ }
++
++test "GLM EXL3: admission takes EXLR8's codebook mcg_e4m3 and still refuses other names" {
++    const gpa = testing.allocator;
++    var why: modelopt.Why = .{};
++    try x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg_e4m3\"}}", &why);
++    try testing.expectError(error.UnsupportedQuant, x3.admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg_e5m2\"}}", &why));
++}
++
++test "GLM EXL3: a config whose codebook is mcg_e4m3 (EXLR8 pieces, patch 0205) sets exl3_e4m3; mcg, mul1 or none do not" {
++    const gpa = testing.allocator;
++    const base = try config.dsaText(gpa, 4, &.{0});
++    defer gpa.free(base);
++    try testing.expect(base[base.len - 1] == '}');
++    for ([_]struct { q: []const u8, exl3: bool, e4: bool }{
++        .{ .q = "", .exl3 = false, .e4 = false },
++        .{ .q = ", \"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4}", .exl3 = true, .e4 = false },
++        .{ .q = ", \"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg\"}", .exl3 = true, .e4 = false },
++        .{ .q = ", \"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg_e4m3\"}", .exl3 = true, .e4 = true },
++    }) |case| {
++        const text = try std.mem.concat(gpa, u8, &.{ base[0 .. base.len - 1], case.q, "}" });
++        defer gpa.free(text);
++        const c = try config.parse(gpa, text);
++        try testing.expectEqual(case.exl3, c.exl3);
++        try testing.expectEqual(case.e4, c.exl3_e4m3);
++    }
++}
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index a2463d089..472e18ce3 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -68,6 +68,7 @@ pub const Modules = struct {
+     prompt: cuda.nvfp4.Prompt, // and their prompt rows
+     experts: experts.Kernels,
+     exl3: exl3.Kernels, // an EXL3 checkpoint's routed experts
++    exl3_e4m3: bool = false, // `exl3` is the E4M3 image (an EXLR8 checkpoint, patch 0205)
+     mm: mm_mod.Kernels, // glm_mm: the bf16 linears on tiled weights
+     index: ?index_mod.Kernels, // TF_GLM_INDEX_CUDA: a prompt chunk's indexer scores and pools (glm_index)
+     dsel: bool, // TF_GLM_DSEL (default on): a decode window's DSA select on many CTAs (cuda_sparse.decodeSelect)
+@@ -86,7 +87,8 @@ pub const Modules = struct {
+     shared_writes: bool = true, // TF_GLM_SHARED_WRITES=0: a batched shared window's cache writes and KDA row copies per segment (the same bits)
+     hc_part: glue.PartTable = .{}, // TF_GLM_HC_PART: hc_pre's decode-dot blocks by rows (default 2:16); 0: tf_glm_hc_partial8's 16 a row (the same bits)
+ 
+-    pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
++    /// `e4m3`: the checkpoint's EXL3 experts are EXLR8's (config "codebook": "mcg_e4m3"): their module rounds mcg to E4M3.
++    pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context, e4m3: bool) !Modules {
+         const k = cuda.kernels;
+         var m: Modules = undefined;
+         var n: usize = 0;
+@@ -108,7 +110,8 @@ pub const Modules = struct {
+         m.quant = try quant.Kernels.load(m.mods[4]);
+         m.q4 = try q4.Kernels.load(m.mods[5], m.mods[3], ctx);
+         m.glue = try glue.Kernels.load(m.mods[6]);
+-        m.exl3 = try exl3.Kernels.load(d);
++        m.exl3 = try if (e4m3) exl3.Kernels.loadE4m3(d) else exl3.Kernels.load(d);
++        m.exl3_e4m3 = e4m3;
+         errdefer m.exl3.unload();
+         m.mm = try mm_mod.Kernels.load(m.mods[7]);
+         m.index = null;
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 22f5f96b9..cc678e2b8 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -636,8 +636,12 @@ const Loader = struct {
+             routed = if (f8) try L.fp8Experts(i) else try L.nvfp4Experts(i);
+         } else if (c.exl3) { // the MTP layer's experts too
+             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
+-            if (x3.?.e4m3) { // patch 0205 part 1 detects EXLR8 pieces; the E4M3 expert kernels are part 2
+-                std.log.err("layer {d}: EXLR8 experts (mcg_e4m3); this build has no E4M3 expert kernels and no EXL3 shared-expert loader yet (patch 0205 parts 2-3)", .{i});
++            if (x3.?.e4m3 != c.exl3_e4m3) { // the kernel image follows the config; the pieces must agree with it
++                std.log.err("layer {d}: experts marked {s}, config.json's quantization_config codebook says {s}", .{ i, if (x3.?.e4m3) "mcg_e4m3 (EXLR8)" else "mcg/mul1", if (c.exl3_e4m3) "mcg_e4m3" else "none" });
++                return error.UnreadableExl3;
++            }
++            if (x3.?.e4m3) { // 0205: E4M3 expert kernels are in (part 2); the shared expert's EXL3 pieces need part 3's loader
++                std.log.err("layer {d}: EXLR8 experts (mcg_e4m3); this build has no EXL3 shared-expert loader yet (patch 0205 part 3)", .{i});
+                 return error.UnreadableExl3;
+             }
+         } else if (c.fp8) {
+diff --git a/zig/tests/exl3_e4m3_sites_check.cu b/zig/tests/exl3_e4m3_sites_check.cu
+new file mode 100644
+index 000000000..54c8307fb
+--- /dev/null
++++ b/zig/tests/exl3_e4m3_sites_check.cu
+@@ -0,0 +1,44 @@
++// X8 (patch 0205 part 2): in a build with TF_EXL3_MCG_E4M3=1 (the exl3_experts_e4m3 image), every mcg decode site the
++// experts module uses gives EXLR8's values: decode2<CB_MCG> (exl3_decode.cuh, the generic and grouped paths),
++// decode2_mcg (exl3_grouped.cuh, the masked read-once path) and mcg2 (exl3_prompt.cuh, the prompt LOP3 path) each equal
++// exlr8.cu's tf_exlr8_pair for all 65,536 states in both slots (two partners a state). Build with
++// -DTF_EXL3_MCG_E4M3=1; built without it the same checks must fail (the control: the sites are then plain mcg).
++// nvcc -O2 -std=c++17 --expt-relaxed-constexpr -arch=sm_121 -I kernels/cuda [-DTF_EXL3_MCG_E4M3=1] tests/exl3_e4m3_sites_check.cu
++#include <cstdio>
++#include <cstdlib>
++#include "exl3_experts.cu"  // the experts module as built (its grouped and prompt headers in their context)
++#include "exlr8.cu"
++
++__global__ void sites(unsigned* bad) {
++    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= 65536) return;
++    const unsigned partners[2] = {i ^ 0xA5A5u, __brev(i) >> 16};
++    for (unsigned p : partners) {
++        for (int slot = 0; slot < 2; ++slot) {
++            const unsigned s0 = slot ? p : i, s1 = slot ? i : p;
++            const __half2 r = tf_exlr8_pair(s0, s1);
++            const uint32_t want = *reinterpret_cast<const uint32_t*>(&r);
++            if (tf_exl3::decode2<tf_exl3::CB_MCG>(s0, s1) != want) atomicAdd(&bad[0], 1u);
++            if (tf_exl3::decode2_mcg(s0, s1, 0x8FFF8FFFu) != want) atomicAdd(&bad[1], 1u);
++            if (tf_exl3_prompt::mcg2(s0, s1) != want) atomicAdd(&bad[2], 1u);
++        }
++    }
++}
++
++int main() {
++    unsigned* d;
++    unsigned h[3] = {0, 0, 0};
++    if (cudaMalloc(&d, sizeof h) != cudaSuccess) return 2;
++    cudaMemset(d, 0, sizeof h);
++    sites<<<256, 256>>>(d);
++    if (cudaDeviceSynchronize() != cudaSuccess) { printf("FAIL launch\n"); return 2; }
++    cudaMemcpy(h, d, sizeof h, cudaMemcpyDeviceToHost);
++    const char* names[3] = {"decode2<CB_MCG> (exl3_decode.cuh)", "decode2_mcg (exl3_grouped.cuh)", "mcg2 (exl3_prompt.cuh)"};
++    int fails = 0;
++    for (int k = 0; k < 3; ++k) {
++        printf("%s %s: %u of 262144 differ from tf_exlr8_pair\n", h[k] == 0 ? "PASS" : "FAIL", names[k], h[k]);
++        fails += h[k] != 0;
++    }
++    printf("TF_EXL3_MCG_E4M3=%d: %d of 3 sites differ\n", TF_EXL3_MCG_E4M3, fails);
++    return fails ? 1 : 0;
++}
+-- 
+2.43.0
+
+
+From 2b79c638cd0662a3874b59a36d05e7af48d4a37c Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Tue, 17 Nov 2026 18:18:56 +0200
+Subject: [PATCH 7/9] glm: EXLR8 checkpoints load (routed experts on the E4M3
+ image; shared and dense converted); exlr8_x8_dump_test writes TensorFold's
+ reference decode for the converter's checks
+
+---
+ zig/src/core/exlr8_x8_dump_test.zig   | 101 ++++++++++++++++++++++++++
+ zig/src/families/glm/cuda_weights.zig |   6 +-
+ 2 files changed, 103 insertions(+), 4 deletions(-)
+ create mode 100644 zig/src/core/exlr8_x8_dump_test.zig
+
+diff --git a/zig/src/core/exlr8_x8_dump_test.zig b/zig/src/core/exlr8_x8_dump_test.zig
+new file mode 100644
+index 000000000..2a3a51da9
+--- /dev/null
++++ b/zig/src/core/exlr8_x8_dump_test.zig
+@@ -0,0 +1,101 @@
++//! X8 (patch 0205 part 4): TensorFold's EXLR8 reference decode (codec.reconstructF32, "exactly as the reference loader
++//! computes it", and exlr8_dense.Matrix.rows) for chosen expert halves and dense matrices, written as f32 files the
++//! converted checkpoint is compared against (night/gr8x/x8/oracle_compare.py). Not a regular test: it runs only with
++//!   TF_X8_ROOT  a release root (experts/ with the index and width files, dense/)
++//!   TF_X8_JOBS  a file of lines "half L E P H" (P gate|up|down, E 256 the shared expert) or "dense L NAME" (L -1: vocab)
++//!   TF_X8_OUT   the output directory (half-L-E-P-H.f32: W (rows, cols) as the half stores it; dense-L-NAME.f32: the HF
++//!               weight (out, in)); each file's shape goes to its .shape line.
++//! zig test -lc -O ReleaseFast zig/src/core/exlr8_x8_dump_test.zig
++const std = @import("std");
++const codec = @import("exlr8_codec.zig");
++const ex = @import("exlr8_experts.zig");
++const dense = @import("exlr8_dense.zig");
++const st = @import("safetensors.zig");
++
++const io = std.testing.io;
++
++fn env(name: [:0]const u8) ?[]const u8 {
++    const v = std.c.getenv(name) orelse return null;
++    return std.mem.span(v);
++}
++
++fn writeF32(gpa: std.mem.Allocator, dir: []const u8, name: []const u8, rows: usize, cols: usize, data: []const f32) !void {
++    const path = try std.fmt.allocPrint(gpa, "{s}/{s}.f32", .{ dir, name });
++    defer gpa.free(path);
++    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(data) });
++    const sp = try std.fmt.allocPrint(gpa, "{s}/{s}.shape", .{ dir, name });
++    defer gpa.free(sp);
++    const text = try std.fmt.allocPrint(gpa, "{d} {d}\n", .{ rows, cols });
++    defer gpa.free(text);
++    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = text });
++}
++
++test "X8 dump: the reference decode of the listed halves and dense matrices" {
++    const root = env("TF_X8_ROOT") orelse return error.SkipZigTest;
++    const jobs_path = env("TF_X8_JOBS") orelse return error.SkipZigTest;
++    const out = env("TF_X8_OUT") orelse return error.SkipZigTest;
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const book = try a.create(codec.Codebook);
++    book.init();
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, jobs_path, a, .limited(1 << 20));
++    var lines = std.mem.tokenizeScalar(u8, text, '\n');
++    var done: usize = 0;
++    while (lines.next()) |line| {
++        var f = std.mem.tokenizeScalar(u8, line, ' ');
++        const kind = f.next() orelse continue;
++        if (std.mem.eql(u8, kind, "half")) {
++            const L = try std.fmt.parseInt(u16, f.next().?, 10);
++            const e = try std.fmt.parseInt(u16, f.next().?, 10);
++            const pname = f.next().?;
++            const h = try std.fmt.parseInt(usize, f.next().?, 10);
++            const proj = std.meta.stringToEnum(ex.Proj, pname) orelse return error.BadJob;
++            var layer = try ex.Layer.open(gpa, io, root, L);
++            defer layer.close(io);
++            const k: u8 = for ([_]u8{ 4, 3, 2 }) |kk| {
++                if (layer.half(e, proj, h, kk)) |_| break kk else |_| {}
++            } else return error.NoWidth;
++            const hf = try layer.half(e, proj, h, k);
++            if (!hf.verify()) return error.HalfChecksum;
++            const rows = hf.rows();
++            const cols = hf.cols();
++            const codes = try a.alloc(u8, rows * cols);
++            try codec.decodeRun(book, hf.k, hf.order(), hf.trellis, rows, cols, codes);
++            const suh = try a.alloc(f32, rows);
++            const svh = try a.alloc(f32, cols);
++            hf.suh(suh);
++            hf.svh(svh);
++            const w = try a.alloc(f32, rows * cols);
++            try codec.reconstructF32(codes, rows, cols, suh, svh, w);
++            try writeF32(gpa, out, try std.fmt.allocPrint(a, "half-{d}-{d}-{s}-{d}", .{ L, e, pname, h }), rows, cols, w);
++        } else if (std.mem.eql(u8, kind, "dense")) {
++            const L = try std.fmt.parseInt(i32, f.next().?, 10);
++            const name = f.next().?;
++            const path = if (L < 0) try std.fmt.allocPrint(a, "{s}/dense/exlr8-vocab.safetensors", .{root}) else try std.fmt.allocPrint(a, "{s}/dense/exlr8-dense-{d:0>3}.safetensors", .{ root, @as(u32, @intCast(L)) });
++            var file = try st.File.open(gpa, io, path);
++            defer file.close(io);
++            const m = try dense.Matrix.get(&file, name);
++            if (!try m.verify()) return error.DenseChecksum;
++            const r = m.record;
++            const w = try a.alloc(f32, r.out * r.in);
++            if (r.format == .trellis) { // T (in, out), W (in, out) by the reference's fp32 order, then as HF (out, in)
++                const codes = try a.alloc(u8, r.in * r.out);
++                try m.trellisCodes(book, codes);
++                const suh = try a.alloc(f32, r.in);
++                const svh = try a.alloc(f32, r.out);
++                m.suh(suh);
++                m.svh(svh);
++                const wio = try a.alloc(f32, r.in * r.out);
++                try codec.reconstructF32(codes, r.in, r.out, suh, svh, wio);
++                for (0..r.out) |o| for (0..r.in) |i| {
++                    w[o * r.in + i] = wio[i * r.out + o];
++                };
++            } else try m.rows(0, r.out, w);
++            try writeF32(gpa, out, try std.fmt.allocPrint(a, "dense-{d}-{s}", .{ L, name }), r.out, r.in, w);
++        } else return error.BadJob;
++        done += 1;
++    }
++    try std.testing.expect(done > 0);
++}
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index cc678e2b8..b6a0367aa 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -640,10 +640,8 @@ const Loader = struct {
+                 std.log.err("layer {d}: experts marked {s}, config.json's quantization_config codebook says {s}", .{ i, if (x3.?.e4m3) "mcg_e4m3 (EXLR8)" else "mcg/mul1", if (c.exl3_e4m3) "mcg_e4m3" else "none" });
+                 return error.UnreadableExl3;
+             }
+-            if (x3.?.e4m3) { // 0205: E4M3 expert kernels are in (part 2); the shared expert's EXL3 pieces need part 3's loader
+-                std.log.err("layer {d}: EXLR8 experts (mcg_e4m3); this build has no EXL3 shared-expert loader yet (patch 0205 part 3)", .{i});
+-                return error.UnreadableExl3;
+-            }
++            // 0205: EXLR8 routed experts run on the E4M3 image (part 2); the converted checkpoint's shared expert and
++            // dense layers are ordinary bf16 / block FP8 tensors (night/gr8x/x8/exlr8_dense.py), read as below
+         } else if (c.fp8) {
+             routed = try L.fp8Experts(i);
+         } else routed = try L.nvfp4Experts(i);
+-- 
+2.43.0
+
+
+From f2ac42e4cbdb3d26f9ef762dc4aacbb1c9c42bf5 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Tue, 17 Nov 2026 19:59:11 +0200
+Subject: [PATCH 8/9] glm: an EXLR8 rank-piece checkpoint's ranks agree on its
+ exlr8-set.json (its shards differ by rank by design)
+
+---
+ zig/src/families/glm/cuda_engine.zig     |  3 ++-
+ zig/src/families/glm/cuda_ranks.zig      | 17 ++++++++++++
+ zig/src/families/glm/cuda_ranks_test.zig | 33 ++++++++++++++++++++++++
+ 3 files changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index deb983562..4e67e749b 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -180,7 +180,8 @@ pub const Engine = struct {
+         errdefer stream.deinit();
+         const config_hash = try ranks.hashFile(a, io, cfg_path);
+         const program_hash = try ranks.hashFile(a, io, "/proc/self/exe");
+-        const checkpoint_digest = try ranks.artifact(a, io, checkpoint);
++        // an EXLR8 rank-piece checkpoint (config codebook mcg_e4m3) identifies by its conversion set: its shards differ by rank
++        const checkpoint_digest = if (c.exl3_e4m3) try ranks.exlr8Set(a, io, checkpoint) else try ranks.artifact(a, io, checkpoint);
+         var fp = ranks.Fingerprint.of(
+             world,
+             rank,
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index 9e7637835..fff06f70f 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -446,3 +446,20 @@ pub fn mediaFingerprint(f: *Fingerprint, limits: @import("cuda_images.zig").Limi
+ pub fn artifact(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![32]u8 {
+     return @import("core").checkpoint_identity.fullIdentity(gpa, io, dir);
+ }
++
++/// The digest an EXLR8 rank-piece checkpoint (patch 0205) sends instead: its shards differ by rank by design (each box
++/// holds its own pieces and shared-expert rows), so the ranks agree on the conversion they come from, exlr8-set.json
++/// (release, revision, profile, ranks, converter): identical on every box by construction, domain-separated from
++/// `artifact`'s digests. Each rank's own data is checked where it loads (the pieces' [rank, ranks] declaration).
++pub fn exlr8Set(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![32]u8 {
++    const path = try std.fs.path.join(gpa, &.{ dir, "exlr8-set.json" });
++    defer gpa.free(path);
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
++    defer gpa.free(text);
++    var h = std.crypto.hash.sha2.Sha256.init(.{});
++    h.update("tensorfold exlr8 rank-piece set v1\x00");
++    h.update(text);
++    var out: [32]u8 = undefined;
++    h.final(&out);
++    return out;
++}
+diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
+index a73bf005e..017421428 100644
+--- a/zig/src/families/glm/cuda_ranks_test.zig
++++ b/zig/src/families/glm/cuda_ranks_test.zig
+@@ -454,3 +454,36 @@ test "TF_GLM_L2PF: read with the settings, carried in the fingerprint, and ranks
+     all[1].l2pf[3] = 0; // rank 1 unpaced
+     try std.testing.expectEqual(Mismatch{ .field = .l2pf, .rank = 1 }, mismatch(&all).?);
+ }
++
++test "GLM EXL3: EXLR8 rank-piece checkpoints agree on their exlr8-set.json, whatever their shard bytes; a different set disagrees" {
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try digestFixture(io, tmp.dir, "r0/model", 1);
++    try digestFixture(io, tmp.dir, "r1/model", 2); // another rank's pieces: other bytes
++    try digestFixture(io, tmp.dir, "x/model", 2);
++    const set = "{\"release\": \"kindlingai/glm-5.3-exlr8-k2-k3-k4@a36ae468\", \"profile\": \"up1\", \"ranks\": 4}";
++    for ([_][]const u8{ "r0/model", "r1/model" }) |sub| {
++        var d = try tmp.dir.openDir(io, sub, .{});
++        defer d.close(io);
++        try d.writeFile(io, .{ .sub_path = "exlr8-set.json", .data = set });
++    }
++    {
++        var d = try tmp.dir.openDir(io, "x/model", .{});
++        defer d.close(io);
++        try d.writeFile(io, .{ .sub_path = "exlr8-set.json", .data = "{\"release\": \"another\"}" });
++    }
++    var paths: [3][:0]u8 = undefined;
++    for ([_][]const u8{ "r0/model", "r1/model", "x/model" }, &paths) |sub, *p| p.* = try tmp.dir.realPathFileAlloc(io, sub, a);
++    defer for (paths) |p| a.free(p);
++    const h: [32]u8 = @splat(7);
++    var all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, h, h, try ranks.exlr8Set(a, io, paths[0])), Fingerprint.of(2, 1, .{}, 8192, true, h, h, try ranks.exlr8Set(a, io, paths[1])) };
++    try std.testing.expect(mismatch(&all) == null);
++    all[1] = Fingerprint.of(2, 1, .{}, 8192, true, h, h, try ranks.exlr8Set(a, io, paths[2]));
++    try std.testing.expectEqual(Mismatch{ .field = .checkpoint, .rank = 1 }, mismatch(&all).?);
++    try std.testing.expect(!std.mem.eql(u8, &(try ranks.exlr8Set(a, io, paths[0])), &(try artifact(a, io, paths[0]))));
++    const root = try tmp.dir.realPathFileAlloc(io, ".", a); // no exlr8-set.json there
++    defer a.free(root);
++    try std.testing.expectError(error.FileNotFound, ranks.exlr8Set(a, io, root));
++}
+-- 
+2.43.0
+
+
+From 7a51a726adea5b7e34edea280e4683f7d88a4227 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Tue, 17 Nov 2026 20:16:07 +0200
+Subject: [PATCH 9/9] glm: exlr8-set.json must name its format and the world it
+ was converted for
+
+---
+ zig/src/families/glm/cuda_engine.zig     |  2 +-
+ zig/src/families/glm/cuda_ranks.zig      | 14 +++++++++++++-
+ zig/src/families/glm/cuda_ranks_test.zig | 13 +++++++------
+ 3 files changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 4e67e749b..8f80e885e 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -181,7 +181,7 @@ pub const Engine = struct {
+         const config_hash = try ranks.hashFile(a, io, cfg_path);
+         const program_hash = try ranks.hashFile(a, io, "/proc/self/exe");
+         // an EXLR8 rank-piece checkpoint (config codebook mcg_e4m3) identifies by its conversion set: its shards differ by rank
+-        const checkpoint_digest = if (c.exl3_e4m3) try ranks.exlr8Set(a, io, checkpoint) else try ranks.artifact(a, io, checkpoint);
++        const checkpoint_digest = if (c.exl3_e4m3) try ranks.exlr8Set(a, io, checkpoint, world) else try ranks.artifact(a, io, checkpoint);
+         var fp = ranks.Fingerprint.of(
+             world,
+             rank,
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index fff06f70f..3ffbaa688 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -451,11 +451,23 @@ pub fn artifact(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![32]u8 {
+ /// holds its own pieces and shared-expert rows), so the ranks agree on the conversion they come from, exlr8-set.json
+ /// (release, revision, profile, ranks, converter): identical on every box by construction, domain-separated from
+ /// `artifact`'s digests. Each rank's own data is checked where it loads (the pieces' [rank, ranks] declaration).
+-pub fn exlr8Set(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![32]u8 {
++pub fn exlr8Set(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize) ![32]u8 {
+     const path = try std.fs.path.join(gpa, &.{ dir, "exlr8-set.json" });
+     defer gpa.free(path);
+     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+     defer gpa.free(text);
++    { // the set's own claims: its format, and the world it was converted for
++        const v = std.json.parseFromSlice(std.json.Value, gpa, text, .{}) catch return error.BadExlr8Set;
++        defer v.deinit();
++        if (v.value != .object) return error.BadExlr8Set;
++        const f = v.value.object.get("format") orelse return error.BadExlr8Set;
++        const n = v.value.object.get("ranks") orelse return error.BadExlr8Set;
++        if (f != .string or !std.mem.eql(u8, f.string, "tensorfold exlr8 rank pieces v1") or n != .integer) return error.BadExlr8Set;
++        if (n.integer != world) {
++            std.log.warn("{s}: converted for {d} ranks, this world has {d}", .{ path, n.integer, world });
++            return error.BadExlr8Set;
++        }
++    }
+     var h = std.crypto.hash.sha2.Sha256.init(.{});
+     h.update("tensorfold exlr8 rank-piece set v1\x00");
+     h.update(text);
+diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
+index 017421428..b5066205c 100644
+--- a/zig/src/families/glm/cuda_ranks_test.zig
++++ b/zig/src/families/glm/cuda_ranks_test.zig
+@@ -463,7 +463,7 @@ test "GLM EXL3: EXLR8 rank-piece checkpoints agree on their exlr8-set.json, what
+     try digestFixture(io, tmp.dir, "r0/model", 1);
+     try digestFixture(io, tmp.dir, "r1/model", 2); // another rank's pieces: other bytes
+     try digestFixture(io, tmp.dir, "x/model", 2);
+-    const set = "{\"release\": \"kindlingai/glm-5.3-exlr8-k2-k3-k4@a36ae468\", \"profile\": \"up1\", \"ranks\": 4}";
++    const set = "{\"format\": \"tensorfold exlr8 rank pieces v1\", \"release\": \"kindlingai/glm-5.3-exlr8-k2-k3-k4@a36ae468\", \"profile\": \"up1\", \"ranks\": 2}";
+     for ([_][]const u8{ "r0/model", "r1/model" }) |sub| {
+         var d = try tmp.dir.openDir(io, sub, .{});
+         defer d.close(io);
+@@ -472,18 +472,19 @@ test "GLM EXL3: EXLR8 rank-piece checkpoints agree on their exlr8-set.json, what
+     {
+         var d = try tmp.dir.openDir(io, "x/model", .{});
+         defer d.close(io);
+-        try d.writeFile(io, .{ .sub_path = "exlr8-set.json", .data = "{\"release\": \"another\"}" });
++        try d.writeFile(io, .{ .sub_path = "exlr8-set.json", .data = "{\"format\": \"tensorfold exlr8 rank pieces v1\", \"release\": \"another\", \"ranks\": 2}" });
+     }
+     var paths: [3][:0]u8 = undefined;
+     for ([_][]const u8{ "r0/model", "r1/model", "x/model" }, &paths) |sub, *p| p.* = try tmp.dir.realPathFileAlloc(io, sub, a);
+     defer for (paths) |p| a.free(p);
+     const h: [32]u8 = @splat(7);
+-    var all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, h, h, try ranks.exlr8Set(a, io, paths[0])), Fingerprint.of(2, 1, .{}, 8192, true, h, h, try ranks.exlr8Set(a, io, paths[1])) };
++    var all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, h, h, try ranks.exlr8Set(a, io, paths[0], 2)), Fingerprint.of(2, 1, .{}, 8192, true, h, h, try ranks.exlr8Set(a, io, paths[1], 2)) };
+     try std.testing.expect(mismatch(&all) == null);
+-    all[1] = Fingerprint.of(2, 1, .{}, 8192, true, h, h, try ranks.exlr8Set(a, io, paths[2]));
++    all[1] = Fingerprint.of(2, 1, .{}, 8192, true, h, h, try ranks.exlr8Set(a, io, paths[2], 2));
+     try std.testing.expectEqual(Mismatch{ .field = .checkpoint, .rank = 1 }, mismatch(&all).?);
+-    try std.testing.expect(!std.mem.eql(u8, &(try ranks.exlr8Set(a, io, paths[0])), &(try artifact(a, io, paths[0]))));
++    try std.testing.expect(!std.mem.eql(u8, &(try ranks.exlr8Set(a, io, paths[0], 2)), &(try artifact(a, io, paths[0]))));
+     const root = try tmp.dir.realPathFileAlloc(io, ".", a); // no exlr8-set.json there
+     defer a.free(root);
+-    try std.testing.expectError(error.FileNotFound, ranks.exlr8Set(a, io, root));
++    try std.testing.expectError(error.FileNotFound, ranks.exlr8Set(a, io, root, 2));
++    try std.testing.expectError(error.BadExlr8Set, ranks.exlr8Set(a, io, paths[0], 4)); // converted for 2 ranks, a world of 4
+ }
+-- 
+2.43.0
+
+From ce27169a913477b17638972f78504895890ea701 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:59:52 +0200
+Subject: [PATCH] tests: tf-cuda-test compiles on 0205 (glm_exl3_layer_tests
+ Loader.has, glm_loader_gate's Modules.load e4m3 argument)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/tests/cuda/glm_exl3_layer_tests.zig | 5 +++++
+ zig/tests/cuda/glm_loader_gate.zig      | 2 +-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/zig/tests/cuda/glm_exl3_layer_tests.zig b/zig/tests/cuda/glm_exl3_layer_tests.zig
+index 38fc5ca83..81d40f442 100644
+--- a/zig/tests/cuda/glm_exl3_layer_tests.zig
++++ b/zig/tests/cuda/glm_exl3_layer_tests.zig
+@@ -30,6 +30,11 @@ const Loader = struct {
+         L.last = try std.fmt.bufPrint(&L.name_buf, prefix ++ f, args);
+         return L.ck.get(L.last);
+     }
++    /// cuda_weights' Loader.has: whether the tensor exists (optional markers), without a missing-tensor error line.
++    pub fn has(L: *Loader, comptime f: []const u8, args: anytype) !bool {
++        var buf: [192]u8 = undefined;
++        return L.ck.has(try std.fmt.bufPrint(&buf, prefix ++ f, args));
++    }
+     pub fn put(L: *Loader, comptime f: []const u8, args: anytype) !u64 {
+         _ = f;
+         _ = args;
+diff --git a/zig/tests/cuda/glm_loader_gate.zig b/zig/tests/cuda/glm_loader_gate.zig
+index 0fffd6b50..3056dc86b 100644
+--- a/zig/tests/cuda/glm_loader_gate.zig
++++ b/zig/tests/cuda/glm_loader_gate.zig
+@@ -521,7 +521,7 @@ pub fn run(gpu: check.Gpu, dir: []const u8) !void {
+     const a = arena.allocator();
+     const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, try std.fs.path.join(a, &.{ dir, "config.json" }), a, .limited(1 << 24));
+     const c = try glm.config.parse(a, text);
+-    var m = try glm.forward.Modules.load(gpu.d, gpu.ctx);
++    var m = try glm.forward.Modules.load(gpu.d, gpu.ctx, c.exl3_e4m3);
+     defer m.deinit();
+     var stream = try cuda.Stream.init(gpu.d, false);
+     defer stream.deinit();
+-- 
+2.43.0
+

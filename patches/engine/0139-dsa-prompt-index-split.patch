@@ -1,0 +1,87 @@
+From bbbe5d7b6e978e322dfdb390c32232a2fc05f866 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:20:40 +0200
+Subject: [PATCH] glm_moe_dsa: prompt index selection split across the ranks
+
+The indexer's 32 heads are replicated, so every rank scored every prompt
+row against every visible key and picked its top 2,048: work that grows
+with the context. Under TF_GLM_INDEX_SPLIT (on from position 2,048) a
+prompt chunk of at least 64 rows a rank now scores and picks only this
+rank's ceil(rows / world) rows; the ranks all-gather the token lists in
+place and the counts through the scores scratch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_dsa_block.zig |  2 +-
+ zig/src/families/glm/cuda_sparse.zig    | 26 ++++++++++++++++++++-----
+ 2 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index 8082d2e..0605c3a 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -189,7 +189,7 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
+     }
+     if (sparseRows(l, host_pos, rows)) {
+         if (l.ifull) { // a shared layer reuses the last full layer's token lists still in v.tokens/counts
+-            if (l.rope != 0) try sparse.dsaSelect(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, l.inv, c.ik, pos, host_pos, rows, ix.heads, ix.d, v.select, v.tokens, v.counts, k.prof) else try sparse.selectTokensProfile(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
++            if (l.rope != 0) try sparse.dsaSelect(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, l.inv, c.ik, pos, host_pos, rows, ix.heads, ix.d, v.select, v.tokens, v.counts, k.split, k.prof) else try sparse.selectTokensProfile(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
+         }
+         const stamp = prof.span(k.prof, stream, .mla);
+         defer stamp.end();
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index fdebdc0..59c7ff8 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -88,7 +88,9 @@ pub fn decodeSelect(set: glue.Set, stream: cuda.Stream, scores: u64, pools: u64,
+ /// best 2048 of them into its token list (tf_glm_dsa_topk; positions ascending, counts 0 within the all-visible
+ /// prefix so those rows keep the dense pass's result). `wts` the fused kw output's weights half, `ik` the roped key
+ /// cache, `inv` the rope frequencies. The scores scratch is [b][np] fp32 per block, np the call's most visible keys.
+-pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64, wts: u64, inv: u64, ik: u64, pos: u64, host_pos: usize, rows: usize, heads: usize, d: usize, s: Scratch, tokens: u64, counts: u64, profile: ?*@import("cuda_prof.zig").Prof) !void {
++/// With `split` (a prompt chunk of at least 64 rows a rank) each rank scores and picks its own ceil(rows / world)
++/// rows and the ranks all-gather the lists and counts (the indexer is replicated: every rank did every row).
++pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64, wts: u64, inv: u64, ik: u64, pos: u64, host_pos: usize, rows: usize, heads: usize, d: usize, s: Scratch, tokens: u64, counts: u64, split_in: ?Split, profile: ?*@import("cuda_prof.zig").Prof) !void {
+     const prof_mod = @import("cuda_prof.zig");
+     if (d != 128 or heads != 32) return error.IndexShape;
+     const stride = d + heads; // the fused kw output's row
+@@ -96,9 +98,13 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+     const b = @min(rows, select_rows);
+     const loop: usize = if (rows >= score_loop_from) score_loop else 1;
+     const add = try ops.function("tf_glm_add_i32");
+-    var a: usize = 0;
+-    while (a < rows) : (a += b) {
+-        const n = @min(b, rows - a);
++    const split: ?Split = if (split_in) |x| (if (x.world > 1 and rows >= 64 * x.world) x else null) else null;
++    const per = if (split) |x| cdiv(rows, x.world) else rows;
++    const lo = if (split) |x| @min(rows, x.rank * per) else 0;
++    const hi = @min(rows, lo + per);
++    var a: usize = lo;
++    while (a < hi) : (a += b) {
++        const n = @min(b, hi - a);
+         var at = pos;
+         if (a > 0) {
+             var args: cuda.Args = .{};
+@@ -120,8 +126,18 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+         inline for (.{ s.scores, tokens + a * dsa_width * 4, @as(i64, @intCast(np)), at, @as(c_int, dsa_width), counts + a * 4 }) |v| ta.add(v);
+         try cuda.launch.launch(set.glue.dsa_topk, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 } }, stream, &ta);
+         stamp.end();
+-        if (a + n == rows and std.c.getenv("TF_GLM_DSA_DUMP") != null) try dsaProbe(set, stream, s.scores, tokens + (a + n - 1) * dsa_width * 4, counts + (a + n - 1) * 4, n - 1, np, np);
++        if (split == null and a + n == rows and std.c.getenv("TF_GLM_DSA_DUMP") != null) try dsaProbe(set, stream, s.scores, tokens + (a + n - 1) * dsa_width * 4, counts + (a + n - 1) * 4, n - 1, np, np);
+     }
++    const x = split orelse return;
++    const stamp = prof_mod.span(profile, stream, .index_select);
++    defer stamp.end();
++    const drv = set.glue.dsa_scores.d;
++    // the lists in place (the prompt buffers' tokens hold world x per rows of dsa_width: sized at sparse.width), the
++    // counts through the scores scratch (counts has no room past rows), every rank's block in rank order
++    try x.lib.check(x.lib.api.ncclAllGather(tokens + x.rank * per * dsa_width * 4, tokens, per * dsa_width, .i32, x.comm, stream.handle), "ncclAllGather");
++    if (hi > lo) try drv.check(drv.api.cuMemcpyDtoDAsync_v2(s.scores + x.rank * per * 4, counts + lo * 4, (hi - lo) * 4, stream.handle), "cuMemcpyDtoDAsync");
++    try x.lib.check(x.lib.api.ncclAllGather(s.scores + x.rank * per * 4, s.scores, per, .i32, x.comm, stream.handle), "ncclAllGather");
++    try drv.check(drv.api.cuMemcpyDtoDAsync_v2(counts, s.scores, rows * 4, stream.handle), "cuMemcpyDtoDAsync");
+ }
+ 
+ /// TF_GLM_DSA_DUMP diagnosis: a call's last row (row `sr` of its block's scores, `vis` keys visible): its count, the
+-- 
+2.43.0
+

@@ -1,0 +1,361 @@
+From 3af934f65fde36683e69f0e7f7cae322c81c2724 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@miaai.invalid>
+Date: Sun, 22 Nov 2026 02:07:59 +0200
+Subject: [PATCH 229/230] glm: prompt chunks cut at the server's message starts
+ behind policy bit 9 (TF_GLM_MSG_CUTS=1); slot resume stands on cut points
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zig/src/families/glm/cuda_engine.zig | 21 ++++++++---
+ zig/src/families/glm/cuda_follow.zig | 17 +++++++--
+ zig/src/families/glm/cuda_lanes.zig  | 37 +++++++++++++++++--
+ zig/src/families/glm/cuda_native.zig |  9 +++++
+ zig/src/families/glm/policy.zig      |  5 +--
+ zig/src/families/glm/slot_resume.zig | 53 ++++++++++++++++++++++++++++
+ zig/src/native/cuda.zig              |  3 ++
+ 7 files changed, 133 insertions(+), 12 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 40634f0ff..0d8866357 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -151,6 +151,7 @@ pub const Engine = struct {
+     pages: ?*pages_mod.Pages = null, // the other streams' KV pages and sequences (cuda_pages), once the server attached them
+     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
+     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
++    chunk_cut: bool = false, // the next prompt step is a message-cut chunk (policy bit 9): its rows from the part, any start; flag 8
+     chunk_busy: bool = false, // the next prompt step takes settings.chunk rows beside a decoding stream (cuda_prompt_solo): rank 0's choice, the chunk's flag 4
+     busy_steps: u64 = 0, // prompt steps that did (glm-solo-check counts them)
+     begun: u64 = 0, // begins so far on this rank (each sequence's Seq.begun: its last one's stamp)
+@@ -599,6 +600,12 @@ pub const Engine = struct {
+         e.cur.begun = e.begun;
+     }
+ 
++    /// Policy bit 9 on the begun sequence: prompt steps may end at the request's message cuts and a resume may stand
++    /// on one (every rank reads the same mask from the begin step).
++    fn msgCutsOn(e: *const Engine) bool {
++        return @import("policy.zig").on(e.cur.policy, .msg_cuts);
++    }
++
+     /// TF_GLM_SLOT_RESUME (slot_resume.zig): the sequence just begun stands at `at` on its own rows, which the slot's
+     /// last prompt pass left there as a fresh pass would (rank 0's rule); its pass starts there. Agreed on every rank
+     /// (one all-reduce): should any rank refuse, none moves (error.BadResume) and the pass starts at 0 as before.
+@@ -623,7 +630,7 @@ pub const Engine = struct {
+         const st = &e.cur.st;
+         if (!e.c.dsa or st.kda_layers != 0 or st.table != 0 or st.hold != null or e.settings.kv_shard.on) return false;
+         if (st.pos != 0 or st.mtp_len != 0 or st.pending != 0 or st.base != 0 or st.mtp_base != 0 or e.cur.begun == 0) return false;
+-        if (at == 0 or at % fw.prefill_rows != 0 or at + fw.window_rows > st.capacity) return false;
++        if (at == 0 or (at % fw.prefill_rows != 0 and !msgCutsOn(e)) or at + fw.window_rows > st.capacity) return false;
+         if (e.mtp and e.drafter == null) return false;
+         if (e.images) |v| if (v.rowCount() > 0) return false;
+         return true;
+@@ -647,7 +654,7 @@ pub const Engine = struct {
+         if (!promptFits(len, e.cur.st.capacity)) return error.PromptTooLong;
+         const r = from orelse { // TF_GLM_SLOT_RESUME: where the begun sequence was rewound to (0: none)
+             const at = e.cur.rewound;
+-            if (at != 0 and (at >= len or at % fw.prefill_rows != 0 or e.cur.st.pos != at)) return error.BadResume;
++            if (at != 0 and (at >= len or (at % fw.prefill_rows != 0 and !msgCutsOn(e)) or e.cur.st.pos != at)) return error.BadResume;
+             return at;
+         };
+         if (e.cur.rewound != 0) return error.BadResume; // a rewound sequence restores no kept state
+@@ -663,13 +670,17 @@ pub const Engine = struct {
+         e.index_split = false;
+         const busy = e.chunk_busy; // likewise
+         e.chunk_busy = false;
++        const cut = e.chunk_cut; // likewise
++        e.chunk_cut = false;
+         if ((from != null or start == e.cur.rewound) and try e.prefillStart(len, from) != start) return error.BadChunk;
+         if (start >= len) return error.BadChunk;
+         if (busy) {
+             if (!prompt_solo.allowed(e, start, len)) return error.BadChunk; // rank 0's rule, this rank's state
+-        } else if (start % fw.prefill_rows != 0) return error.BadChunk;
+-        const rows = @min(len - start, if (busy) @as(usize, e.settings.chunk) else fw.prefill_rows);
+-        if (!busy and part.len > rows + 1) return prompt_pair.prefill(e, part, start, len, cancel, marks, split);
++        } else if (start % fw.prefill_rows != 0 and !(cut and msgCutsOn(e))) return error.BadChunk;
++        // a cut step: its rows are the part's (the next id rides along unless the part reaches the prompt's end)
++        const rows = if (cut) (if (start + part.len >= len) len - start else part.len - 1) else @min(len - start, if (busy) @as(usize, e.settings.chunk) else fw.prefill_rows);
++        if (cut and (!msgCutsOn(e) or rows == 0 or rows > fw.prefill_rows)) return error.BadChunk;
++        if (!busy and !cut and part.len > rows + 1) return prompt_pair.prefill(e, part, start, len, cancel, marks, split);
+         if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
+         e.busy_steps += @intFromBool(busy);
+         var one: [1]fw.Rank = undefined;
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index a81d58a0a..fe0fda885 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -286,15 +286,27 @@ pub const Leader = struct {
+     /// One prompt step on every rank (Engine.prefillChunk). `solo`: no other stream decodes, so a chunk, or two when
+     /// Engine.pairedAt allows; else a chunk, or TF_GLM_CHUNK rows of one when prompt_solo.busyAt allows.
+     pub fn chunk(x: Leader, ids: []const u32, start: usize, solo: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !Chunk {
++        return x.chunkTo(ids, start, solo, from, cancel, marks, null);
++    }
++
++    /// `chunk`, ending at `cut` when the request's message cuts (policy bit 9) put one before the step's own end: a cut
++    /// step (flag 8) is one chunk of cut - start rows at any start, never paired (every rank takes its rows from the part).
++    pub fn chunkTo(x: Leader, ids: []const u32, start: usize, solo: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks, cut_at: ?usize) !Chunk {
+         if (start >= ids.len) return error.BadChunk;
+         try x.flush();
+         const busy = prompt_solo.busyAt(x.e, start, ids.len, solo, from);
+-        const n: usize = if (busy) x.e.settings.chunk else if (solo and x.e.pairedAt(start, ids.len, from, marks)) 2 * engine.prompt_rows else engine.prompt_rows;
++        const cut_room: ?usize = if (cut_at) |c| (if (c > start and c < ids.len) c - start else null) else null;
++        const plain_n: usize = if (busy) x.e.settings.chunk else engine.prompt_rows;
++        const cut = cut_room != null and cut_room.? < (if (solo and !busy and x.e.pairedAt(start, ids.len, from, marks)) 2 * engine.prompt_rows else plain_n);
++        const off_grid = cut_at != null and start % engine.prompt_rows != 0; // a step after a cut: never a pair, whole rows
++        const n: usize = if (cut) @min(cut_room.?, plain_n) else if (busy) x.e.settings.chunk else if (off_grid) engine.prompt_rows else if (solo and x.e.pairedAt(start, ids.len, from, marks)) 2 * engine.prompt_rows else engine.prompt_rows;
++        const cut_step = cut or off_grid;
+         const part = ids[start..@min(ids.len, start + n + 1)];
+         const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world); // a paired step's chunks share it
+-        try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1 | @as(u32, @intFromBool(busy)) << 2, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
++        try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1 | @as(u32, @intFromBool(busy)) << 2 | @as(u32, @intFromBool(cut_step)) << 3, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
+         x.e.index_split = split;
+         x.e.chunk_busy = busy;
++        x.e.chunk_cut = cut_step;
+         const first = try x.e.prefillChunk(part, start, ids.len, from, cancel, marks);
+         return .{ .first = first, .rows = @min(ids.len - start, n) };
+     }
+@@ -482,6 +494,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+             const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
+             e.index_split = indexSplit(h);
+             e.chunk_busy = busyStep(h);
++            e.chunk_cut = h.flags & 8 != 0;
+             _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
+                 error.Cancelled => {},
+                 else => return err,
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index e009ebe66..38c74958f 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -92,6 +92,23 @@ pub const Lanes = struct {
+     }
+ 
+     /// The rows the drafter re-taps at a prompt's end (a fresh pass ingests its last dflash.WIN rows), 0 without one.
++    /// Policy bit 9 (TF_GLM_MSG_CUTS=1): the stream's planned chunk starts (the server's message cuts, chunk_plan),
++    /// which its prompt steps end at and a slot resume may stand on; null for any other request.
++    fn cutsOf(s: *const lanes.Stream, mask: ?policy_mod.Mask) ?[]const u32 {
++        const m = mask orelse return null;
++        if (!policy_mod.on(m, .msg_cuts) or s.chunks.len == 0) return null;
++        return s.chunks;
++    }
++
++    /// The first planned start past `at` (null: none, the pass runs to the prompt's end).
++    fn nextCut(cs: []const u32, at: usize) ?usize {
++        for (cs) |c| if (c > at) return c;
++        return null;
++    }
++
++    /// Tokens short of the shared prefix's end a cut resume keeps clear: a message marker straddling it cuts one pass.
++    const cut_slack: usize = 8;
++
+     fn drafterTail(self: *const Lanes) usize {
+         return if (self.x.e.drafter != null) @intCast(dflash.WIN) else 0;
+     }
+@@ -249,6 +266,10 @@ pub const Lanes = struct {
+ 
+     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+         const self = of(ptr);
++        if (cutsOf(s, self.policy.effective(s.policy))) |_| { // message cuts (policy bit 9): the pass goes step by step, each ending at its cut
++            while (!try prefillStepFn(ptr, s)) {}
++            return;
++        }
+         const from = try self.opening(s);
+         try self.images(s, from);
+         var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s };
+@@ -309,8 +330,17 @@ pub const Lanes = struct {
+         try sink.prepare();
+         self.x.e.prompt_logprobs = sink.want();
+         defer self.x.e.prompt_logprobs = null;
+-        const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+-        if (self.standingOf(l.slot)) |st| st.stepped(fw.prefill_rows, at, step.rows);
++        const cuts = cutsOf(s, l.policy);
++        const cut_at: ?usize = if (cuts) |cs| nextCut(cs, at) else null;
++        const solo = !self.othersDecode(s);
++        const step = try self.x.chunkTo(s.prompt(), at, solo, from, .{ .ptr = s, .check = cancelled }, marksOf(s), if (cuts != null) (cut_at orelse s.prompt().len) else null);
++        if (self.standingOf(l.slot)) |st| {
++            if (cuts != null) {
++                // the planned step alone: to its cut (or a whole chunk); a busy step's part never counts
++                const planned: usize = if (!solo) 0 else @min(fw.prefill_rows, (cut_at orelse s.prompt().len) - at);
++                st.steppedCut(self.x.e.gpa, at, step.rows, planned);
++            } else st.stepped(fw.prefill_rows, at, step.rows);
++        }
+         if (step.first) |first| {
+             l.first = self.take(first);
+             l.fill = null;
+@@ -363,8 +393,9 @@ pub const Lanes = struct {
+         const plain = s.images.len == 0;
+         const standing = self.standingOf(l.slot);
+         // where the slot's rows stand for this prompt, read before the begin stamps the slot again
++        const tail = policy_mod.retapRows(mask orelse 0, self.drafterTail());
+         const point: usize = if (standing) |st| (if (may_resume and self.slot_resume and plain and s.prompt_logprobs == null and self.x.e.pages == null)
+-            st.plan(fw.prefill_rows, ids, self.x.e.cur.begun, mask orelse 0, policy_mod.retapRows(mask orelse 0, self.drafterTail()))
++            (if (cutsOf(s, mask)) |cs| st.planCut(ids, self.x.e.cur.begun, mask orelse 0, tail, cs, cut_slack) else st.plan(fw.prefill_rows, ids, self.x.e.cur.begun, mask orelse 0, tail))
+         else
+             0) else 0;
+         if (standing) |st| st.clear(); // the begin below leaves nothing standing until the pass records it
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index ac23fa66e..e4324da74 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -506,6 +506,13 @@ fn close(ptr: *anyopaque) void {
+ /// (TF_GLM_DSA_SPLIT_QKVA, the same rule on every rank); bits 2 and 3 (the indexer's RoPE hoist and multi-CTA
+ /// top-2048) on glm_moe_dsa, whose kernels and scratch every rank loads at startup. A package wiring bits 1 or 4 adds
+ /// its bit here once its kernels and scratch are loaded at startup.
++/// TF_GLM_MSG_CUTS=1: the server plans prompt chunk starts at message starts (chunk_plan) for this engine to follow
++/// under policy bit 9; read by native/cuda.zig (the plan's step) and here (the bit offered).
++pub fn msgCuts() bool {
++    const v = std.c.getenv("TF_GLM_MSG_CUTS") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
+ fn policyBoot(e: *const engine.Engine) policy.Boot {
+     var b = policy.Boot.read(&ranks.environment);
+     if (!b.requests) return b;
+@@ -514,6 +521,8 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+     };
+     // the shorter re-tap of a slot resume: host rules on every rank (the resume point, the drafter's first row)
+     if (e.drafter != null) b.offered |= policy.bit(.retap_a) | policy.bit(.retap_b);
++    // message cuts: the server plans them only with TF_GLM_MSG_CUTS=1 (native/cuda.zig: prefill_step), glm_moe_dsa only
++    if (e.c.dsa and msgCuts()) b.offered |= policy.bit(.msg_cuts);
+     for (e.w.layers) |l| switch (l.mixer) {
+         .mla => |a| {
+             if (a.dec_n > 0) b.offered |= policy.bit(.qkva_bypass);
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+index 47297b9ff..c962d3e4f 100644
+--- a/zig/src/families/glm/policy.zig
++++ b/zig/src/families/glm/policy.zig
+@@ -19,6 +19,7 @@ pub const Bit = enum(u5) {
+     retap_a = 6, // slot resume beside a drafter: re-tap 512 rows at the prompt's end, not the drafter's 2,048 (b: 256; both: 0)
+     retap_b = 7,
+     dsa_pdl = 8, // the decode DSA chain (attention, index scores and selection, norms) as dependent launches
++    msg_cuts = 9, // prompt chunks also cut at the server's message starts (TF_GLM_MSG_CUTS=1); slot resume may stand there
+     // the unified-opt run's candidates (night/unified): bits 16-27, each off unless a request (or the default) asks
+     l2pf_v2 = 16, // U1: TF_GLM_L2PF's sites read what the window reads next (proj_dec, q_b, shared expert, head), stop at the gather's end
+     dflash_mesh = 17, // U2: DFlash2's gathers and greedyRows over the RoCE mesh, not NCCL
+@@ -34,7 +35,7 @@ pub const Bit = enum(u5) {
+     prompt_topk_multi = 27, // U6.3: prompt select blocks past 131,072 keys on tf_glm_dsa_tscan / tmerge
+ };
+ 
+-pub const reserved: Mask = 0x1ff;
++pub const reserved: Mask = 0x3ff;
+ /// The unified run's bits (16-27): offered where their kernels and tables loaded.
+ pub const unified: Mask = 0x0fff_0000;
+ /// The mask of the forward now running on this rank's thread (set at each forward's start; 0 outside one): the bits
+@@ -43,7 +44,7 @@ pub var live: Mask = 0;
+ 
+ /// Bits a stream uses on its own (rank 0's drafting, the resume point), not in a forward: a shared forward never mixes
+ /// over them.
+-pub const per_stream: Mask = 1 << @backingInt(Bit.dflash2_coupled) | 1 << @backingInt(Bit.retap_a) | 1 << @backingInt(Bit.retap_b);
++pub const per_stream: Mask = 1 << @backingInt(Bit.dflash2_coupled) | 1 << @backingInt(Bit.retap_a) | 1 << @backingInt(Bit.retap_b) | 1 << @backingInt(Bit.msg_cuts);
+ 
+ /// The rows a slot resume re-taps at the prompt's end beside a drafter of window `win` under mask `m`: the window
+ /// itself (the boot's rule) unless a retap bit asks for 512, 256 or 0 rows.
+diff --git a/zig/src/families/glm/slot_resume.zig b/zig/src/families/glm/slot_resume.zig
+index bc3c61bc0..0f6fe722c 100644
+--- a/zig/src/families/glm/slot_resume.zig
++++ b/zig/src/families/glm/slot_resume.zig
+@@ -30,15 +30,18 @@ pub const Standing = struct {
+     stamp: u64 = 0, // the slot's begin stamp of that pass (Engine.begun); another begin since: nothing stands
+     policy: u32 = 0,
+     plain: bool = false, // text only (an image prompt's rows go by its images, not its ids)
++    cuts: std.ArrayList(u32) = .empty, // message-cut passes (policy bit 9): every point `whole` reached, in order
+ 
+     pub fn deinit(st: *Standing, gpa: std.mem.Allocator) void {
+         st.tokens.deinit(gpa);
++        st.cuts.deinit(gpa);
+         st.* = .{};
+     }
+ 
+     /// Nothing stands (a pass is about to begin, or failed to).
+     pub fn clear(st: *Standing) void {
+         st.tokens.clearRetainingCapacity();
++        st.cuts.clearRetainingCapacity();
+         st.whole = 0;
+         st.stamp = 0;
+         st.plain = false;
+@@ -50,6 +53,7 @@ pub const Standing = struct {
+         st.clear();
+         st.tokens.appendSlice(gpa, ids) catch return;
+         st.whole = if (at < ids.len) at else 0;
++        if (st.whole > 0) st.cuts.append(gpa, @intCast(st.whole)) catch {}; // a cut pass may stand here again
+         st.stamp = stamp;
+         st.policy = policy;
+         st.plain = plain;
+@@ -62,6 +66,35 @@ pub const Standing = struct {
+         if (start + rows < st.tokens.items.len) st.whole = start + rows;
+     }
+ 
++    /// A message-cut pass's step took `rows` rows from `start`, where its plan (the request's cuts, else the grid's
++    /// step) asked for `planned`: it extends what stands, and records the point, only as that planned chunk alone.
++    pub fn steppedCut(st: *Standing, gpa: std.mem.Allocator, start: usize, rows: usize, planned: usize) void {
++        if (!st.plain or start != st.whole or rows != planned or rows == 0) return;
++        if (start + rows >= st.tokens.items.len) return;
++        st.cuts.append(gpa, @intCast(start + rows)) catch return; // out of memory: the point is not offered
++        st.whole = start + rows;
++    }
++
++    /// Where a message-cut prompt `ids` resumes: the furthest point the last cut pass reached (or stood at) that is
++    /// within the shared tokens less `slack` (a message marker straddling the prefix's end cuts one pass only), short of
++    /// the drafter's re-tap, and a chunk start of the new prompt's own plan (`starts`), so every chunk below it was cut
++    /// from the shared tokens alone, as a cold pass of the new prompt cuts them.
++    pub fn planCut(st: *const Standing, ids: []const u32, stamp: u64, policy: u32, tail: usize, starts: []const u32, slack: usize) usize {
++        if (!st.plain or st.whole == 0 or stamp == 0 or stamp != st.stamp or policy != st.policy) return 0;
++        const same = commonPrefix(st.tokens.items[0..st.whole], ids);
++        const limit = @min(same -| slack, ids.len -| @max(tail, 1));
++        var best: usize = 0;
++        var i = st.cuts.items.len;
++        while (i > 0) : (i -= 1) {
++            const c: usize = st.cuts.items[i - 1];
++            if (c <= limit and std.mem.indexOfScalar(u32, starts, @intCast(c)) != null) {
++                best = c;
++                break;
++            }
++        }
++        return best;
++    }
++
+     /// A whole pass (Engine.prefill: every chunk whole, one at a time) ran from `from` to the prompt's end.
+     pub fn ran(st: *Standing, grid: usize, from: usize) void {
+         const len = st.tokens.items.len;
+@@ -99,6 +132,26 @@ fn pass(st: *Standing, ids: []const u32, at: usize) void {
+     while (s < ids.len) : (s += G) st.stepped(G, s, @min(G, ids.len - s));
+ }
+ 
++test "GLM slot resume: message cuts stand only on planned points both prompts share" {
++    var st: Standing = .{};
++    defer st.deinit(t.allocator);
++    const a = seq(20, 100);
++    st.open(t.allocator, &a, 0, 7, 512, true);
++    st.steppedCut(t.allocator, 0, 3, 3); // a cut at 3
++    st.steppedCut(t.allocator, 3, 4, 4); // the step's 4 rows: 7
++    st.steppedCut(t.allocator, 7, 2, 4); // a busy step's part: refused, nothing past 7 stands
++    try t.expectEqual(@as(usize, 7), st.whole);
++    const b = a ++ seq(5, 900);
++    try t.expectEqual(@as(usize, 7), st.planCut(&b, 7, 512, 0, &.{ 3, 7, 11 }, 0));
++    try t.expectEqual(@as(usize, 3), st.planCut(&b, 7, 512, 0, &.{ 3, 11 }, 0)); // 7 is no start of the new plan
++    try t.expectEqual(@as(usize, 3), st.planCut(&b, 7, 512, 0, &.{ 3, 7, 11 }, 2)); // a slack of 2: the limit is 5
++    var c = b;
++    c[5] = 1;
++    try t.expectEqual(@as(usize, 3), st.planCut(&c, 7, 512, 0, &.{ 3, 7 }, 0)); // shared only to 5
++    try t.expectEqual(@as(usize, 0), st.planCut(&c, 7, 0, 0, &.{ 3, 7 }, 0)); // another policy: nothing
++    try t.expectEqual(@as(usize, 3), st.planCut(&b, 7, 512, 22, &.{ 3, 7 }, 0)); // the re-tap of 22 rows: limit 3
++}
++
+ test "GLM slot resume: a next turn extending the last prompt resumes at the last chunk start below the shared tokens" {
+     var st: Standing = .{};
+     defer st.deinit(t.allocator);
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 8b286ee4b..6dcf33a7a 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -490,6 +490,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         .lanes = streams,
+         .draft_sources = .{ .drafter = served.source },
+         .context_window = @intCast(window),
++        // glm_moe_dsa with TF_GLM_MSG_CUTS=1: the server plans chunk starts at message starts on the 4,096-row step, which
++        // the engine follows only for requests with policy bit 9 (the plan is a function of each prompt's prefix)
++        .prefill_step = if (comptime F == glm.native) (if (glm.native.msgCuts()) 4096 else 0) else 0,
+         .startup = h.startup,
+         .policy = if (@hasField(@TypeOf(loaded), "policy")) loaded.policy else "",
+         .prompt_cache = h.store != null,
+-- 
+2.43.0
+

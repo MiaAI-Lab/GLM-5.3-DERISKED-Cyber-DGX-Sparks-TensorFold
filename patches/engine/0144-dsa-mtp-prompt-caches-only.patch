@@ -1,0 +1,59 @@
+From 8d47c50c94f774239dec7ceeb9a58ed2b78592b3 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:38:18 +0200
+Subject: [PATCH] glm_moe_dsa: a prompt's MTP pass writes the head's caches
+ only
+
+The prompt pass ran the whole MTP block (attention, out-projection, two
+exchanges, MoE) for every prompt row, but a prompt keeps only the head's
+latent rows and index keys, made by its projections. It now stops after
+the cache writes: the same cache bytes. TF_GLM_MTP_ABSORB_FULL=1 runs the
+whole block.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_forward.zig | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index efd6e0a..9d6b780 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -735,6 +735,14 @@ pub const Forward = struct {
+         }
+     }
+ 
++    /// A prompt pass of the glm_moe_dsa head writes its caches only (TF_GLM_MTP_ABSORB_FULL=1: the whole block).
++    fn mtpCachesOnly(f: *const Forward) bool {
++        const r = f.ranks[0];
++        if (!r.b.prefill or !r.w.config.dsa) return false;
++        const v = std.c.getenv("TF_GLM_MTP_ABSORB_FULL") orelse return true;
++        return !std.mem.eql(u8, std.mem.span(v), "1");
++    }
++
+     /// mtp.mtp_forward: caches from mtp_len, stream in b.mx, a window's draft logits in b.logits (prompt: no head).
+     pub fn mtp(f: *const Forward, ids: []const i32, hidden: []const u64) !void {
+         const n = ids.len;
+@@ -756,9 +764,18 @@ pub const Forward = struct {
+             try glue.rmsnorm(f.set(), f.stream, b.hin, D, m.hnorm, b.mcat + D * 2, 2 * D, null, c.eps, n, D);
+             try b16.matmul(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
+             try glue.rmsnormBy(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
++            if (f.mtpCachesOnly()) {
++                // a prompt's rows: only the head's cache writes are read later (its latent rows and index keys, from
++                // the projections); its attention, out-projection, exchanges and FFN feed nothing a prompt keeps
++                const mla = m.layer.mixer.mla;
++                try dsa_block.prepare(f.set(), f.stream, mla, b.dsa, b.normed, D, n, false);
++                _ = try dsa_block.attendWrite(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, mla, r.st.mtp_caches, b.dsa, 0, n, r.st.mtp_pos_dev);
++                continue;
++            }
+             const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
+             try dsa_block.block(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
+         }
++        if (f.mtpCachesOnly()) return;
+         try f.gather(n);
+         for (f.ranks) |r| {
+             const m = r.w.mtp.?;
+-- 
+2.43.0
+

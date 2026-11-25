@@ -1,0 +1,65 @@
+From 561836452a2107e99f7d1c050be57e25c296108c Mon Sep 17 00:00:00 2001
+From: port <port@local>
+Date: Tue, 24 Nov 2026 19:55:12 +0200
+Subject: [PATCH 242/242] glm tp6: keep tf-cuda-test compatible with
+ multi-width once and balanced exl3 loader
+
+---
+ zig/src/families/glm/cuda_exl3.zig        | 11 +++++------
+ zig/tests/cuda/exl3_prompt_once_tests.zig |  4 ++--
+ 2 files changed, 7 insertions(+), 8 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index 375addfb5..e4f095447 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -183,19 +183,18 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+             return error.UnreadableExl3;
+         };
+     }
+-    const share = L.w.share;
+-    const cfg_ptr = &L.w.config;
+-    const bal = !pieced and shard.balOn(share.world) and (inter / 128) % share.world != 0 and expertsOnce();
+-    const max_w = if (bal) share.maxMoeLen(cfg_ptr) else width;
++    const has_w = comptime @hasField(@TypeOf(L.*), "w");
++    const bal = if (has_w) !pieced and shard.balOn(L.w.share.world) and (inter / 128) % L.w.share.world != 0 and expertsOnce() else false;
++    const max_w = if (has_w and bal) L.w.share.maxMoeLen(&L.w.config) else width;
+     const ecuts = try L.gpa.alloc(Span, count);
+     defer L.gpa.free(ecuts);
+     const ewidths = try L.gpa.alloc(i32, count);
+     defer L.gpa.free(ewidths);
+     for (0..count) |e| {
+-        ecuts[e] = if (bal) shard.expertSpan(cfg_ptr, share, i, e) else cut;
++        ecuts[e] = if (has_w and bal) shard.expertSpan(&L.w.config, L.w.share, i, e) else cut;
+         ewidths[e] = @intCast(ecuts[e].len());
+     }
+-    if (bal and i == 3) std.log.info("TF_GLM_TP6_BAL=1: per-expert balanced EXL3 sharding active (rank {d} of {d}, max width {d})", .{ share.rank, share.world, max_w });
++    if (has_w and bal and i == 3) std.log.info("TF_GLM_TP6_BAL=1: per-expert balanced EXL3 sharding active (rank {d} of {d}, max width {d})", .{ L.w.share.rank, L.w.share.world, max_w });
+     inline for (mats, .{ "gate_proj", "up_proj", "down_proj" }, .{ "gt", "ut", "dt" }, .{ "suh_g", "suh_u", "suh_d" }, .{ "svh_g", "svh_u", "svh_d" }, 0..) |m, proj, tw, su, sv, pi| {
+         const mine = k2s[pi * count ..][0..count];
+         for (0..count, mine) |e, *k2| {
+diff --git a/zig/tests/cuda/exl3_prompt_once_tests.zig b/zig/tests/cuda/exl3_prompt_once_tests.zig
+index 0c86edea6..a02e408e1 100644
+--- a/zig/tests/cuda/exl3_prompt_once_tests.zig
++++ b/zig/tests/cuda/exl3_prompt_once_tests.zig
+@@ -77,7 +77,7 @@ fn runOn(c: *Ctx, exp: *const ex.Experts, l: ex.Layer, x: u64, stride: usize, pk
+ 
+ /// The once path's xd and y equal the old path's byte for byte, and the once path wrote no rotated copies.
+ fn same(c: *Ctx, name: []const u8, l: ex.Layer, x: u64, stride: usize, pk: u64, rows: usize) !void {
+-    try check.expect(ex.prompt.onceEligible(l, x, stride) and ex.prompt.onceFits(l, rows, K) and (if (l.codebook == .mul1) c.exp.prompt.gateup_once_mul1 else c.exp.prompt.gateup_once) != null, "{s}: the once kernel does not take this layer", .{name});
++    try check.expect(ex.prompt.onceEligible(l, x, stride) and ex.prompt.onceFits(l, rows, K) and (if (l.codebook == .mul1) c.exp.prompt.gateup_once_mul1[0] else c.exp.prompt.gateup_once[0]) != null, "{s}: the once kernel does not take this layer", .{name});
+     const want = try runOnce(c, l, x, stride, pk, rows, false);
+     const got = try runOnce(c, l, x, stride, pk, rows, true);
+     try check.expect(!want.xu_untouched, "{s}: the old path left xu unwritten (the probe proves nothing)", .{name});
+@@ -185,7 +185,7 @@ fn suite(gpu: Gpu, dir: ?[]const u8, e4m3: bool) !void {
+     var pm = try cuda.Module.load(gpu.d, cuda.kernels.experts);
+     defer pm.unload();
+     var c: Ctx = .{ .gpu = gpu, .a = arena.allocator(), .s = stream, .exp = &exp, .router = try cuda.grouped.Router.resolve(pm), .k4 = if (e4m3) &k4 else null };
+-    try check.expect(exp.prompt.gateup_once != null, "tf_exl3_prompt_gu_once is not in the experts image", .{});
++    try check.expect(exp.prompt.gateup_once[0] != null, "tf_exl3_prompt_gu_once is not in the experts image", .{});
+     var prng = std.Random.DefaultPrng.init(0x0206);
+     const rng = prng.random();
+     var want_cases: usize = 0;
+-- 
+2.43.0
+

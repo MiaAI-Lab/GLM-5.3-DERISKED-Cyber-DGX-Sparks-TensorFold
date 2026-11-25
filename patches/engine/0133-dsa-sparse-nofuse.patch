@@ -1,0 +1,33 @@
+From af7e0ca6f7431ba73958335082b880e4556819cf Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:45:09 +0200
+Subject: [PATCH] glm_moe_dsa: sparse attention in 512-row calls; the fused
+ w576 path drops distant picks
+
+---
+ zig/src/families/glm/cuda_dsa_block.zig       |   9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index f88ee37..8082d2e 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -193,7 +193,14 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
+         }
+         const stamp = prof.span(k.prof, stream, .mla);
+         defer stamp.end();
+-        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, latTable(l, c), v.tokens, v.counts, if (l.rope != 0) sparse.dsa_width else sparse.width, v.partials, v.ol, rows, l.heads, l.rowW(), scale);
++        const w: usize = if (l.rope != 0) sparse.dsa_width else sparse.width;
++        if (l.rope != 0) { // the fused w576 merge drops distant picks: 512-row calls always fit the partials
++            var ro: usize = 0;
++            while (ro < rows) : (ro += prompt_att_rows) {
++                const n = @min(prompt_att_rows, rows - ro);
++                try latent.sparseAttentionFormat(set, stream, v.qa + ro * l.heads * l.rowW() * 2, c.lc, c.ls, latTable(l, c), v.tokens + ro * w * 4, v.counts + ro * 4, w, v.partials, v.ol + ro * l.heads * l.lw * 2, n, l.heads, l.rowW(), scale);
++            }
++        } else try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, latTable(l, c), v.tokens, v.counts, w, v.partials, v.ol, rows, l.heads, l.rowW(), scale);
+     }
+ }
+ 
+-- 
+2.43.0
+

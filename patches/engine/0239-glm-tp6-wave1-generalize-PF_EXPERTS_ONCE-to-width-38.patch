@@ -1,0 +1,512 @@
+From 98c9b681b5f86d50a7cdada91cb2b19d7d7dbeeb Mon Sep 17 00:00:00 2001
+From: port <port@local>
+Date: Tue, 24 Nov 2026 18:29:24 +0200
+Subject: [PATCH 239/242] glm tp6 wave1: generalize PF_EXPERTS_ONCE to width
+ 384/256, retune promptTile for TP6 Q8 shapes, unlock padded/owner
+ scatter_inplace
+
+---
+ zig/kernels/cuda/exl3_prompt_once.cuh | 77 +++++++++++++++------------
+ zig/src/cuda/exl3_prompt.zig          | 57 +++++++++++++-------
+ zig/src/families/glm/cuda_forward.zig | 66 +++++++++++++++--------
+ zig/src/families/glm/cuda_mm.zig      |  4 +-
+ zig/src/families/glm/cuda_state.zig   |  2 +-
+ zig/src/families/glm/cuda_taps.zig    | 12 +++--
+ 6 files changed, 139 insertions(+), 79 deletions(-)
+
+diff --git a/zig/kernels/cuda/exl3_prompt_once.cuh b/zig/kernels/cuda/exl3_prompt_once.cuh
+index 189274265..1547c1717 100644
+--- a/zig/kernels/cuda/exl3_prompt_once.cuh
++++ b/zig/kernels/cuda/exl3_prompt_once.cuh
+@@ -17,8 +17,6 @@ using namespace tf_exl3_prompt;
+ 
+ constexpr int OM = TPM;                 // members a block: one plan item
+ constexpr int OW = 8, OT = OW * 32;     // warps, threads
+-constexpr int ON = 512;                 // columns (one rank's expert width at TP4)
+-constexpr int OTMT = ON / 16 / OW;      // 16-column tiles a warp
+ constexpr int OKB = 128;                // k of a rotation block (fwht128's)
+ constexpr int OKT = OKB / 16;           // k tiles a rotation block
+ constexpr int OXS = OKB + 8;            // halves a rotated row in shared memory (ldmatrix rows 16 bytes apart mod 128)
+@@ -27,12 +25,18 @@ constexpr int OWS = 8;                  // weight stages, one k tile each (a war
+ constexpr int ORD = OWS - 2;            // k tiles ahead a raw row's copy is issued (landed by the weight wait)
+ constexpr int ORS = 8;                  // raw row slots a warp (256 bytes: 32 lanes x 4 bf16)
+ constexpr int OTW = tile_words<8>();    // 32 words a 4-bit tile
+-constexpr int OWB = OW * OTMT * OTW * 4;   // bytes a weight stage: 32 tiles
+ constexpr int OSU = OKB * 2;            // bytes of a block's suh
+-constexpr int smem_bytes() { return 2 * OXH * 2 + OWS * OWB + OW * ORS * 256 + 2 * OSU; }
+-static_assert(OTMT == 4 && OKT == OW, "4 tiles a warp; a block's rotations one a k tile a warp");
++template <int ON>
++constexpr int smem_bytes_for() {
++    static_assert(ON == 256 || ON == 384 || ON == 512, "supported expert widths: 256, 384, 512");
++    constexpr int OTMT = ON / 16 / OW;
++    constexpr int OWB = OW * OTMT * OTW * 4;
++    return 2 * OXH * 2 + OWS * OWB + OW * ORS * 256 + 2 * OSU;
++}
++constexpr int smem_bytes() { return smem_bytes_for<512>(); }
++static_assert(OKT == OW, "a block's rotations one a k tile a warp");
+ static_assert(ORS > ORD && (ORS & (ORS - 1)) == 0 && OKT % ORS == 0, "raw slots by k tile");
+-static_assert(smem_bytes() <= 99 * 1024, "one block a multiprocessor");
++static_assert(smem_bytes_for<512>() <= 99 * 1024 && smem_bytes_for<384>() <= 99 * 1024 && smem_bytes_for<256>() <= 99 * 1024, "one block a multiprocessor");
+ 
+ // One lane's 4 values of a member row's k block rotated as fp16 (raw: the lane's 4 bf16 of the row's block, s: its 4
+ // suh). rot_in's arithmetic: FMUL (no contraction), fwht128 (as fwht128f: the same butterflies, each an exact FFMA of
+@@ -89,16 +93,20 @@ __device__ __forceinline__ void epi_member(const float* gs, const float* us, int
+ }
+ 
+ // Matrix `mat` of an item (expert e, cnt members rows_sh, their token rows tok_sh): the fp32 sums into S[mat][p][:].
+-template <int NBA, int CB = CB_MCG>
++template <int NBA, int CB = CB_MCG, int ON = 512>
+ __device__ __forceinline__ void sums_n(const __nv_bfloat16* __restrict__ x, int x_stride, const uint64_t* __restrict__ T,
+         const half* __restrict__ suh, float* __restrict__ S, int K, unsigned char* smem, const int* rows_sh, const int* tok_sh, int e) {
++    constexpr int OTMT = ON / 16 / OW;
++    constexpr int OWB = OW * OTMT * OTW * 4;
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     const int kts = K >> 4, blocks = K / OKB;
+     half* Xb = reinterpret_cast<half*>(smem);                        // two blocks' rotated rows
+     const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem);
+     const uint32_t wbase = sbase + (uint32_t)(2 * OXH * 2);           // the weight ring
+-    // each warp streams its own 4 tiles (no block barrier a k tile): the lane's 16 bytes `part` of tile q
+-    const int q = warp * OTMT + (lane >> 3), part = lane & 7;
++    // each warp streams its own OTMT tiles (no block barrier a k tile): the lane's 16 bytes `part` of tile q
++    const int tw_in_warp = lane >> 3, part = lane & 7;
++    const bool wlive = tw_in_warp < OTMT;
++    const int q = warp * OTMT + (wlive ? tw_in_warp : 0);
+     const uint32_t* wsrc = reinterpret_cast<const uint32_t*>(T[e]) + (size_t)q * OTW + part * 4;
+     const size_t wstep = (size_t)(ON / 16) * OTW;                     // words a k tile row of tiles
+     const uint32_t wdst = wbase + (uint32_t)(q * OTW * 4 + part * 16);
+@@ -106,7 +114,7 @@ __device__ __forceinline__ void sums_n(const __nv_bfloat16* __restrict__ x, int
+     int wnext = 0;        // the next weight stage's k tile
+     auto wissue = [&]() {  // past the last k tile: an empty copy (src-size 0) of a valid address, so no branch
+         const bool in = wnext < kts;
+-        cp16s(wdst + wfill, wsrc + (size_t)(in ? wnext : 0) * wstep, in ? 16 : 0);
++        if (wlive) cp16s(wdst + wfill, wsrc + (size_t)(in ? wnext : 0) * wstep, in ? 16 : 0);
+         wfill = wfill + OWB == (uint32_t)(OWS * OWB) ? 0u : wfill + OWB;
+         ++wnext;
+     };
+@@ -250,15 +258,16 @@ __device__ __forceinline__ void sums_n(const __nv_bfloat16* __restrict__ x, int
+ 
+ }  // namespace tf_exl3_once
+ 
+-// Block (matrix: 0 gate, 1 up; item). S: fp32 [2][pairs][512] scratch; done: int [items], zero at launch (the caller
+-// zeroes it). Dynamic shared memory: tf_exl3_once::smem_bytes(). 4-bit gate and up, N = 512.
+-template <int CB>
++// Block (matrix: 0 gate, 1 up; item). S: fp32 [2][pairs][ON] scratch; done: int [items], zero at launch (the caller
++// zeroes it). Dynamic shared memory: tf_exl3_once::smem_bytes_for<ON>(). 4-bit gate and up, ON in {256, 384, 512}.
++template <int CB, int ON = 512>
+ __device__ __forceinline__ void gu_once(const __nv_bfloat16* __restrict__ x, int x_stride, int slots,
+         const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const half* __restrict__ suh_g, const half* __restrict__ suh_u,
+         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_g,
+         const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd, float* __restrict__ S, int* __restrict__ done,
+         int pairs, int K, float limit, int act_mode, unsigned char* once_smem) {
+     using namespace tf_exl3_once;
++    constexpr int NCB = ON / 128;
+     __shared__ int rows_sh[OM], tok_sh[OM], last_sh;
+     const int mat = blockIdx.x, item = blockIdx.y;
+     if (item >= counts[0]) return;
+@@ -271,7 +280,7 @@ __device__ __forceinline__ void gu_once(const __nv_bfloat16* __restrict__ x, int
+     __syncthreads();
+     float* Sm = S + (size_t)mat * pairs * ON;
+ #define TF_EXL3_ONCE_SUMS(NBA) \
+-    sums_n<NBA, CB>(x, x_stride, mat ? Tu : Tg, mat ? suh_u : suh_g, Sm, K, once_smem, rows_sh, tok_sh, e)
++    sums_n<NBA, CB, ON>(x, x_stride, mat ? Tu : Tg, mat ? suh_u : suh_g, Sm, K, once_smem, rows_sh, tok_sh, e)
+     TF_EXL3_PROMPT_NBA(cnt, TF_EXL3_ONCE_SUMS)
+ #undef TF_EXL3_ONCE_SUMS
+     __threadfence();   // the sums, before the count says so
+@@ -281,26 +290,28 @@ __device__ __forceinline__ void gu_once(const __nv_bfloat16* __restrict__ x, int
+     if (last_sh != 1) return;   // the first block of the item: the second runs the epilogue
+     __threadfence();
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+-    for (int w = warp; w < cnt * (ON / 128); w += OW) {
+-        const int i = w >> 2, cb = w & 3, p = rows_sh[i];
++    for (int w = warp; w < cnt * NCB; w += OW) {
++        const int i = w / NCB, cb = w % NCB, p = rows_sh[i];
+         epi_member(S + (size_t)p * ON, S + ((size_t)pairs + p) * ON, p, lane, e, cb, svh_g, svh_u, suh_d, xd, ON, limit, act_mode);
+     }
+ }
+ 
+-extern "C" __global__ void __launch_bounds__(256, 1) tf_exl3_prompt_gu_once(const __nv_bfloat16* __restrict__ x, int x_stride, int slots,
+-        const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const half* __restrict__ suh_g, const half* __restrict__ suh_u,
+-        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_g,
+-        const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd, float* __restrict__ S, int* __restrict__ done,
+-        int pairs, int K, float limit, int act_mode) {
+-    extern __shared__ __align__(16) unsigned char once_smem[];
+-    gu_once<CB_MCG>(x, x_stride, slots, Tg, Tu, suh_g, suh_u, items, counts, members, svh_g, svh_u, suh_d, xd, S, done, pairs, K, limit, act_mode, once_smem);
+-}
+-// The same on the mul1 codebook (a mul1 checkpoint's 4-bit gate and up), the arguments tf_exl3_prompt_gu_once's.
+-extern "C" __global__ void __launch_bounds__(256, 1) tf_exl3_prompt_gu_once_mul1(const __nv_bfloat16* __restrict__ x, int x_stride, int slots,
+-        const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const half* __restrict__ suh_g, const half* __restrict__ suh_u,
+-        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_g,
+-        const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd, float* __restrict__ S, int* __restrict__ done,
+-        int pairs, int K, float limit, int act_mode) {
+-    extern __shared__ __align__(16) unsigned char once_smem[];
+-    gu_once<CB_MUL1>(x, x_stride, slots, Tg, Tu, suh_g, suh_u, items, counts, members, svh_g, svh_u, suh_d, xd, S, done, pairs, K, limit, act_mode, once_smem);
+-}
++#define TF_EXL3_ONCE_DEF(NAME, CB_, ON_)                                                                                   \
++    extern "C" __global__ void __launch_bounds__(256, 1) NAME(const __nv_bfloat16* __restrict__ x, int x_stride, int slots,\
++            const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const half* __restrict__ suh_g,              \
++            const half* __restrict__ suh_u, const int* __restrict__ items, const int* __restrict__ counts,                 \
++            const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u,               \
++            const half* __restrict__ suh_d, half* __restrict__ xd, float* __restrict__ S, int* __restrict__ done,          \
++            int pairs, int K, float limit, int act_mode) {                                                                 \
++        extern __shared__ __align__(16) unsigned char once_smem[];                                                         \
++        gu_once<CB_, ON_>(x, x_stride, slots, Tg, Tu, suh_g, suh_u, items, counts, members, svh_g, svh_u, suh_d, xd, S,    \
++                          done, pairs, K, limit, act_mode, once_smem);                                                     \
++    }
++
++TF_EXL3_ONCE_DEF(tf_exl3_prompt_gu_once, CB_MCG, 512)
++TF_EXL3_ONCE_DEF(tf_exl3_prompt_gu_once_mul1, CB_MUL1, 512)
++TF_EXL3_ONCE_DEF(tf_exl3_prompt_gu_once_n384, CB_MCG, 384)
++TF_EXL3_ONCE_DEF(tf_exl3_prompt_gu_once_mul1_n384, CB_MUL1, 384)
++TF_EXL3_ONCE_DEF(tf_exl3_prompt_gu_once_n256, CB_MCG, 256)
++TF_EXL3_ONCE_DEF(tf_exl3_prompt_gu_once_mul1_n256, CB_MUL1, 256)
++#undef TF_EXL3_ONCE_DEF
+diff --git a/zig/src/cuda/exl3_prompt.zig b/zig/src/cuda/exl3_prompt.zig
+index a600d1d73..c1b0c149f 100644
+--- a/zig/src/cuda/exl3_prompt.zig
++++ b/zig/src/cuda/exl3_prompt.zig
+@@ -71,8 +71,17 @@ fn sizes(l: ex.Layer, rows: usize, slots: usize) ![4]usize {
+ /// once kernel takes by shape holds only its sums and counts in xg and no xu (no rotated copies are ever made); a call
+ /// that would take the copying path refuses (error.Exl3Shape) instead of overrunning.
+ pub var once_only: bool = false;
++pub const once_widths = [_]usize{ 512, 384, 256 };
++pub fn onceIndex(width: usize) ?usize {
++    for (once_widths, 0..) |w, idx| if (w == width) return idx;
++    return null;
++}
++pub fn onceSmem(width: usize) ?u32 {
++    if (onceIndex(width) == null) return null;
++    return @intCast(2 * 64 * 136 * 2 + 8 * (width / 16) * 32 * 4 + 8 * 8 * 256 + 2 * 128 * 2);
++}
+ fn onceShape(l: ex.Layer) bool {
+-    return eligible(l) and widths(l).gu == 8 and !l.shared_input and l.width == once_width and l.dims % 128 == 0;
++    return eligible(l) and widths(l).gu == 8 and !l.shared_input and onceIndex(l.width) != null and l.dims % 128 == 0;
+ }
+ 
+ fn sizesFor(l: ex.Layer, rows: usize, slots: usize, own_y: bool) ![4]usize {
+@@ -102,13 +111,13 @@ pub fn scratchFor(base: u64, l: ex.Layer, rows: usize, slots: usize, own_y: bool
+     _ = std.math.add(u64, base, total) catch return error.Exl3Shape;
+     return .{ .xg = base, .xu = if (l.shared_input) base else base + ns[0], .xd = base + ns[0] + ns[1], .y = if (own_y) base + ns[0] + ns[1] + ns[2] else 0, .rows = rows, .slots = slots };
+ }
+-/// tf_exl3_prompt_gu_once (exl3_prompt_once.cuh): its dynamic shared memory (smem_bytes()), width and threads.
++/// tf_exl3_prompt_gu_once (exl3_prompt_once.cuh): its dynamic shared memory at N=512 (smem_bytes()), width and threads.
+ pub const once_smem: u32 = 2 * 64 * 136 * 2 + 8 * 32 * 32 * 4 + 8 * 8 * 256 + 2 * 128 * 2;
+ pub const once_width = 512;
+-/// The layers the once kernel takes: 4-bit gate and up (mcg or mul1, every expert's own input scales), one rank's width 512
+-/// (TP4's), whole 128-column k blocks, x rows 8-byte aligned for its 8-byte raw copies.
++/// The layers the once kernel takes: 4-bit gate and up (mcg or mul1, every expert's own input scales), width 512 (TP4)
++/// or 384/256 (TP6), whole 128-column k blocks, x rows 8-byte aligned for its 8-byte raw copies.
+ pub fn onceEligible(l: ex.Layer, x: u64, stride: usize) bool {
+-    return eligible(l) and widths(l).gu == 8 and !l.shared_input and l.width == once_width and l.dims % 128 == 0 and x % 8 == 0 and stride % 4 == 0;
++    return onceShape(l) and x % 8 == 0 and stride % 4 == 0;
+ }
+ /// The once kernel's scratch in the xg region: fp32 sums [2][pairs][width], then an int count an item.
+ fn onceBytes(l: ex.Layer, pairs: usize, items: usize) !usize {
+@@ -137,7 +146,7 @@ pub const Kernels = struct {
+     down_k6: Function, // 3-bit down, down's arguments
+     down_b16: Function, // down and down_k6 writing bf16 slot rows, their arguments
+     down_k6_b16: Function,
+-    gateup_once: ?Function = null, // TF_GLM_PF_EXPERTS_ONCE: rotation fused, gate or up a block (onceEligible); null: not in the image
++    gateup_once: [once_widths.len]?Function = @splat(null), // TF_GLM_PF_EXPERTS_ONCE by width (512, 384, 256)
+     down_fuse: ?Function = null, // down_b16 and down_k6_b16 with the route combine (Fuse), their arguments and the Fuse's;
+     down_k6_fuse: ?Function = null, // null in an image built before them (the fused path is then refused)
+     // the mul1 codebook's 4-bit copies (eligible: a mul1 layer is 4-bit gate/up and down), the mcg kernels' arguments
+@@ -145,17 +154,26 @@ pub const Kernels = struct {
+     down_mul1: Function,
+     down_b16_mul1: Function,
+     down_fuse_mul1: ?Function = null,
+-    gateup_once_mul1: ?Function = null,
++    gateup_once_mul1: [once_widths.len]?Function = @splat(null),
+     pub fn resolve(mod: Module) !Kernels {
+-        // optional: an image without it, or a device whose shared memory refuses its 84,480 bytes, keeps the old path
+-        var once: ?Function = mod.function("tf_exl3_prompt_gu_once") catch null;
+-        if (once) |f| f.allowDynamicShared(once_smem) catch {
+-            once = null;
+-        };
+-        var once_m1: ?Function = mod.function("tf_exl3_prompt_gu_once_mul1") catch null;
+-        if (once_m1) |f| f.allowDynamicShared(once_smem) catch {
+-            once_m1 = null;
+-        };
++        // optional: an image without it, or a device whose shared memory refuses its bytes, keeps the old path
++        const mcg_names = [once_widths.len][:0]const u8{ "tf_exl3_prompt_gu_once", "tf_exl3_prompt_gu_once_n384", "tf_exl3_prompt_gu_once_n256" };
++        const m1_names = [once_widths.len][:0]const u8{ "tf_exl3_prompt_gu_once_mul1", "tf_exl3_prompt_gu_once_mul1_n384", "tf_exl3_prompt_gu_once_mul1_n256" };
++        var once: [once_widths.len]?Function = @splat(null);
++        var once_m1: [once_widths.len]?Function = @splat(null);
++        for (once_widths, mcg_names, m1_names, 0..) |w, gn, mn, idx| {
++            const sm = onceSmem(w).?;
++            if (mod.function(gn)) |f| {
++                if (f.allowDynamicShared(sm)) |_| {
++                    once[idx] = f;
++                } else |_| {}
++            } else |_| {}
++            if (mod.function(mn)) |f| {
++                if (f.allowDynamicShared(sm)) |_| {
++                    once_m1[idx] = f;
++                } else |_| {}
++            } else |_| {}
++        }
+         return .{
+             .gateup_once = once,
+             .gateup_once_mul1 = once_m1,
+@@ -178,9 +196,10 @@ pub const Kernels = struct {
+     pub fn fuseLoaded(k: Kernels) bool {
+         return k.down_fuse != null and k.down_k6_fuse != null and k.down_fuse_mul1 != null;
+     }
+-    /// The once kernel for `l`'s codebook (null: not in the image).
++    /// The once kernel for `l`'s codebook and width (null: not in the image or unsupported width).
+     fn onceFor(k: Kernels, l: ex.Layer) ?Function {
+-        return if (l.codebook == .mul1) k.gateup_once_mul1 else k.gateup_once;
++        const idx = onceIndex(l.width) orelse return null;
++        return if (l.codebook == .mul1) k.gateup_once_mul1[idx] else k.gateup_once[idx];
+     }
+     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
+         if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
+@@ -201,7 +220,7 @@ pub const Kernels = struct {
+             try s.d.check(s.d.api.cuMemsetD32Async(done, 0, items, s.handle), "cuMemsetD32Async");
+             var args: launch.Args = .{};
+             inline for (.{ x, i(stride), i(sc.slots), l.gate, l.up, l.suh_g, l.suh_u, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, sums, done, i(pairs), i(l.dims), l.limit, l.act_mode }) |v| args.add(v);
+-            try launch.launch(k.onceFor(l).?, .{ .grid = .{ .x = 2, .y = @intCast(items), .z = 1 }, .block = .{ .x = 256 }, .shared = once_smem }, s, &args);
++            try launch.launch(k.onceFor(l).?, .{ .grid = .{ .x = 2, .y = @intCast(items), .z = 1 }, .block = .{ .x = 256 }, .shared = onceSmem(l.width).? }, s, &args);
+         } else {
+             if (once_only and onceShape(l)) return error.Exl3Shape; // U8a: no room for rotated copies
+             if (l.shared_input) {
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 07ed8484e..15040cbb4 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -789,12 +789,13 @@ pub const Forward = struct {
+     /// hidden[0..R) += every rank's partial at `part` (R rows, this rank's), on `stream` over `comm`; `end` bounds the room.
+     /// With `own`, the owner's rows of the next layer's [q_a | kv_a] gathered in the same NCCL group as the residual rows.
+     fn scatterRows(f: *const Forward, stream: cuda.Stream, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, R: usize, own: ?OwnNext) !void {
+-        return f.scatterRowsAt(stream, comm, part, null, end, hidden, R, own);
++        return f.scatterRowsAt(stream, comm, part, null, end, hidden, R, own, false);
+     }
+ 
+     /// scatterRows with the scattered sums and gathered bf16 rows at `scratch` (null: right after the padded partial,
+     /// scatterRows' own room) up to `end` (TF_GLM_NEON_SLICES: each slice's partial in one array, its scratch apart).
+-    fn scatterRowsAt(f: *const Forward, stream: cuda.Stream, comm: cuda.nccl.Comm, part: u64, scratch: ?u64, end: u64, hidden: u64, R: usize, own: ?OwnNext) !void {
++    /// `inplace_pad`: caller sized `hidden` to at least `padded` rows, so policy bit 22 gathers in place even when R % world != 0.
++    fn scatterRowsAt(f: *const Forward, stream: cuda.Stream, comm: cuda.nccl.Comm, part: u64, scratch: ?u64, end: u64, hidden: u64, R: usize, own: ?OwnNext, inplace_pad: bool) !void {
+         const r = f.ranks[0];
+         const n = f.exchange.nccl;
+         const D = r.w.config.hidden;
+@@ -809,11 +810,20 @@ pub const Forward = struct {
+         try n.lib.check(n.lib.api.ncclReduceScatter(part, recv, per * D, .f32, .sum, comm, stream.handle), "ncclReduceScatter");
+         const lo = @min(R, rank * per);
+         const mine = @min(R, lo + per) - lo;
+-        // policy bit 22 (U7a): with R a multiple of the ranks every rank's rows are its own `per`: the sums added in
+-        // place into the residual rows and gathered into them (NCCL's in-place all-gather), no copy back
+-        if (own == null and padded == R and policy_mod.on(f.policy, .scatter_inplace)) {
+-            try glue.residualAdd(f.set(), stream, hidden + lo * D * 2, hidden + lo * D * 2, recv, mine, D, 1);
+-            try n.lib.check(n.lib.api.ncclAllGather(hidden + rank * per * D * 2, hidden, per * D, .bf16, comm, stream.handle), "ncclAllGather");
++        // policy bit 22 (U7a): add scattered sums in place into the residual rows and all-gather straight into `hidden`
++        // (with optional `own` fused into the same NCCL group), skipping the copy back from rows_b16.
++        if ((padded == R or inplace_pad) and policy_mod.on(f.policy, .scatter_inplace)) {
++            if (mine > 0) try glue.residualAdd(f.set(), stream, hidden + lo * D * 2, hidden + lo * D * 2, recv, mine, D, 1);
++            if (own) |o| {
++                const w = o.l.q_lora + o.l.rowW();
++                try dsa_block.ownerRows(f.set(), stream, o.l, o.norm, o.eps, hidden + lo * D * 2, D, o.normed, o.xs, o.dp + rank * per * w * 2, mine);
++                try n.lib.check(n.lib.api.ncclGroupStart(), "ncclGroupStart");
++                const ga = n.lib.check(n.lib.api.ncclAllGather(hidden + rank * per * D * 2, hidden, per * D, .bf16, comm, stream.handle), "ncclAllGather");
++                const gb = n.lib.check(n.lib.api.ncclAllGather(o.dp + rank * per * w * 2, o.dp, per * w, .bf16, comm, stream.handle), "ncclAllGather");
++                try n.lib.check(n.lib.api.ncclGroupEnd(), "ncclGroupEnd");
++                try ga;
++                try gb;
++            } else try n.lib.check(n.lib.api.ncclAllGather(hidden + rank * per * D * 2, hidden, per * D, .bf16, comm, stream.handle), "ncclAllGather");
+             return;
+         }
+         if (mine > 0) try glue.residualAdd(f.set(), stream, hidden + lo * D * 2, rows_b16 + rank * per * D * 2, recv, mine, D, 1);
+@@ -873,11 +883,19 @@ pub const Forward = struct {
+         var xs: [2]u64 = undefined;
+         var hidden: [2]u64 = undefined;
+         var dsa: [2]dsa_block.Scratch = .{ b.dsa, b.dsa };
++        const world = r.w.share.world;
++        const padded0 = ((RA + world - 1) / world) * world;
++        const pad_h1 = policy_mod.on(f.policy, .scatter_inplace) and padded0 > RA;
++        const h1_off = if (pad_h1) padded0 else RA;
+         for (0..2) |h| {
+             part[h] = b.gathered + h * span_bytes;
+             normed[h] = b.normed + lo[h] * D * 2;
+             xs[h] = b.xs + lo[h] * (D / 64) * 4;
+-            hidden[h] = b.hidden + lo[h] * D * 2;
++            hidden[h] = b.hidden + (if (h == 0) 0 else h1_off) * D * 2;
++        }
++        if (pad_h1) { // shift half 1 up by padded0 - RA rows (via b.normed, no overlap) so half 0's in-place gather stays apart
++            try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(b.normed, b.hidden + RA * D * 2, rows[1] * D * 2, f.stream.handle), "cuMemcpyDtoDAsync");
++            try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(hidden[1], b.normed, rows[1] * D * 2, f.stream.handle), "cuMemcpyDtoDAsync");
+         }
+         // the second half's token lists after the first's (the shared layers reuse each half's own)
+         dsa[1].tokens += RA * sparse.dsa_width * 4;
+@@ -898,7 +916,7 @@ pub const Forward = struct {
+                 const qi_rows = if (ow.pol.qb and a.rope != 0) sparse.splitRows(k.split, rows[h]) else null;
+                 try dsa_block.bodyRows(k, f.stream, a, st.caches[di], sh, normed[h], D, rows[h], pos_dev[h], st.pos + lo[h], nch, b.part_rows, null, done, qi_rows);
+                 try dsa_block.fill(f.set(), f.stream, a, dsa[h], 0, rows[h], part[h]);
+-                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h], null, null);
++                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h], null, null, true);
+             }
+             prof_mod.context(f.prof, j, null, .ffn);
+             if (l.ffn == .moe and l.ffn.moe.exl3 != null and wholeExperts()) { // (EXL3) the routed experts once over both halves (every expert's weights read once)
+@@ -917,7 +935,7 @@ pub const Forward = struct {
+                     try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, D, R, true);
+                     try moe.combineRows(f.moeKernels(), f.stream, m, b.moe, 0, rows[0], part[0]);
+                 }
+-                try f.sideExchange(p, 0, side_comm, part[0], part[0] + span_bytes, hidden[0], rows[0], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[0] } else null, ow.next(j, 0));
++                try f.sideExchange(p, 0, side_comm, part[0], part[0] + span_bytes, hidden[0], rows[0], if (f.taps) |t| .{ .t = t, .j = j, .x = hidden[0], .lo = lo[0] } else null, ow.next(j, 0), true);
+                 // half 1's shared expert and sum under half 0's exchange
+                 if (fused) {
+                     // TF_GLM_NEON_FOLD (neon #15): the shared down folds the slot into part[1] itself (the same bytes)
+@@ -929,7 +947,7 @@ pub const Forward = struct {
+                     try moe.sharedSlot(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[1], R);
+                     try moe.combineRows(f.moeKernels(), f.stream, m, b.moe, lo[1], R, part[1]);
+                 }
+-                try f.sideExchange(p, 1, side_comm, part[1], part[1] + span_bytes, hidden[1], rows[1], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[1] } else null, ow.next(j, 1));
++                try f.sideExchange(p, 1, side_comm, part[1], part[1] + span_bytes, hidden[1], rows[1], if (f.taps) |t| .{ .t = t, .j = j, .x = hidden[1], .lo = lo[1] } else null, ow.next(j, 1), true);
+                 di += 1;
+                 continue;
+             }
+@@ -946,11 +964,15 @@ pub const Forward = struct {
+                         try moe.fill(f.moeKernels(), f.stream, m, b.moe, normed[h], D, 0, rows[h], true, part[h]);
+                     },
+                 }
+-                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[h] } else null, ow.next(j, h));
++                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h], if (f.taps) |t| .{ .t = t, .j = j, .x = hidden[h], .lo = lo[h] } else null, ow.next(j, h), true);
+             }
+             di += 1;
+         }
+         for (0..2) |h| try f.stream.wait(p.gathered[h]);
++        if (pad_h1) { // pack half 1 back right after half 0 for finish()'s contiguous b.hidden
++            try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(b.normed, hidden[1], rows[1] * D * 2, f.stream.handle), "cuMemcpyDtoDAsync");
++            try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(b.hidden + RA * D * 2, b.normed, rows[1] * D * 2, f.stream.handle), "cuMemcpyDtoDAsync");
++        }
+     }
+ 
+     /// TF_GLM_NEON_SLICES=1 (default off), read once.
+@@ -1050,7 +1072,7 @@ pub const Forward = struct {
+                 const qi_rows = if (pol.qb and a.rope != 0) sparse.splitRows(k.split, rows[s]) else null;
+                 try dsa_block.bodyRows(k, f.stream, a, st.caches[di], dsa[s], normed[s], D, rows[s], pos_dev[s], st.pos + lo[s], nch, b.part_rows, null, false, qi_rows);
+                 try dsa_block.fill(f.set(), f.stream, a, dsa[s], 0, rows[s], part[s]);
+-                try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], null, null);
++                try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], null, null, false);
+             }
+             prof_mod.context(f.prof, j, null, .ffn);
+             const last = n_s - 1;
+@@ -1068,12 +1090,12 @@ pub const Forward = struct {
+                 if (fused) {
+                     // every slice's rows into its partial (one array, part[0] on); the first slices' shared slots summed in
+                     try moe.bodyFusedRows(f.moeKernels(), f.stream, m, b.moe, b.normed, D, R, part[0], lo[last]);
+-                    for (0..last) |s| try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[s] } else null, null);
++                    for (0..last) |s| try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], if (f.taps) |t| .{ .t = t, .j = j, .x = hidden[s], .lo = lo[s] } else null, null, false);
+                 } else {
+                     try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, D, R, true);
+                     for (0..last) |s| {
+                         try moe.combineRows(f.moeKernels(), f.stream, m, b.moe, lo[s], lo[s] + rows[s], part[s]);
+-                        try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[s] } else null, null);
++                        try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], if (f.taps) |t| .{ .t = t, .j = j, .x = hidden[s], .lo = lo[s] } else null, null, false);
+                     }
+                 }
+                 // the last slice's shared expert and sum under the first slices' exchanges
+@@ -1084,7 +1106,7 @@ pub const Forward = struct {
+                     try moe.sharedSlot(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[last], R);
+                     try moe.combineRows(f.moeKernels(), f.stream, m, b.moe, lo[last], R, part[last]);
+                 }
+-                try f.sideExchangeAt(p, last, side_comm, part[last], scr[last], end[last], hidden[last], rows[last], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[last] } else null, null);
++                try f.sideExchangeAt(p, last, side_comm, part[last], scr[last], end[last], hidden[last], rows[last], if (f.taps) |t| .{ .t = t, .j = j, .x = hidden[last], .lo = lo[last] } else null, null, false);
+                 di += 1;
+                 continue;
+             }
+@@ -1101,7 +1123,7 @@ pub const Forward = struct {
+                         try moe.fill(f.moeKernels(), f.stream, m, b.moe, normed[s], D, 0, rows[s], true, part[s]);
+                     },
+                 }
+-                try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[s] } else null, null);
++                try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], if (f.taps) |t| .{ .t = t, .j = j, .x = hidden[s], .lo = lo[s] } else null, null, false);
+             }
+             di += 1;
+         }
+@@ -1112,18 +1134,18 @@ pub const Forward = struct {
+     /// A layer's ffn exchange taps its half's finished residual rows on the side stream before `gathered` (DSpark).
+     const HalfTap = struct { t: taps_mod.Taps, j: usize, x: u64, lo: usize };
+ 
+-    fn sideExchange(f: *const Forward, p: *const Pieces, h: usize, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, rows: usize, tap: ?HalfTap, own: ?OwnNext) !void {
+-        return f.sideExchangeAt(p, h, comm, part, null, end, hidden, rows, tap, own);
++    fn sideExchange(f: *const Forward, p: *const Pieces, h: usize, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, rows: usize, tap: ?HalfTap, own: ?OwnNext, inplace_pad: bool) !void {
++        return f.sideExchangeAt(p, h, comm, part, null, end, hidden, rows, tap, own, inplace_pad);
+     }
+ 
+     /// sideExchange with the exchange's scratch at `scratch` (scatterRowsAt; null: after the partial).
+-    fn sideExchangeAt(f: *const Forward, p: *const Pieces, h: usize, comm: cuda.nccl.Comm, part: u64, scratch: ?u64, end: u64, hidden: u64, rows: usize, tap: ?HalfTap, own: ?OwnNext) !void {
++    fn sideExchangeAt(f: *const Forward, p: *const Pieces, h: usize, comm: cuda.nccl.Comm, part: u64, scratch: ?u64, end: u64, hidden: u64, rows: usize, tap: ?HalfTap, own: ?OwnNext, inplace_pad: bool) !void {
+         try p.filled[h].record(f.stream);
+         try p.side.wait(p.filled[h]);
+-        try f.scatterRowsAt(p.side, comm, part, scratch, end, hidden, rows, own);
++        try f.scatterRowsAt(p.side, comm, part, scratch, end, hidden, rows, own, inplace_pad);
+         // the half's rows of the layer, gathered whole in hidden on this stream: the next layer's exchange of this half
+         // (the only writer of these rows) follows on the same stream, and the chunk's end waits for `gathered`
+-        if (tap) |q| try q.t.at(p.side, q.j, q.x, q.lo, rows);
++        if (tap) |q| try q.t.atFrom(p.side, q.j, q.x, q.lo, rows);
+         try p.gathered[h].record(p.side);
+     }
+ 
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index 8a528e5fc..44fdb5866 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -101,7 +101,9 @@ pub const Kernels = struct {
+     /// +10-13%; the shared expert's down (k <= 512) from 1,024 rows, +20%), null = glm_mm8_128s2 (q_b, [q_a | kv_a], the
+     /// shared gate-up and the rest, where neither wins).
+     pub fn promptTile(n: usize, kk: usize, m: usize) ?usize {
+-        if (n >= 4096 and kk >= 4096) return if (m <= 2048 or n != 6144) 0 else 1;
++        if (n == 6144 and kk >= 2048) return if (m <= 2048) 0 else 1;
++        if (n >= 4096 and kk >= 4096) return if (n == 4096 and m >= 2048) 1 else 0;
++        if (n == 4096 and kk == 2048 and m < 1024) return 0;
+         if (n >= 4096 and kk <= 512 and m >= 1024) return 1;
+         return null;
+     }
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 0e6c5d4cb..8974a54e2 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -473,7 +473,7 @@ pub const Buffers = struct {
+             if (trims.eact) 4 else pairs * ew * 2, pairs * D * @as(usize, if (prefill and @import("cuda_exl3.zig").eySmall()) 2 else 4), rows * 2 * sh * 2, // eact, ey (U3e: bf16 prompt slot rows), sgu
+             rows * sh * 2,
+             rows * (sh / 64) * 4, rows * D * 4, // sxs, sy
+-            rows * D * 2,         rows * D * 2,
++            (rows + if (prefill) 2 * s.world else 0) * D * 2, rows * D * 2,
+             rows * (D / 64) * 4,  (if (prefill) prompt_heads else rows) * s.vocab.len() * 2,
+             if (trims.mtp) 4 else rows * D * 2, if (trims.mtp) 4 else rows * D * 2, if (trims.mtp) 4 else rows * 2 * D * 2, if (trims.mtp) 4 else rows * D * 2, // hin, me, mcat, mx
+             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
+diff --git a/zig/src/families/glm/cuda_taps.zig b/zig/src/families/glm/cuda_taps.zig
+index 7ff0007f6..2fadb706d 100644
+--- a/zig/src/families/glm/cuda_taps.zig
++++ b/zig/src/families/glm/cuda_taps.zig
+@@ -45,19 +45,25 @@ pub const Taps = struct {
+     /// After layer `j` (nothing off the tapped layers): rows lo..lo + n of residual `x` (bf16 [rows][4][hidden], or
+     /// on the dsa [rows][dsa]).
+     pub fn at(t: Taps, s: cuda.Stream, j: usize, x: u64, lo: usize, n: usize) !void {
++        const src = if (t.dsa != 0) x + lo * t.dsa * 2 else x + lo * 4 * hidden * 2;
++        return t.atFrom(s, j, src, lo, n);
++    }
++
++    /// `at` with the `n` source rows starting at `src` (so a padded residual half writes into its unpadded `dst_lo` slot).
++    pub fn atFrom(t: Taps, s: cuda.Stream, j: usize, src: u64, dst_lo: usize, n: usize) !void {
+         if (t.dsa != 0) {
+             const k = slotIn(t.layer_list, j) orelse return;
+             if (n == 0) return;
+             const row = t.dsa * 2;
+             const nl = t.layer_list.len;
+-            const p: cuda.abi.Memcpy2D = .{ .src = x + lo * row, .src_pitch = row, .dst = t.out + lo * nl * row + k * row, .dst_pitch = nl * row, .width = row, .height = n };
++            const p: cuda.abi.Memcpy2D = .{ .src = src, .src_pitch = row, .dst = t.out + dst_lo * nl * row + k * row, .dst_pitch = nl * row, .width = row, .height = n };
+             return s.d.check(s.d.api.cuMemcpy2DAsync_v2(&p, s.handle), "cuMemcpy2DAsync");
+         }
+         const k = slot(j) orelse return;
+         if (n == 0) return;
+         var a: cuda.Args = .{};
+-        a.add(x + lo * 4 * hidden * 2);
+-        a.add(t.out + lo * layers.len * hidden * 2);
++        a.add(src);
++        a.add(t.out + dst_lo * layers.len * hidden * 2);
+         a.add(k);
+         a.add(@as(i32, 0)); // the mean of the 4 streams (df_tap's mode 0)
+         try cuda.launch.launch(t.f, .{ .grid = .{ .x = @intCast(n), .y = hidden / 1024 }, .block = .{ .x = 256 } }, s, &a);
+-- 
+2.43.0
+

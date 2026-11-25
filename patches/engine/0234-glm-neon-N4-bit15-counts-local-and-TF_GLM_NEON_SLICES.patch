@@ -1,0 +1,439 @@
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Subject: [PATCH] glm: neon N4: policy bit 15 (split selection counts from the position) and TF_GLM_NEON_SLICES=1 (4-slice prompt chunk)
+
+Squash of neon 2cbf59bc3 and d51b1bf22 over 8abdfae96.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj5qARY3iLJfisqfnh
+---
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 53727175f..d0aac9001 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -10,6 +10,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     b.step("test-glm-tp3-host", "Uneven KDA head shares through actual projection and load planning, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM TP3:"} })).step);
+     b.step("test-glm-halves-host", "A prompt chunk's two halves and their exchange rooms (TF_GLM_DSA_HALVES), without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM halves room:"} })).step);
+     b.step("test-glm-owner-proj-host", "TF_GLM_PROMPT_OWNER_PROJ's switch, split rows and rooms, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM owner proj:"} })).step);
++    b.step("test-glm-neon-slices-host", "TF_GLM_NEON_SLICES: a full prompt chunk's slices and their exchange rooms, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM neon slices:"} })).step);
+     b.step("test-glm-neon-bufs-host", "TF_GLM_NEON_BUFS: a GLM-5.3 TP4 prompt buffer's trimmed sizes, decode and shared buffers unchanged, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM neon bufs:"} })).step);
+     b.step("test-glm-exl3-host", "GLM EXL3 admission, mixed-width expert loading and scratch sizing, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM EXL3:"} })).step);
+     b.step("test-glm-x8-host", "GLM EXLR8 trellis projections as stored (0205b): cuts, markers, scratch, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM X8:"} })).step);
+diff --git a/zig/kernels/cuda/glm_glue_index.cuh b/zig/kernels/cuda/glm_glue_index.cuh
+index 1890fa39b..65c691da5 100644
+--- a/zig/kernels/cuda/glm_glue_index.cuh
++++ b/zig/kernels/cuda/glm_glue_index.cuh
+@@ -355,6 +355,16 @@ extern "C" __global__ void __launch_bounds__(1024)
+   }
+ }
+ 
++// neon rank #12 (GLM policy bit 15): a split selection's counts for all `rows` rows from the position alone, as
++// tf_glm_dsa_topk / tf_glm_dsa_tmerge write them (k past the all-visible prefix, 0 within): every rank's gathered counts
++// without the gather.
++extern "C" __global__ void tf_glm_dsa_counts(const int* pos, int k, int* counts, int rows) {
++  for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < rows; r += gridDim.x * blockDim.x) {
++    const int64_t n = (int64_t)pos[0] + r + 1;
++    counts[r] = n > k ? k : 0;
++  }
++}
++
+ // glm_moe_dsa's index key write, a warp a row: LayerNorm of the fused kw output's key half (its first 128 dims,
+ // tf_glm_index_write's LN), then the interleaved 64-wide rope on the first 64 dims, into the index cache at the row's
+ // position. glm_moe_dsa caches roped keys (its scores dot roped queries) and has no gate row.
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index f6cc918b6..761650881 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -60,6 +60,46 @@ pub fn halvesFit(R: usize, cap: usize, world: usize, D: usize) bool {
+     return true;
+ }
+ 
++/// TF_GLM_NEON_SLICES=1 (default off): a prompt chunk's slices of rows, short tails about long middles so each
++/// exchange has more compute to hide under (the first slice's ffn exchange under the last slice's shared expert, the
++/// last slice's mixer exchange under the first three's). Only a full 4,096-row chunk; null: the two halves' path.
++pub const slice_count = 4;
++pub const neon_slices = [slice_count]usize{ 768, 1280, 1280, 768 };
++
++pub fn sliceRows(R: usize) ?[slice_count]usize {
++    return if (R == neon_slices[0] + neon_slices[1] + neon_slices[2] + neon_slices[3]) neon_slices else null;
++}
++
++/// wholeDsaSlices' exchange rooms, byte offsets from the gathered room's start. `part[s]`: slice s's fp32 partial
++/// rows, every slice's in row order (part[s] = lo[s] x D x 4), so one fused down writes all of them as one array;
++/// `scratch[s]`: slice s's own scattered sums and gathered bf16 rows (scatterRowsAt). Every slice has its own bytes
++/// (nothing recycled): a slice's rows a multiple of the ranks (no padded rows past its partial, which would read the
++/// next slice's), and the whole below the slices' device positions in the room's last 256 bytes (`pos[s]`, s >= 1).
++pub const SliceRoom = struct { lo: [slice_count]usize, part: [slice_count]usize, scratch: [slice_count]usize, end: usize, pos: [slice_count]usize };
++
++pub fn sliceRoom(rows: [slice_count]usize, cap: usize, world: usize, D: usize) ?SliceRoom {
++    var o: SliceRoom = undefined;
++    var R: usize = 0;
++    for (rows, 0..) |n, s| {
++        if (n == 0 or n % 64 != 0 or n % world != 0) return null;
++        o.lo[s] = R;
++        o.part[s] = R * D * 4;
++        R += n;
++    }
++    if (R > cap) return null;
++    var at = std.mem.alignForward(usize, R * D * 4, 256);
++    for (rows, 0..) |n, s| {
++        const per = n / world;
++        o.scratch[s] = at;
++        at = std.mem.alignForward(usize, at + per * D * 4 + n * D * 2, 256); // scattered fp32 sums, then the bf16 rows
++    }
++    o.end = at;
++    const room = world * cap * D * 4;
++    if (o.end + 256 > room) return null;
++    for (0..slice_count) |s| o.pos[s] = room - 256 + 16 * s; // pos[0] unused (the state's own position)
++    return o;
++}
++
+ /// The modules a forward launches from: our fatbins.
+ pub const Modules = struct {
+     glue: glue.Kernels,
+@@ -749,6 +789,12 @@ pub const Forward = struct {
+     /// hidden[0..R) += every rank's partial at `part` (R rows, this rank's), on `stream` over `comm`; `end` bounds the room.
+     /// With `own`, the owner's rows of the next layer's [q_a | kv_a] gathered in the same NCCL group as the residual rows.
+     fn scatterRows(f: *const Forward, stream: cuda.Stream, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, R: usize, own: ?OwnNext) !void {
++        return f.scatterRowsAt(stream, comm, part, null, end, hidden, R, own);
++    }
++
++    /// scatterRows with the scattered sums and gathered bf16 rows at `scratch` (null: right after the padded partial,
++    /// scatterRows' own room) up to `end` (TF_GLM_NEON_SLICES: each slice's partial in one array, its scratch apart).
++    fn scatterRowsAt(f: *const Forward, stream: cuda.Stream, comm: cuda.nccl.Comm, part: u64, scratch: ?u64, end: u64, hidden: u64, R: usize, own: ?OwnNext) !void {
+         const r = f.ranks[0];
+         const n = f.exchange.nccl;
+         const D = r.w.config.hidden;
+@@ -756,9 +802,10 @@ pub const Forward = struct {
+         const rank = r.w.share.rank;
+         const per = (R + world - 1) / world;
+         const padded = per * world;
+-        const recv = part + padded * D * 4;
++        const recv = scratch orelse part + padded * D * 4;
+         const rows_b16 = recv + per * D * 4;
+-        if (part + scatterRoom(R, world, D) > end) return error.ScatterRoom; // (= rows_b16 + padded * D * 2)
++        if (recv + per * D * 4 + padded * D * 2 > end) return error.ScatterRoom; // (= part + scatterRoom(R) without `scratch`)
++        if (scratch) |s| if (s < part + padded * D * 4 and part < s + per * D * 4 + padded * D * 2) return error.ScatterRoom; // apart from the partial
+         try n.lib.check(n.lib.api.ncclReduceScatter(part, recv, per * D, .f32, .sum, comm, stream.handle), "ncclReduceScatter");
+         const lo = @min(R, rank * per);
+         const mine = @min(R, lo + per) - lo;
+@@ -903,14 +950,174 @@ pub const Forward = struct {
+         for (0..2) |h| try f.stream.wait(p.gathered[h]);
+     }
+ 
++    /// TF_GLM_NEON_SLICES=1 (default off), read once.
++    fn neonSlicesOn() bool {
++        const S = struct {
++            var once: ?bool = null;
++        };
++        if (S.once) |v| return v;
++        const v = if (std.c.getenv("TF_GLM_NEON_SLICES")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
++        if (v) std.log.info("TF_GLM_NEON_SLICES=1: full prompt chunks of the two-halves path run as slices of {d}, {d}, {d}, {d} rows", .{ neon_slices[0], neon_slices[1], neon_slices[2], neon_slices[3] });
++        S.once = v;
++        return v;
++    }
++
++    /// The slices' rooms for a chunk of R rows the two-halves path takes, or null (that path): the switch on, a full
++    /// chunk, rooms that fit (a slice's rows a multiple of the ranks), and no owner projections (OwnHalves' rooms and
++    /// ready flags are two halves'; logged once). DSpark taps take each slice's rows (taps.at of rows lo..lo + n).
++    fn slicesFor(f: *const Forward, R: usize) ?SliceRoom {
++        if (!neonSlicesOn()) return null;
++        const rows = sliceRows(R) orelse return null;
++        const r = f.ranks[0];
++        const S = struct {
++            var room_logged = false;
++            var owner_logged = false;
++        };
++        const sr = sliceRoom(rows, r.b.rows, r.w.share.world, r.w.config.hidden) orelse {
++            if (!S.room_logged) std.log.warn("TF_GLM_NEON_SLICES: the slices do not fit this rank's exchange room (world {d}, {d} rows): the two halves' path", .{ r.w.share.world, r.b.rows });
++            S.room_logged = true;
++            return null;
++        };
++        if (OwnHalves.init(f, R).on) {
++            if (!S.owner_logged) std.log.warn("TF_GLM_NEON_SLICES: owner projections (TF_GLM_PROMPT_OWNER_PROJ / policy bit 4) are on: the two halves' path", .{});
++            S.owner_logged = true;
++            return null;
++        }
++        return sr;
++    }
++
++    /// TF_GLM_NEON_SLICES: wholeDsaHalves over slice_count slices of rows (sliceRows), each site's exchange of a slice
++    /// on the side stream under the main stream's later work. Slice s attends to the keys slices before it wrote of the
++    /// same layer (on this stream, before it). The same ops on the same rows as the halves: every op split by rows is
++    /// row-independent (rmsnorm, the mixer's projections on glm_mm's one-slice prompt kernels in 64-row multiples, the
++    /// DSA select and attention a row at a time, the shared expert), and the routed experts still run once over all R
++    /// rows. Every slice owns its partial rows and exchange scratch in the room (sliceRoom), so the halves' event
++    /// protocol holds per slice: the main stream writes slice s's partial only after waiting p.gathered[s] (its last
++    /// exchange done), the side stream reads it only after p.filled[s]; hidden's rows of slice s are written by that
++    /// slice's exchanges alone (one side stream, in order) and read on the main stream after p.gathered[s].
++    fn wholeDsaSlices(f: *const Forward, R: usize, sr: SliceRoom) !void {
++        const r = f.ranks[0];
++        const c = &r.w.config;
++        const D: usize = c.hidden;
++        const b = r.b;
++        const st = r.st;
++        const p = f.pieces.?;
++        const side_comm = f.exchange.nccl.side_comm;
++        const rows = sliceRows(R) orelse return error.ScatterRoom;
++        const n_s = slice_count;
++        const lo = sr.lo;
++        if (sr.end + 256 > r.w.share.world * b.rows * D * 4) return error.ScatterRoom;
++        var pos_dev: [n_s]u64 = undefined;
++        var part: [n_s]u64 = undefined;
++        var scr: [n_s]u64 = undefined;
++        var end: [n_s]u64 = undefined;
++        var normed: [n_s]u64 = undefined;
++        var xs: [n_s]u64 = undefined;
++        var hidden: [n_s]u64 = undefined;
++        var dsa: [n_s]dsa_block.Scratch = @splat(b.dsa);
++        for (0..n_s) |s| {
++            pos_dev[s] = if (s == 0) st.pos_dev else b.gathered + sr.pos[s];
++            if (s > 0) { // slice s's device position: the chunk's plus lo[s]
++                var add: cuda.Args = .{};
++                add.add(st.pos_dev);
++                add.add(@as(c_int, @intCast(lo[s])));
++                add.add(pos_dev[s]);
++                try cuda.launch.launch(try f.m.ops().function("tf_glm_add_i32"), .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 } }, f.stream, &add);
++            }
++            part[s] = b.gathered + sr.part[s];
++            scr[s] = b.gathered + sr.scratch[s];
++            end[s] = if (s + 1 < n_s) b.gathered + sr.scratch[s + 1] else b.gathered + sr.end;
++            normed[s] = b.normed + lo[s] * D * 2;
++            xs[s] = b.xs + lo[s] * (D / 64) * 4;
++            hidden[s] = b.hidden + lo[s] * D * 2;
++            // each slice's token lists after the slices' before it (the shared layers reuse each slice's own)
++            dsa[s].tokens += lo[s] * sparse.dsa_width * 4;
++            dsa[s].counts += lo[s] * 4;
++        }
++        const pol = OwnHalves.init(f, R).pol; // its qb bit only: slicesFor refused the owner rooms
++        var di: usize = 0;
++        for (r.w.layers, 0..) |l, j| {
++            prof_mod.context(f.prof, j, null, .mixer);
++            const a = l.mixer.mla;
++            const k: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof, .split = f.indexSplit(r) };
++            for (0..n_s) |s| {
++                if (j > 0) try f.stream.wait(p.gathered[s]); // this slice's ffn exchange of the layer before
++                try glue.rmsnormBy(f.set(), f.stream, hidden[s], D, l.in_norm, normed[s], D, xs[s], c.eps, rows[s], D);
++                const nch = @min(latent.chunksFor(st.pos + lo[s] + rows[s]), b.nch);
++                const qi_rows = if (pol.qb and a.rope != 0) sparse.splitRows(k.split, rows[s]) else null;
++                try dsa_block.bodyRows(k, f.stream, a, st.caches[di], dsa[s], normed[s], D, rows[s], pos_dev[s], st.pos + lo[s], nch, b.part_rows, null, false, qi_rows);
++                try dsa_block.fill(f.set(), f.stream, a, dsa[s], 0, rows[s], part[s]);
++                try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], null, null);
++            }
++            prof_mod.context(f.prof, j, null, .ffn);
++            const last = n_s - 1;
++            if (l.ffn == .moe and l.ffn.moe.exl3 != null and wholeExperts()) { // (EXL3) the routed experts once over every slice
++                const m = l.ffn.moe;
++                const fused = moe.fusedDown(f.moeKernels(), m, R);
++                // the first slices' shared experts, each under the later slices' mixer exchanges
++                for (0..last) |s| {
++                    try f.stream.wait(p.gathered[s]);
++                    try glue.rmsnormBy(f.set(), f.stream, hidden[s], D, l.post_norm, normed[s], D, xs[s], c.eps, rows[s], D);
++                    if (fused) try moe.sharedOnly(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[s], lo[s] + rows[s]) else try moe.sharedSlot(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[s], lo[s] + rows[s]);
++                }
++                try f.stream.wait(p.gathered[last]);
++                try glue.rmsnormBy(f.set(), f.stream, hidden[last], D, l.post_norm, normed[last], D, xs[last], c.eps, rows[last], D);
++                if (fused) {
++                    // every slice's rows into its partial (one array, part[0] on); the first slices' shared slots summed in
++                    try moe.bodyFusedRows(f.moeKernels(), f.stream, m, b.moe, b.normed, D, R, part[0], lo[last]);
++                    for (0..last) |s| try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[s] } else null, null);
++                } else {
++                    try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, D, R, true);
++                    for (0..last) |s| {
++                        try moe.combineRows(f.moeKernels(), f.stream, m, b.moe, lo[s], lo[s] + rows[s], part[s]);
++                        try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[s] } else null, null);
++                    }
++                }
++                // the last slice's shared expert and sum under the first slices' exchanges
++                if (fused) {
++                    try moe.sharedOnly(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[last], R);
++                    try moe.foldRows(f.moeKernels(), f.stream, m, b.moe, lo[last], R, part[last]);
++                } else {
++                    try moe.sharedSlot(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo[last], R);
++                    try moe.combineRows(f.moeKernels(), f.stream, m, b.moe, lo[last], R, part[last]);
++                }
++                try f.sideExchangeAt(p, last, side_comm, part[last], scr[last], end[last], hidden[last], rows[last], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[last] } else null, null);
++                di += 1;
++                continue;
++            }
++            for (0..n_s) |s| {
++                try f.stream.wait(p.gathered[s]);
++                try glue.rmsnormBy(f.set(), f.stream, hidden[s], D, l.post_norm, normed[s], D, xs[s], c.eps, rows[s], D);
++                switch (l.ffn) {
++                    .dense => |m| {
++                        try mlp.body(f.mlpKernels(), f.stream, m, b.dense, normed[s], D, rows[s], true);
++                        try mlp.fill(f.mlpKernels(), f.stream, m, b.dense, 0, rows[s], true, part[s]);
++                    },
++                    .moe => |m| {
++                        try moe.body(f.moeKernels(), f.stream, m, b.moe, normed[s], D, rows[s], true);
++                        try moe.fill(f.moeKernels(), f.stream, m, b.moe, normed[s], D, 0, rows[s], true, part[s]);
++                    },
++                }
++                try f.sideExchangeAt(p, s, side_comm, part[s], scr[s], end[s], hidden[s], rows[s], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[s] } else null, null);
++            }
++            di += 1;
++        }
++        for (0..n_s) |s| try f.stream.wait(p.gathered[s]);
++    }
++
+     /// Half h's exchange on the side stream after the main stream's work so far; p.gathered[h] marks it done.
+     /// A layer's ffn exchange taps its half's finished residual rows on the side stream before `gathered` (DSpark).
+     const HalfTap = struct { t: taps_mod.Taps, j: usize, x: u64, lo: usize };
+ 
+     fn sideExchange(f: *const Forward, p: *const Pieces, h: usize, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, rows: usize, tap: ?HalfTap, own: ?OwnNext) !void {
++        return f.sideExchangeAt(p, h, comm, part, null, end, hidden, rows, tap, own);
++    }
++
++    /// sideExchange with the exchange's scratch at `scratch` (scatterRowsAt; null: after the partial).
++    fn sideExchangeAt(f: *const Forward, p: *const Pieces, h: usize, comm: cuda.nccl.Comm, part: u64, scratch: ?u64, end: u64, hidden: u64, rows: usize, tap: ?HalfTap, own: ?OwnNext) !void {
+         try p.filled[h].record(f.stream);
+         try p.side.wait(p.filled[h]);
+-        try f.scatterRows(p.side, comm, part, end, hidden, rows, own);
++        try f.scatterRowsAt(p.side, comm, part, scratch, end, hidden, rows, own);
+         // the half's rows of the layer, gathered whole in hidden on this stream: the next layer's exchange of this half
+         // (the only writer of these rows) follows on the same stream, and the chunk's end waits for `gathered`
+         if (tap) |q| try q.t.at(p.side, q.j, q.x, q.lo, rows);
+@@ -925,7 +1132,10 @@ pub const Forward = struct {
+         const pf = f.prefetch();
+         const v2 = f.prefetchV2();
+         if (f.taps != null and f.taps.?.dsa == 0) return error.DsaTaps; // DFlash2's 4-stream taps: not this stream
+-        if (f.dsaHalves(R)) return f.wholeDsaHalves(R); // DSpark's taps: each half's rows after its ffn exchange
++        if (f.dsaHalves(R)) {
++            if (f.slicesFor(R)) |sr| return f.wholeDsaSlices(R, sr); // TF_GLM_NEON_SLICES=1 only
++            return f.wholeDsaHalves(R); // DSpark's taps: each half's rows after its ffn exchange
++        }
+         var di: usize = 0;
+         for (f.ranks[0].w.layers, 0..) |_, j| {
+             prof_mod.context(f.prof, j, null, .mixer);
+@@ -1209,3 +1419,60 @@ test "GLM halves room: the 28,417-id prompt's last chunk (3,841 rows at TP4) spl
+ test "GLM halves room: chunks that split evenly keep their halves (the fix moves only the overflowing lengths)" {
+     for ([_]usize{ 2048, 2050, 3478, 3840, 3842, 4096 }) |R| try std.testing.expectEqual((R / 2 + 63) / 64 * 64, halfRows(R)[0]);
+ }
++
++test "GLM neon slices: a full chunk's slices are 64-row multiples that sum to it; other chunks keep the halves" {
++    const rows = sliceRows(prefill_rows) orelse return error.TestUnexpectedResult;
++    var sum: usize = 0;
++    for (rows) |n| {
++        try std.testing.expect(n % 64 == 0 and n > 0);
++        sum += n;
++    }
++    try std.testing.expectEqual(@as(usize, prefill_rows), sum);
++    try std.testing.expect(rows[0] == rows[3] and rows[1] == rows[2] and rows[0] < rows[1]); // symmetric tails
++    for (1..prefill_rows) |R| try std.testing.expectEqual(@as(?[slice_count]usize, null), sliceRows(R));
++}
++
++test "GLM neon slices: TP4's rooms (4,096 rows a rank, D 6144): disjoint partials in row order, scratch apart, clear of the positions" {
++    const world = 4;
++    const D = 6144;
++    const cap = prefill_rows;
++    const rows = sliceRows(prefill_rows).?;
++    const o = sliceRoom(rows, cap, world, D) orelse return error.TestUnexpectedResult;
++    const room = world * cap * D * 4;
++    var regions: [2 * slice_count][2]usize = undefined;
++    for (0..slice_count) |s| {
++        const per = rows[s] / world;
++        try std.testing.expectEqual(per * world, rows[s]); // no padded rows: scatterRowsAt reads only this slice's partial
++        try std.testing.expectEqual(o.lo[s] * D * 4, o.part[s]);
++        try std.testing.expect(o.part[s] % 256 == 0 and o.scratch[s] % 256 == 0); // the fused down's 16-byte stores, NCCL's buffers
++        if (s + 1 < slice_count) try std.testing.expectEqual(o.part[s] + rows[s] * D * 4, o.part[s + 1]); // one array: the fused down's out
++        const end = if (s + 1 < slice_count) o.scratch[s + 1] else o.end;
++        // scatterRowsAt's bound: the scattered sums then the gathered bf16 rows inside [scratch, end)
++        try std.testing.expect(o.scratch[s] + per * D * 4 + per * world * D * 2 <= end);
++        regions[2 * s] = .{ o.part[s], o.part[s] + rows[s] * D * 4 };
++        regions[2 * s + 1] = .{ o.scratch[s], o.scratch[s] + per * D * 4 + rows[s] * D * 2 };
++        if (s > 0) {
++            try std.testing.expect(o.pos[s] >= o.end and o.pos[s] + 4 <= room and o.pos[s] % 4 == 0 and o.pos[s] >= room - 256);
++            if (s > 1) try std.testing.expect(o.pos[s] >= o.pos[s - 1] + 4);
++        }
++    }
++    for (regions, 0..) |x, i| for (regions[i + 1 ..]) |y| try std.testing.expect(x[1] <= y[0] or y[1] <= x[0]); // no bytes shared
++    try std.testing.expect(o.end + 256 <= room);
++    // the whole fits beside the halves' (2 x span + 256) in the same room, no new allocation
++    try std.testing.expect(halvesFit(prefill_rows, cap, world, D));
++    std.debug.print("GLM neon slices: TP4 room {d} MiB, slices take {d} MiB (halves {d} MiB)\n", .{ room >> 20, o.end >> 20, (2 * std.mem.alignForward(usize, scatterRoom(2048, world, D), 256)) >> 20 });
++}
++
++test "GLM neon slices: rooms refuse slices that are not a multiple of the ranks or past the rows cap" {
++    const rows = sliceRows(prefill_rows).?;
++    try std.testing.expectEqual(@as(?SliceRoom, null), sliceRoom(rows, prefill_rows, 6, 6144)); // 1,280 rows over 6 ranks pad
++    try std.testing.expectEqual(@as(?SliceRoom, null), sliceRoom(rows, prefill_rows, 3, 6144));
++    try std.testing.expect(sliceRoom(rows, prefill_rows, 8, 6144) != null);
++    // two ranks: the partials (R x D x 4) and the gathered bf16 rows (R x D x 2) and sums fill the 2 x cap x D x 4
++    // room to its last byte, no room for the positions: null (the scatter path needs three ranks anyway)
++    try std.testing.expectEqual(@as(?SliceRoom, null), sliceRoom(rows, prefill_rows, 2, 6144));
++    try std.testing.expectEqual(@as(?SliceRoom, null), sliceRoom(rows, 2048, 4, 6144)); // more rows than the buffer's
++    try std.testing.expectEqual(@as(?SliceRoom, null), sliceRoom(.{ 768, 1280, 1280, 700 }, prefill_rows, 4, 6144));
++    // a room too small for the slices' bytes (one rank's room is cap rows of fp32, the slices take ~10 bytes a value): null
++    try std.testing.expectEqual(@as(?SliceRoom, null), sliceRoom(rows, prefill_rows, 1, 6144));
++}
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 1c948e716..d73daf4fb 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -126,6 +126,7 @@ pub const Kernels = struct {
+     chunks_16_w576_i8_skip: cuda.Function, // policy bit 26 (U5x): the dense chunks without their keyless tiles
+     chunks_16_w576_s4_i8: cuda.Function,
+     chunks_16_fused_w576_i8: cuda.Function,
++    dsa_counts: cuda.Function, // policy bit 15 (neon #12): a split selection's counts from the position (glm_glue_index.cuh)
+     dec_split_qk: cuda.Function, // policy bit 31 (neon #3): a dense decode window's tiles' scores (glm_dec_split.cuh)
+     dec_split_pv: cuda.Function, // and their P.V a 64-column block at a time, the chunk kernel's walk
+     router_fused: cuda.Function, // policy bit 14 (neon #13): a prompt's router slices summed in one launch (glm_glue_bmm.cuh)
+diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.zig
+index 6992f34fc..ae081dc5a 100644
+--- a/zig/src/families/glm/cuda_moe.zig
++++ b/zig/src/families/glm/cuda_moe.zig
+@@ -101,6 +101,15 @@ pub fn bodyFused(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
+     return bodyWith(k, stream, l, s, x, x_stride, rows, true, .{ .wts = s.wts, .sy = s.sy, .sy_rows = h.split, .out0 = h.out0, .out1 = h.out1, .split = h.split });
+ }
+ 
++/// TF_GLM_NEON_SLICES: bodyFused with every row's sum at out [rows][dims] fp32 (one array: the slices' partials in row
++/// order) and the shared slot summed for rows below `sy_rows` (the slices whose shared expert `sharedOnly` ran before
++/// the body); the rest take it by `foldRows`. The kernel's split at `rows` (out1 unused). The same per-row arithmetic
++/// as bodyFused: the routed slots in order, then the shared slot's fma, here or in foldRows on the stored fp32.
++pub fn bodyFusedRows(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, out: u64, sy_rows: usize) !void {
++    if (!fusedDown(k, l, rows) or sy_rows > rows) return error.BadFill;
++    return bodyWith(k, stream, l, s, x, x_stride, rows, true, .{ .wts = s.wts, .sy = s.sy, .sy_rows = sy_rows, .out0 = out, .out1 = 0, .split = rows });
++}
++
+ /// A fused chunk's shared expert of rows lo..hi into `sy` only (no slot row: the fused down or foldRows reads sy).
+ pub fn sharedOnly(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize) !void {
+     if (forks(k, true)) return error.BadFill;
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index a5dcce65e..e4f2f2fa1 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -564,6 +564,7 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+     b.offered |= policy.bit(.exl3_uo); // 28 (neon #11): falls back to the unchanged forms where the kernels are absent
+     if (b.offered & policy.bit(.l2pf_v2) != 0) b.offered |= policy.bit(.l2pf_v3); // 29 (neon #5): with bit 16's table
+     b.offered |= policy.bit(.dec_split); // 31 (neon #3): tf_glm_dec_split_qk / _pv
++    b.offered |= policy.bit(.counts_local); // 15 (neon #12): tf_glm_dsa_counts
+     b.offered |= policy.bit(.scores_w8); // 11 (neon #1): tf_glm_dsa_scores_w8 (with bit 24)
+     if (e.drafter) |dr| if (dr.spark == null and dr.k.attn_mma != null) {
+         b.offered |= policy.bit(.dg_mma); // 30 (neon N3 #1): DFlash2 at the full shape loaded dg_attn_part_mma
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index 725e0b4bc..be000d5f0 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -252,6 +252,11 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+     // the lists in place (the prompt buffers' tokens hold world x per rows of dsa_width: sized at sparse.width), the
+     // counts through the scores scratch (counts has no room past rows), every rank's block in rank order
+     try x.lib.check(x.lib.api.ncclAllGather(tokens + x.rank * per * dsa_width * 4, tokens, per * dsa_width, .i32, x.comm, stream.handle), "ncclAllGather");
++    if (policy.on(set.policy, .counts_local)) { // policy bit 15 (neon #12): every row's count from the position, no gather
++        var ca: cuda.Args = .{};
++        inline for (.{ pos, @as(c_int, dsa_width), counts, @as(c_int, @intCast(rows)) }) |v| ca.add(v);
++        return cuda.launch.launch(set.glue.dsa_counts, .{ .grid = .{ .x = @intCast(cdiv(rows, 256)) }, .block = .{ .x = 256 } }, stream, &ca);
++    }
+     if (hi > lo) try drv.check(drv.api.cuMemcpyDtoDAsync_v2(s.scores + x.rank * per * 4, counts + lo * 4, (hi - lo) * 4, stream.handle), "cuMemcpyDtoDAsync");
+     try x.lib.check(x.lib.api.ncclAllGather(s.scores + x.rank * per * 4, s.scores, per, .i32, x.comm, stream.handle), "ncclAllGather");
+     try drv.check(drv.api.cuMemcpyDtoDAsync_v2(counts, s.scores, rows * 4, stream.handle), "cuMemcpyDtoDAsync");
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+index 400c1a2b3..af14c3c19 100644
+--- a/zig/src/families/glm/policy.zig
++++ b/zig/src/families/glm/policy.zig
+@@ -26,6 +26,7 @@ pub const Bit = enum(u5) {
+     dg_mma = 30, // neon N3 #1: DFlash2's block attention partials on tensor cores (dg_attn_part_mma; drafts only)
+     l2pf_v3 = 29, // neon #5: with bit 16, site o paced and stopped before expand_v; the stops as a dependent launch
+     exl3_uo = 28, // neon #11: mul1 decode experts on the u-outer grid forms + the dependent combine (with bit 19)
++    counts_local = 15, // neon #12: a split prompt selection's counts computed from the position, not all-gathered
+     router_fused = 14, // neon #13: a prompt's router on tf_glm_router_fused (slices summed in registers, no slice partials)
+     msa_f3 = 13, // neon #9: a prompt's int8 sparse/dense attention on tf_glm_msa_w576_i8_f3 / dense_i8_f3
+     mm8_tiles = 12, // neon #2: 8-bit prompt linears on glm_mm8_p128x64 / p64x128 by shape (cuda_mm promptTile)

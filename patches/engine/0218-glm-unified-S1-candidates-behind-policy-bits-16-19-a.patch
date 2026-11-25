@@ -1,0 +1,793 @@
+From ace03ae7a4854b6eca858e64f529c006efcbfff4 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Mon, 23 Nov 2026 01:38:28 +0200
+Subject: [PATCH] glm: unified S1 candidates behind policy bits 16-19 and
+ TF_GLM_UNI_EY_BF16
+
+Bit 16 (U1): TF_GLM_L2PF's second table (proj_dec / q_b, shared expert, head, site q)
+with a stopping paced kernel. Bit 17 (U2): DFlash2 gathers and greedyRows over the RoCE
+mesh. Bit 18 (U3a): P2 decode forms of glm_mm8. Bit 19 (U3b): down_combine without the
+dead fp32 slot rows. TF_GLM_UNI_EY_BF16=1 (U3e): bf16-sized prompt slot rows.
+---
+ zig/kernels/cuda/exl3_experts.cu          |   9 +-
+ zig/kernels/cuda/glm_glue.cu              |   1 +
+ zig/kernels/cuda/glm_glue_l2.cuh          |  51 ++++++++
+ zig/kernels/cuda/glm_mm.cu                |  30 +++++
+ zig/src/cuda/exl3_experts.zig             |   9 +-
+ zig/src/families/glm/cuda_engine_pick.zig |  10 +-
+ zig/src/families/glm/cuda_exl3.zig        |  15 +++
+ zig/src/families/glm/cuda_forward.zig     |  28 +++-
+ zig/src/families/glm/cuda_glue.zig        |   1 +
+ zig/src/families/glm/cuda_l2pf.zig        | 148 +++++++++++++++++++++-
+ zig/src/families/glm/cuda_mm.zig          |  28 +++-
+ zig/src/families/glm/cuda_moe.zig         |   3 +
+ zig/src/families/glm/cuda_native.zig      |   7 +
+ zig/src/families/glm/cuda_state.zig       |   2 +-
+ zig/src/families/glm/dflash_block.zig     |   4 +
+ zig/src/families/glm/policy.zig           |  16 ++-
+ 16 files changed, 343 insertions(+), 19 deletions(-)
+ create mode 100644 zig/kernels/cuda/glm_glue_l2.cuh
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index ae97cd03e..b215ff970 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -230,7 +230,10 @@ struct DownArgs {
+     int wslots; // weights a row: slots (+ 1 with `extra`); the routed pairs stay compact, `slots` a row
+ };
+ 
+-extern "C" __global__ void tf_exl3_down_combine(const DownArgs a) {
++// ND (tf_exl3_down_combine_nd, GLM policy bit 19): with `wts` the per-slot fp32 rows in `y` are not stored (the
++// combine sums them from shared memory; nothing reads them after), the sums the same bits.
++template <bool ND>
++__device__ __forceinline__ void down_combine_body(const DownArgs& a) {
+     __shared__ float4 part[32][32]; // [slot][lane]: the slot's 4 outputs of the lane
+     const int r = blockIdx.x, blk = blockIdx.y;
+     const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
+@@ -250,7 +253,7 @@ extern "C" __global__ void tf_exl3_down_combine(const DownArgs a) {
+ #pragma unroll
+         for (int j = 0; j < 4; ++j) {
+             o[j] = v[j] * HAD_SCALE * __half2float(a.svh_d[(size_t)e * a.d + n + j]);
+-            a.y[(size_t)p * a.d + n + j] = o[j];
++            if (!ND || !a.wts) a.y[(size_t)p * a.d + n + j] = o[j];
+         }
+     } else {
+ #pragma unroll
+@@ -280,6 +283,8 @@ extern "C" __global__ void tf_exl3_down_combine(const DownArgs a) {
+ #pragma unroll
+     for (int j = 0; j < 4; ++j) a.out[(size_t)r * a.d + n + j] = acc[j];
+ }
++extern "C" __global__ void tf_exl3_down_combine(const DownArgs a) { down_combine_body<false>(a); }
++extern "C" __global__ void tf_exl3_down_combine_nd(const DownArgs a) { down_combine_body<true>(a); }
+ 
+ }  // namespace tf_exl3
+ 
+diff --git a/zig/kernels/cuda/glm_glue.cu b/zig/kernels/cuda/glm_glue.cu
+index 4b6948f62..1a4487aea 100644
+--- a/zig/kernels/cuda/glm_glue.cu
++++ b/zig/kernels/cuda/glm_glue.cu
+@@ -14,3 +14,4 @@
+ #include "glm_index_decode.cuh"
+ #include "glm_dsa_topk_multi.cuh"
+ #include "glm_kvsplit_index.cuh"
++#include "glm_glue_l2.cuh"
+diff --git a/zig/kernels/cuda/glm_glue_l2.cuh b/zig/kernels/cuda/glm_glue_l2.cuh
+new file mode 100644
+index 000000000..646868c9d
+--- /dev/null
++++ b/zig/kernels/cuda/glm_glue_l2.cuh
+@@ -0,0 +1,51 @@
++// tf_glm_l2_paced_stop: TF_GLM_L2PF's paced site (dsv41_l2pace's paced_kernel, the same table and pacing) that also
++// stops once the main stream has written `epoch` (or later) to `stop` (U1, policy bit 16): the gather beside it has
++// ended, so the rest of the site would only contend with the window's next matmuls. Wrap-safe epoch compare.
++// Exactness: reads weight memory into L2 (cp.async.bulk.prefetch.L2) and writes nothing.
++#pragma once
++#include <stdint.h>
++
++namespace tf_glm_l2 {
++__device__ __forceinline__ uint64_t now_ns() {
++  uint64_t t;
++  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++  return t;
++}
++__device__ __forceinline__ bool stopped(const volatile uint32_t* stop, uint32_t epoch) {
++  return static_cast<int32_t>(*stop - epoch) >= 0;
++}
++__device__ __forceinline__ void bulk_prefetch(const void* p, uint32_t bytes) {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
++#else
++  for (uint32_t o = 0; o < bytes; o += 128) asm volatile("prefetch.global.L2 [%0];" ::"l"((const char*)p + o));
++#endif
++}
++}  // namespace tf_glm_l2
++
++extern "C" __global__ void __launch_bounds__(32)
++    tf_glm_l2_paced_stop(const int64_t* table, int n, uint32_t chunk, uint64_t ns_per_piece, const uint32_t* stop,
++                         uint32_t epoch) {
++  if (threadIdx.x != 0) return;
++  const volatile uint32_t* st = stop;
++  const uint64_t c = blockIdx.x, g = gridDim.x;
++  const uint64_t t0 = tf_glm_l2::now_ns();
++  uint64_t k = 0;
++  for (int s = 0; s < n; s++) {
++    const uint8_t* p = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(table[2 * s]));
++    const uint64_t bytes = static_cast<uint64_t>(table[2 * s + 1]);
++    for (uint64_t off = 0; off < bytes; off += chunk, k++) {
++      if (k % g != c) continue;
++      const uint64_t due = t0 + k * ns_per_piece;
++      while (true) {
++        if (tf_glm_l2::stopped(st, epoch)) return;
++        const uint64_t t = tf_glm_l2::now_ns();
++        if (t >= due) break;
++        const uint64_t left = due - t;
++        __nanosleep(static_cast<unsigned>(left > 2000u ? 1000u : (left > 64u ? left / 2u : 32u)));
++      }
++      const uint64_t left = bytes - off;
++      tf_glm_l2::bulk_prefetch(p + off, static_cast<uint32_t>(left < chunk ? left : chunk));
++    }
++  }
++}
+diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
+index 3ba5748ce..66b8cb9ed 100644
+--- a/zig/kernels/cuda/glm_mm.cu
++++ b/zig/kernels/cuda/glm_mm.cu
+@@ -437,6 +437,36 @@ GLM_MM_DECODE_ALL(6)
+ GLM_MM_DECODE_ALL(8)
+ GLM_MM_DECODE_ALL(16)
+ 
++// Policy bit 18 (U3a, night/unified): the 8-bit decode windows as P2 (bpairs8_fast and the stage pointers worked out
++// once a block). bpairs8_fast gives the same bf16 pairs as bpairs<8> (see it), and the loads, MMAs and FMAs are the
++// same in the same order, so every output is the same bits; only the instruction count changes.
++template <int B, int BM, int WM, int S>
++__device__ __forceinline__ void mm_two_sp(const MmTwo& p) {
++    const int b = (int)blockIdx.x, z = b >= p.blocks0 ? 1 : 0, l = b - (z ? p.blocks0 : 0), c = p.cols[z];
++    mm_kernel<B, BM, WM, S, false, true>(p.x[z], p.ldx[z], p.w[z], p.s[z], p.out[z], p.part[z], p.f32, p.M, p.N[z], p.K[z],
++                                         p.SK[z], l / c, l % c);
++}
++#define GLM_MM_DECODE_P2(S)                                                                                             \
++    extern "C" __global__ void __launch_bounds__(128) glm_mm8_16s##S##p(const __nv_bfloat16* __restrict__ x,           \
++        long long ldx, const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out,          \
++        float* __restrict__ part, int f32, int M, int N, int K, int SK) {                                              \
++        mm_kernel<8, 16, 1, S, false, true>(x, ldx, w, s, out, part, f32, M, N, K, SK);                                \
++    }                                                                                                                  \
++    extern "C" __global__ void __launch_bounds__(128) glm_mm8_32s##S##p(const __nv_bfloat16* __restrict__ x,           \
++        long long ldx, const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out,          \
++        float* __restrict__ part, int f32, int M, int N, int K, int SK) {                                              \
++        mm_kernel<8, 32, 1, S, false, true>(x, ldx, w, s, out, part, f32, M, N, K, SK);                                \
++    }                                                                                                                  \
++    extern "C" __global__ void __launch_bounds__(128) glm_mm8_16x2s##S##p(const MmPair p) {                            \
++        const int z = blockIdx.z;                                                                                      \
++        mm_kernel<8, 16, 1, S, false, true>(p.x[z], p.ldx, p.w[z], p.s[z], p.out[z], nullptr, p.f32, p.M, p.N, p.K, 1, 0); \
++    }                                                                                                                  \
++    extern "C" __global__ void __launch_bounds__(128) glm_mm8_16ts##S##p(const MmTwo p) { mm_two_sp<8, 16, 1, S>(p); }  \
++    extern "C" __global__ void __launch_bounds__(128) glm_mm8_32ts##S##p(const MmTwo p) { mm_two_sp<8, 32, 1, S>(p); }
++GLM_MM_DECODE_P2(5)
++GLM_MM_DECODE_P2(6)
++GLM_MM_DECODE_P2(8)
++
+ // Both problems' K slices added in slice order, then rounded once: glm_mm_reduce's sums for each (x: problem 0's
+ // blocks, then problem 1's; a problem of one slice has none). Dependent launch (TF_GLM_PDL_CHAIN's reduce, as
+ // glm_mm_reduce): it may start while the two-problem matmul that writes `part` runs, so every thread waits for that
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index ccfecf4a1..35247c54c 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -43,6 +43,10 @@ pub const Layer = struct {
+ };
+ 
+ /// What one projection launches (experts.py default_config): the 8-tile 4-warp K splits, shape-fixed; n % 128 required.
++/// GLM policy bit 19 (U3b): the forward now running asks combine to skip the fp32 slot rows nobody reads (set by the
++/// GLM forward at its start, cleared at its end; one forward at a time a process).
++pub var skip_dead_y: bool = false;
++
+ pub fn plan(k: usize, n: usize, gateup: bool) !u32 {
+     const cands = [_]usize{ if (gateup) 4 else 1, 2, 1 };
+     for (cands) |sk| {
+@@ -125,6 +129,7 @@ pub const Experts = struct {
+     pdl: bool = true, // TF_EXL3_PDL=0: the read-once chain launches as ordinary launches; the same bits either way
+     gateup: Function,
+     down_combine: Function,
++    down_combine_nd: ?Function = null, // tf_exl3_down_combine_nd: GLM policy bit 19 (skip_dead_y)
+     prompt: prompt.Kernels = undefined,
+     plan_rotate: Function = undefined,
+     plan_finish: Function = undefined,
+@@ -175,6 +180,7 @@ pub const Experts = struct {
+         e.pdl = envOn("TF_EXL3_PDL");
+         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
+         e.down_combine = try e.mod.function("tf_exl3_down_combine");
++        e.down_combine_nd = e.mod.function("tf_exl3_down_combine_nd") catch null;
+         return e;
+     }
+ 
+@@ -343,7 +349,8 @@ pub const Experts = struct {
+         cb.add(i32d(g.slots));
+         cb.add(extra);
+         cb.add(i32d(wslots));
+-        try launch_.launch(e.down_combine, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(g.d / 128), .z = 1 }, .block = .{ .x = @intCast(32 * g.slots), .y = 1, .z = 1 } }, s, &cb);
++        const f = if (skip_dead_y and wts != 0) (e.down_combine_nd orelse e.down_combine) else e.down_combine;
++        try launch_.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(g.d / 128), .z = 1 }, .block = .{ .x = @intCast(32 * g.slots), .y = 1, .z = 1 } }, s, &cb);
+     }
+ };
+ 
+diff --git a/zig/src/families/glm/cuda_engine_pick.zig b/zig/src/families/glm/cuda_engine_pick.zig
+index 24f7e3a8b..05d8b6f5d 100644
+--- a/zig/src/families/glm/cuda_engine_pick.zig
++++ b/zig/src/families/glm/cuda_engine_pick.zig
+@@ -17,6 +17,12 @@ pub fn greedyChance(e: *Engine, logits: u64) !chance.Pick {
+ /// tf_glm_top1's words for each), then one gather of every rank's words, one sync and one read (rank order
+ /// [world][rows]), each row picked as `greedy` picks it. A follower's verify rows (Engine.discard_draws) join the
+ /// gather and stop there: rank 0 alone reads the tokens.
++/// Policy bit 17 (U2): the picks' gather over the RoCE mesh (checkGathers checks it after the synchronize).
++fn meshPick(e: *Engine, bytes: usize) ?*@import("cuda_mesh.zig").Mesh {
++    const m = e.mesh orelse return null;
++    return if (@import("policy.zig").on(e.cur.policy, .dflash_mesh) and m.fits(bytes)) m else null;
++}
++
+ pub fn greedyRows(e: *Engine, logits: u64, rows: usize, out: []u32) !void {
+     if (rows == 0) return;
+     if (rows > @import("cuda_engine.zig").pick_rows) return error.WindowTooWide;
+@@ -31,7 +37,7 @@ pub fn greedyRows(e: *Engine, logits: u64, rows: usize, out: []u32) !void {
+     a.add(mine);
+     try cuda.launch.launch(e.m.glue.top1_rows, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.stream, &a);
+     const stamp = @import("cuda_prof.zig").span(e.profiling_prompt, e.stream, .token_gather);
+-    if (e.group) |g| try g.allGather(e.stream, mine, e.pairs.ptr, rows * pair_bytes) else try e.lib.check(e.lib.api.ncclAllGather(mine, e.pairs.ptr, rows * pair_bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
++    if (meshPick(e, rows * pair_bytes)) |m| try m.allGatherBytes(mine, e.pairs.ptr, rows * pair_bytes, e.stream.handle) else if (e.group) |g| try g.allGather(e.stream, mine, e.pairs.ptr, rows * pair_bytes) else try e.lib.check(e.lib.api.ncclAllGather(mine, e.pairs.ptr, rows * pair_bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
+     stamp.end();
+     if (e.discard_draws) {
+         @memset(out[0..rows], 0);
+@@ -58,7 +64,7 @@ fn pick(e: *Engine, logits: u64, sums: bool) !chance.Pick {
+     try cuda.launch.launch(if (sums) e.m.glue.top1_sums else e.m.glue.top1, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, e.stream, &a);
+     const mine = e.pairs.ptr + e.share.rank * pair_bytes;
+     const stamp = @import("cuda_prof.zig").span(e.profiling_prompt, e.stream, .token_gather);
+-    if (e.group) |g| try g.allGather(e.stream, mine, e.pairs.ptr, pair_bytes) else try e.lib.check(e.lib.api.ncclAllGather(mine, e.pairs.ptr, pair_bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
++    if (meshPick(e, pair_bytes)) |m| try m.allGatherBytes(mine, e.pairs.ptr, pair_bytes, e.stream.handle) else if (e.group) |g| try g.allGather(e.stream, mine, e.pairs.ptr, pair_bytes) else try e.lib.check(e.lib.api.ncclAllGather(mine, e.pairs.ptr, pair_bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
+     stamp.end();
+     try e.stream.synchronize();
+     try e.checkGathers();
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index 94f8a83bc..bc589a0e9 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -363,6 +363,20 @@ fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usiz
+ /// A prompt chunk's fused EXL3 experts write bf16 slot rows (an NVFP4 chunk's form; half the slot-row bytes the down
+ /// kernel writes and the combine reads), not fp32; TF_GLM_EXL3_BF16_SLOTS=0 keeps fp32. On K4 at TP4 (2026-11-15): 8K
+ /// agent+code panel KL against BF16 -0.00177 [-0.00438, +0.00083] nats vs fp32 slots; prefill +7%.
++/// TF_GLM_UNI_EY_BF16=1 (U3e, night/unified; boot-time, off by default): a prompt buffer's `ey` slot rows are sized for
++/// bf16 (2 bytes), not fp32: a mul1/mcg checkpoint's prompt chunks write them bf16 (bf16Slots and promptBf16); a
++/// prompt call that would write fp32 rows refuses instead (error.UniEySmall).
++pub fn eySmall() bool {
++    const S = struct {
++        var once: ?bool = null;
++    };
++    if (S.once) |v| return v;
++    const v = if (std.c.getenv("TF_GLM_UNI_EY_BF16")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
++    if (v) std.log.info("TF_GLM_UNI_EY_BF16=1: prompt slot rows sized bf16", .{});
++    S.once = v;
++    return v;
++}
++
+ pub fn bf16Slots() bool {
+     const S = struct {
+         var once: ?bool = null;
+@@ -434,6 +448,7 @@ pub fn runFused(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stre
+     const cap: usize = @min(rows, chunk_rows);
+     const arena = sc.picks + picksBytes(rows);
+     const fused = prompt and common.prompt.eligible(l);
++    if (prompt and eySmall() and !(fused and bf16Slots())) return error.UniEySmall; // fp32 slot rows would overrun ey
+     var at: usize = 0;
+     while (at < rows) : (at += chunk_rows) {
+         const n: usize = @min(chunk_rows, rows - at);
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 68262ace1..c8f5ee696 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -292,6 +292,12 @@ pub const Forward = struct {
+         return if (f.ranks.len == 1 and !f.ranks[0].b.prefill) f.l2pf else null;
+     }
+ 
++    /// Policy bit 16 (U1): the prefetch's second table and its stopping paced kernel, where loaded and asked for.
++    pub fn prefetchV2(f: *const Forward) ?cuda.Function {
++        const p = f.prefetch() orelse return null;
++        return if (@import("policy.zig").on(f.policy, .l2pf_v2) and p.hasV2()) f.m.glue.l2_paced_stop else null;
++    }
++
+     pub fn set(f: *const Forward) glue.Set {
+         return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split, .hc_part = f.m.hc_part, .dscore = if (f.m.dscore) |*x| x else null, .policy = f.policy | f.m.index_boot, .x8 = if (f.m.x8) |*x| x else null };
+     }
+@@ -409,11 +415,11 @@ pub const Forward = struct {
+                         .local => null,
+                     };
+                     const nx: ?@import("cuda_kv_split.zig").Next = if (di + 1 < st.caches.len and di + 1 < r.w.layers.len and r.w.layers[di + 1].mixer == .mla) .{ .c = st.caches[di + 1], .ifull = r.w.layers[di + 1].mixer.mla.ifull } else null;
+-                    const done = try f.splitProj(r, a, rows);
++                    const done = try f.splitProj(r, a, rows, l.index);
+                     if (b.prefill) try x.prompt(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, done, di, nx) else try x.decode(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, done, di);
+                 } else if (kv_attn.wanted(f, r)) try kv_attn.single(f, r, a, di, rows, nch, k) else {
+-                    const done = try f.splitProj(r, a, rows);
+-                    try dsa_block.bodyPre(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, if (f.prefetch()) |pf| .{ .l2 = pf, .layer = l.index } else null, done);
++                    const done = try f.splitProj(r, a, rows, l.index);
++                    try dsa_block.bodyPre(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, if (f.prefetch()) |pf| .{ .l2 = pf, .layer = l.index, .v2 = f.prefetchV2() } else null, done);
+                 }
+                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
+             },
+@@ -423,7 +429,7 @@ pub const Forward = struct {
+     /// A decode window's [q_a | kv_a] split across the ranks (TF_GLM_DSA_SPLIT_QKVA, default on with the mesh): this
+     /// rank's columns into its slot of the gathered room, every rank's slots gathered by the mesh, then back into the
+     /// rows of s.dp; false (nothing run) where the replicated projection stays (a prompt chunk, no slice, no mesh).
+-    fn splitProj(f: *const Forward, r: Rank, a: dsa_block.Layer, rows: usize) !bool {
++    fn splitProj(f: *const Forward, r: Rank, a: dsa_block.Layer, rows: usize, j: usize) !bool {
+         if (!splitWanted(r.b.prefill, a.dec_n, f.ranks.len, f.policy)) return false;
+         const n = switch (f.exchange) {
+             .local => return false,
+@@ -436,7 +442,10 @@ pub const Forward = struct {
+         const base = r.b.gathered;
+         const mine = base + r.w.share.rank * sbytes;
+         try projection.matmul(f.set(), f.stream, a.proj_dec, r.b.normed, r.w.config.hidden, mine, r.b.dsa.mm_part, rows, a.dec_n, a.dims, false);
++        const v2 = f.prefetchV2(); // policy bit 16: site q (the indexer's and kv_b's next weights) beside this gather
++        if (v2) |sf| try f.prefetch().?.forkV2(f.stream, j, .q, sf);
+         try m.allGatherBytes(mine, base, sbytes, f.stream.handle);
++        if (v2 != null) try f.prefetch().?.stopV2(f.stream);
+         const total = a.q_lora + a.rowW();
+         var u: cuda.Args = .{};
+         inline for (.{ base, r.b.dsa.dp, @as(c_int, @intCast(rows)), @as(c_int, @intCast(a.dec_cw)), @as(c_int, @intCast(total)), @as(i64, @intCast(total)) }) |v| u.add(v);
+@@ -591,6 +600,10 @@ pub const Forward = struct {
+     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
+     pub fn run(f: *const Forward, ids: []const i32) !void {
+         const R = ids.len;
++        policy_mod.live = f.policy; // the unified run's kernel-table bits (18-20) for this forward's launches
++        defer policy_mod.live = 0;
++        cuda.exl3_experts.skip_dead_y = policy_mod.on(f.policy, .down_nodead);
++        defer cuda.exl3_experts.skip_dead_y = false;
+         for (f.ranks) |r| {
+             if (R == 0 or R > r.b.rows) return error.BadWindow;
+             if (r.segs.len == 0) {
+@@ -876,6 +889,7 @@ pub const Forward = struct {
+         const c = &f.ranks[0].w.config;
+         const D = c.hidden;
+         const pf = f.prefetch();
++        const v2 = f.prefetchV2();
+         if (f.taps != null and f.taps.?.dsa == 0) return error.DsaTaps; // DFlash2's 4-stream taps: not this stream
+         if (f.dsaHalves(R)) return f.wholeDsaHalves(R); // DSpark's taps: each half's rows after its ffn exchange
+         var di: usize = 0;
+@@ -888,8 +902,9 @@ pub const Forward = struct {
+                 if (r.segs.len > 0) try shared.mixer(f, r, l, 0, di, R, slot(r, R)) else try f.mixer(r, l, 0, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), f.slotDsa(r, R));
+             }
+             if (f.prof) |p| p.mark(f.stream, .mla);
+-            if (pf) |p| try p.fork(f.stream, j, .f);
++            if (pf) |p| if (v2) |sf| try p.forkV2(f.stream, j, .f, sf) else try p.fork(f.stream, j, .f);
+             try f.reduceDsa(R);
++            if (v2 != null) try pf.?.stopV2(f.stream);
+             prof_mod.context(f.prof, j, null, .ffn);
+             for (f.ranks) |r| {
+                 const l = r.w.layers[j];
+@@ -898,8 +913,9 @@ pub const Forward = struct {
+                 try f.ffn(r, l, R, f.slotDsa(r, R));
+             }
+             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared);
+-            if (pf) |p| try p.fork(f.stream, j, .n);
++            if (pf) |p| if (v2) |sf| try p.forkV2(f.stream, j, .n, sf) else try p.fork(f.stream, j, .n);
+             try f.reduceDsa(R);
++            if (v2 != null) try pf.?.stopV2(f.stream);
+             if (f.prof) |p| p.mark(f.stream, .gather_b);
+             // DSpark's taps: the layer's whole residual rows (decode never scatters; a prompt's scatter path gathers
+             // its rows back into hidden on this stream before the next layer reads them)
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 5973f048f..1548459a2 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -119,6 +119,7 @@ pub const Kernels = struct {
+     chunks_16_w576_i8: cuda.Function,
+     chunks_16_w576_s4_i8: cuda.Function,
+     chunks_16_fused_w576_i8: cuda.Function,
++    l2_paced_stop: cuda.Function, // TF_GLM_L2PF policy bit 16: a paced site that stops at its gather's end (glm_glue_l2.cuh)
+     unblock: cuda.Function, // a split [q_a | kv_a]'s gathered column slots back into rows (glm_glue_msa.cuh)
+     msa_w576: cuda.Function, // glm_glue_msa.cuh: a prompt row a block over its token list, the rank's heads one m16 tile
+     msa_w576_dense: cuda.Function, // and a dense prompt row over keys 0 .. its position (the implicit list)
+diff --git a/zig/src/families/glm/cuda_l2pf.zig b/zig/src/families/glm/cuda_l2pf.zig
+index abb9646fa..fa7c5f793 100644
+--- a/zig/src/families/glm/cuda_l2pf.zig
++++ b/zig/src/families/glm/cuda_l2pf.zig
+@@ -44,7 +44,7 @@ pub const Options = struct {
+ };
+ 
+ /// A layer's sites: n before gather_b (the next mixer's input), f before gather_a (the ffn's head), o (KDA's chain).
+-pub const Site = enum(u2) { n, f, o };
++pub const Site = enum(u2) { n, f, o, q }; // q: policy bit 16's site beside the [q_a | kv_a] gather
+ 
+ /// One site's rows of the table and their bytes.
+ pub const Span = struct { at: u32 = 0, rows: u32 = 0, bytes: u64 = 0 };
+@@ -110,10 +110,89 @@ fn sources(l: weights.Layer, site: Site) Sources {
+             .kda => |k| s.proj(k.o),
+             .mla => |a| s.proj(a.o), // glm_moe_dsa: o_proj (its largest GEMV) read into L2 while the attention runs
+         },
++        .q => {}, // policy bit 16's site alone (sourcesV2)
+     }
+     return s;
+ }
+ 
++/// Policy bit 16 (U1): what a decode window reads next at each site. n: the next layer's [q_a | kv_a] as the window
++/// runs it (the split slice proj_dec when the layer has one: the replicated proj is never read then), then q_b; past
++/// the last layer the head. f: the router, then the shared expert (MoE), or the dense MLP as before. q (beside the
++/// [q_a | kv_a] gather): the indexer's wq_b and [wk | weights_proj], then kv_b's wk. o: as before.
++fn sourcesV2(layers: []const weights.Layer, head: projection.Proj, j: usize, site: Site) Sources {
++    var s: Sources = .{};
++    switch (site) {
++        .n => {
++            if (j + 1 == layers.len) {
++                s.proj(head);
++                return s;
++            }
++            switch (layers[j + 1].mixer) {
++                .mla => |a| {
++                    s.proj(if (a.dec_n > 0) a.proj_dec else a.proj);
++                    s.proj(a.q_b);
++                },
++                else => return sources(layers[j + 1], .n),
++            }
++        },
++        .f => switch (layers[j].ffn) {
++            .moe => |m| {
++                s.add(m.router);
++                s.proj(m.shared_gu);
++                s.proj(m.shared_down);
++            },
++            else => return sources(layers[j], .f),
++        },
++        .q => switch (layers[j].mixer) {
++            .mla => |a| if (a.dec_n > 0) {
++                s.proj(a.index.qb);
++                s.proj(a.index.kw);
++                s.add(a.wk);
++            },
++            else => {},
++        },
++        .o => return sources(layers[j], .o),
++    }
++    return s;
++}
++
++/// Site rows of `src` within `budget` appended to `rows`, counted in `sp`; false when a source starts no buffer.
++fn fill(gpa: std.mem.Allocator, bufs: []const cuda.DeviceBuffer, src: Sources, budget: u64, rows: *std.ArrayList([2]i64), sp: *Span, j: usize, site: Site) !bool {
++    // a source that starts no buffer (a view into another allocation) is left out, logged once
++    var ptrs: [max_sources]u64 = undefined;
++    var sizes: [max_sources]u64 = undefined;
++    var n: usize = 0;
++    for (src.ptrs[0..src.len]) |p| {
++        const len: ?u64 = for (bufs) |b| {
++            if (b.ptr == p) break b.len;
++        } else null;
++        if (len) |l| {
++            ptrs[n] = p;
++            sizes[n] = l;
++            n += 1;
++        } else if (j == 0) std.log.warn("TF_GLM_L2PF (bit 16): layer 0's site {t} reads 0x{x}, which starts no weight buffer; left out", .{ site, p });
++    }
++    var got: [max_sources]u64 = undefined;
++    take(sizes[0..n], budget, got[0..n]);
++    for (ptrs[0..n], got[0..n]) |p, b| if (b > 0) {
++        try rows.append(gpa, .{ @intCast(p), @intCast(b) });
++        sp.rows += 1;
++        sp.bytes += b;
++    };
++    return true;
++}
++
++/// Policy bit 16's table: four sites a layer (n, f, o, q), from sourcesV2.
++pub fn tableV2(gpa: std.mem.Allocator, bufs: []const cuda.DeviceBuffer, layers: []const weights.Layer, head: projection.Proj, budget: u64, rows: *std.ArrayList([2]i64), spans: []Span) !bool {
++    std.debug.assert(spans.len == layers.len * 4);
++    for (layers, 0..) |_, j| for ([_]Site{ .n, .f, .o, .q }) |site| {
++        const sp = &spans[j * 4 + @backingInt(site)];
++        sp.* = .{ .at = @intCast(rows.items.len) };
++        if (!try fill(gpa, bufs, sourcesV2(layers, head, j, site), budget, rows, sp, j, site)) return false;
++    };
++    return true;
++}
++
+ /// l2pf.take: the bytes of each of `sizes` in order within `budget`, 16-byte multiples, the last one's head, 0 past it.
+ pub fn take(sizes: []const u64, budget: u64, out: []u64) void {
+     var left = budget;
+@@ -164,6 +243,12 @@ pub const L2pf = struct {
+     paced: cuda.Function,
+     rows: cuda.DeviceBuffer,
+     spans: []Span,
++    // policy bit 16 (U1): its own table (null: a source was not a buffer), the stop word and the host's last epoch
++    d: *const cuda.Driver = undefined,
++    rows2: ?cuda.DeviceBuffer = null,
++    spans2: []Span = &.{},
++    stop: ?cuda.DeviceBuffer = null,
++    epoch: *u32 = undefined,
+ 
+     /// Built after the weights load and tile (tiling moves packed linears); null when a source is not a buffer.
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, o: Options) !?L2pf {
+@@ -193,7 +278,25 @@ pub const L2pf = struct {
+         errdefer join_ev.deinit();
+         const segments = try mods[0].function("_ZN6tfl2pf15segments_kernelILb1EEEvPKlij");
+         const paced = try mods[1].function("_ZN12dsv41_l2pace12paced_kernelEPKlijmm");
+-        return .{ .gpa = gpa, .o = o, .side = side, .fork_ev = fork_ev, .join_ev = join_ev, .mods = mods, .segments = segments, .paced = paced, .rows = rows, .spans = spans };
++        var p: L2pf = .{ .gpa = gpa, .o = o, .side = side, .fork_ev = fork_ev, .join_ev = join_ev, .mods = mods, .segments = segments, .paced = paced, .rows = rows, .spans = spans, .d = d };
++        p.epoch = try gpa.create(u32);
++        p.epoch.* = 0;
++        v2: {
++            const spans2 = try gpa.alloc(Span, w.layers.len * 4);
++            var host2: std.ArrayList([2]i64) = .empty;
++            defer host2.deinit(gpa);
++            if (!try tableV2(gpa, w.buffers.items, w.layers, w.head, @as(u64, o.mb + 1) << 20, &host2, spans2) or host2.items.len == 0) {
++                gpa.free(spans2);
++                break :v2;
++            }
++            var t2: u64 = 0;
++            for (spans2) |sp| t2 += sp.bytes;
++            p.rows2 = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(host2.items));
++            p.spans2 = spans2;
++            p.stop = try cuda.DeviceBuffer.fromHost(d, std.mem.asBytes(&[_]u32{ 0, 0, 0, 0 }));
++            std.log.info("TF_GLM_L2PF policy bit 16 table: {d} rows, {d} MiB a decode window", .{ host2.items.len, t2 >> 20 });
++        }
++        return p;
+     }
+ 
+     /// Before the weights free: the side stream drains first (Stream.deinit synchronizes).
+@@ -203,6 +306,10 @@ pub const L2pf = struct {
+         p.fork_ev.deinit();
+         p.join_ev.deinit();
+         p.rows.free();
++        if (p.rows2) |*b| b.free();
++        if (p.stop) |*b| b.free();
++        if (p.spans2.len > 0) p.gpa.free(p.spans2);
++        p.gpa.destroy(p.epoch);
+         for (&p.mods) |*m| m.unload();
+         p.gpa.free(p.spans);
+         p.* = undefined;
+@@ -229,6 +336,41 @@ pub const L2pf = struct {
+         try cuda.launch.launch(p.segments, .{ .grid = .{ .x = grid }, .block = .{ .x = 128 } }, p.side, &a);
+     }
+ 
++    /// Policy bit 16's table loaded.
++    pub fn hasV2(p: *const L2pf) bool {
++        return p.rows2 != null;
++    }
++
++    /// Policy bit 16's site `site` of layer `j`: its table; the paced sites by `stop_fn` (glue.l2_paced_stop), which
++    /// ends once `stopV2` has run on `main` after the gather.
++    pub fn forkV2(p: *const L2pf, main: cuda.Stream, j: usize, site: Site, stop_fn: cuda.Function) !void {
++        if (j * 4 >= p.spans2.len) return;
++        const sp = p.spans2[j * 4 + @backingInt(site)];
++        if (sp.rows == 0) return;
++        try p.fork_ev.record(main);
++        try p.side.wait(p.fork_ev);
++        var a: cuda.Args = .{};
++        a.add(p.rows2.?.ptr + @as(u64, sp.at) * 16);
++        a.add(@as(c_int, @intCast(sp.rows)));
++        a.add(chunk);
++        if (site != .o and p.o.pace_gbps > 0) {
++            p.epoch.* +%= 1;
++            a.add(@as(u64, @max(1, (chunk + p.o.pace_gbps / 2) / p.o.pace_gbps)));
++            a.add(p.stop.?.ptr);
++            a.add(p.epoch.*);
++            return cuda.launch.launch(stop_fn, .{ .grid = .{ .x = p.o.ctas }, .block = .{ .x = 32 } }, p.side, &a);
++        }
++        const pieces = std.math.divCeil(u64, sp.bytes, chunk) catch unreachable;
++        const grid: u32 = @intCast(std.math.clamp(std.math.divCeil(u64, pieces, 128) catch unreachable, 1, p.o.ctas));
++        try cuda.launch.launch(p.segments, .{ .grid = .{ .x = grid }, .block = .{ .x = 128 } }, p.side, &a);
++    }
++
++    /// Policy bit 16: the gather beside the last paced site has ended on `main`; that site stops prefetching.
++    pub fn stopV2(p: *const L2pf, main: cuda.Stream) !void {
++        const st = p.stop orelse return;
++        try p.d.check(p.d.api.cuMemsetD32Async(st.ptr, p.epoch.*, 1, main.handle), "cuMemsetD32Async");
++    }
++
+     /// A window's end: `main` waits for every site forked on it, so nothing is in flight past the window.
+     pub fn join(p: *const L2pf, main: cuda.Stream) !void {
+         try p.join_ev.record(p.side);
+@@ -240,8 +382,10 @@ pub const L2pf = struct {
+ pub const At = struct {
+     l2: *const L2pf,
+     layer: usize,
++    v2: ?cuda.Function = null, // policy bit 16: its table (glue.l2_paced_stop)
+ 
+     pub fn fork(at: At, main: cuda.Stream) !void {
++        if (at.v2) |f| return at.l2.forkV2(main, at.layer, .o, f);
+         return at.l2.fork(main, at.layer, .o);
+     }
+ };
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index ff4189d76..d36faca1a 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -91,6 +91,7 @@ pub const Kernels = struct {
+     two_on: bool = true, // TF_GLM_MM_TWO=0: the two problems take their own launches (the same bits either way)
+     decode: ?[stage_variants.len]Decode = null, // the 16- and 32-row kernels at each pipeline depth (TF_GLM_MM_STAGES); null (a table built without load): the 3-stage kernels
+     si: usize = default_stage_index, // the index into stage_variants the decode launches take
++    decode_p2: ?Decode = null, // policy bit 18 (U3a): decode[si] with the 8-bit forms as P2 (glm_mm8_*s{S}p), stages 5-8
+ 
+     /// Decode windows' kernels at one pipeline depth: by width (16, 4, 6, 8 bits) and rows a block (16, 32).
+     pub const Decode = struct {
+@@ -99,6 +100,12 @@ pub const Kernels = struct {
+         two: [4][2]cuda.Function, // glm_mm{B}_{16,32}t[s{S}]
+     };
+ 
++    /// The decode table a launch takes: decode_p2 while the forward's policy asks for bit 18 (policy.live).
++    pub fn decTable(k: *const Kernels) ?*const Decode {
++        if (k.decode_p2) |*p2| if (@import("policy.zig").on(@import("policy.zig").live, .mm8_p2)) return p2;
++        return if (k.decode) |*tbl| &tbl[k.si] else null;
++    }
++
+     /// The stage count the decode launches run at (TF_GLM_MM_STAGES: 3, 5, 6 or 8; 6 unless set).
+     pub fn stages(k: *const Kernels) usize {
+         return stage_variants[k.si];
+@@ -149,6 +156,21 @@ pub const Kernels = struct {
+             }
+         }
+         k.decode = decode;
++        if (stage_variants[k.si] != 3) {
++            var p2 = decode[k.si];
++            const st = stage_variants[k.si];
++            inline for (.{ 5, 6, 8 }) |sv| if (st == sv) {
++                inline for (.{ 16, 32 }, 0..) |bm, i| {
++                    p2.rows[3][i] = try m.function(std.fmt.comptimePrint("glm_mm8_{d}s{d}p", .{ bm, sv }));
++                    try p2.rows[3][i].allowDynamicShared(sharedBytesStages(8, bm, sv));
++                    p2.two[3][i] = try m.function(std.fmt.comptimePrint("glm_mm8_{d}ts{d}p", .{ bm, sv }));
++                    try p2.two[3][i].allowDynamicShared(sharedBytesStages(8, bm, sv));
++                }
++                p2.pair[3] = try m.function(std.fmt.comptimePrint("glm_mm8_16x2s{d}p", .{sv}));
++                try p2.pair[3].allowDynamicShared(sharedBytesStages(8, 16, sv));
++            };
++            k.decode_p2 = p2;
++        }
+         std.log.info("glm_mm decode windows: {d} pipeline stages (TF_GLM_MM_STAGES)", .{k.stages()});
+         try k.prompt.allowDynamicShared(smem(128));
+         if (std.c.getenv("TF_GLM_PDL")) |v| k.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
+@@ -331,7 +353,7 @@ pub fn matmulFrom(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tile
+             try cuda.launch.launch(k.packed_prompt[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = 256 }, .shared = sharedBytesStages(w.bits, bm, 2), .pdl = pdl }, s, &a);
+         } else {
+             // 16- and 32-row blocks: the decode kernels at the chosen pipeline depth (the same sums as the 3-stage ones)
+-            const dec: ?*const Kernels.Decode = if (i <= 1) (if (k.decode) |*tbl| &tbl[k.si] else null) else null;
++            const dec: ?*const Kernels.Decode = if (i <= 1) k.decTable() else null;
+             const f = if (dec) |tbl| tbl.rows[wi][i] else if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
+             const shared = if (dec != null) sharedBytesStages(w.bits, bm, k.stages()) else sharedBytes(w.bits, bm);
+             try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = shared, .pdl = pdl }, s, &a);
+@@ -373,7 +395,7 @@ pub fn matmulPair(k: *const Kernels, s: cuda.Stream, x0: u64, x1: u64, ldx: usiz
+     a.add(@as(c_int, @intCast(w0.n)));
+     a.add(@as(c_int, @intCast(w0.k)));
+     const cols: u32 = @intCast((w0.n + 63) / 64);
+-    const dec: ?*const Kernels.Decode = if (k.decode) |*tbl| &tbl[k.si] else null;
++    const dec: ?*const Kernels.Decode = k.decTable();
+     const f = if (dec) |tbl| tbl.pair[wi] else k.pair[wi];
+     const shared = if (dec != null) sharedBytesStages(w0.bits, 16, k.stages()) else sharedBytes(w0.bits, 16);
+     try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = 1, .z = 2 }, .block = .{ .x = 128 }, .shared = shared, .pdl = k.pdl }, s, &a);
+@@ -439,7 +461,7 @@ pub fn matmulTwo(k: *const Kernels, s: cuda.Stream, p: [2]Two, part: u64, part_b
+     var a: cuda.Args = .{};
+     a.add(t);
+     const blocks: u32 = @intCast(t.blocks0 + t.cols[1] * t.sk[1]);
+-    const dec: ?*const Kernels.Decode = if (i <= 1) (if (k.decode) |*tbl| &tbl[k.si] else null) else null;
++    const dec: ?*const Kernels.Decode = if (i <= 1) k.decTable() else null;
+     const f = if (dec) |tbl| tbl.two[wi][i] else fs[wi][i];
+     const shared = if (dec != null) sharedBytesStages(p[0].w.bits, bm, k.stages()) else sharedBytes(p[0].w.bits, bm);
+     try cuda.launch.launch(f, .{ .grid = .{ .x = blocks }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = shared, .pdl = k.pdl }, s, &a);
+diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.zig
+index 07e1db38e..4eb1f4961 100644
+--- a/zig/src/families/glm/cuda_moe.zig
++++ b/zig/src/families/glm/cuda_moe.zig
+@@ -184,6 +184,7 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
+     const n = hi - lo;
+     const bf16_slots = bf16Rows(l, prompt); // the slot rows: bf16 in an NVFP4 prompt chunk, else fp32
+     const eb: usize = if (bf16_slots) 2 else 4;
++    if (prompt and !bf16_slots and exl3.eySmall()) return error.UniEySmall;
+     if (grouped(k, l, hi, prompt)) { // body ran the grouped path on rows 0..hi: one fill of them all
+         if (lo != 0) return error.BadFill;
+         if (forks(k, prompt)) try stream.wait(k.side.?.join) else try sharedRows(k, stream, l, s, x, x_stride, 0, hi, prompt, false);
+@@ -208,6 +209,7 @@ pub fn combineRows(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: us
+     const slots = l.top_k + 1;
+     const bf16_slots = bf16Rows(l, true);
+     const eb: usize = if (bf16_slots) 2 else 4;
++    if (!bf16_slots and exl3.eySmall()) return error.UniEySmall;
+     try glue.combine(k.set, stream, s.ey + lo * slots * d * eb, !bf16_slots, s.wts + lo * slots * 4, out, hi - lo, d, slots);
+ }
+ 
+@@ -219,6 +221,7 @@ fn sharedRows(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_s
+     const n = hi - lo;
+     const bf16_slots = bf16Rows(l, prompt);
+     const eb: usize = if (bf16_slots) 2 else 4;
++    if (prompt and slot and !bf16_slots and exl3.eySmall()) return error.UniEySmall;
+     try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
+     try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
+     try projection.matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 8ea78556d..f101d9dc4 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -529,6 +529,13 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+         },
+         else => {},
+     };
++    // the unified run's bits (night/unified): 16 where TF_GLM_L2PF loaded its second table
++    if (e.l2pf) |*p| if (p.hasV2()) {
++        b.offered |= policy.bit(.l2pf_v2);
++    };
++    if (e.mesh != null) b.offered |= policy.bit(.dflash_mesh); // 17: the mesh is up on every rank or none
++    if (e.m.mm.decode_p2 != null) b.offered |= policy.bit(.mm8_p2); // 18: the P2 decode forms loaded
++    b.offered |= policy.bit(.down_nodead); // 19: tf_exl3_down_combine_nd (falls back to the storing kernel if absent)
+     std.log.info("request policies on (TF_GLM_POLICY_REQUESTS=1): default 0x{x}, offered 0x{x}", .{ b.default & b.offered, b.offered });
+     return b;
+ }
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index d2855df13..2c3626e0a 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -362,7 +362,7 @@ pub const Buffers = struct {
+             rows * count * 4, pairs * 4, pairs * 4, pairs * 4, // mlog, pick, wts, members
+             experts.maxItems(pairs, count + 1, experts.tile) * 3 * 4, // items (the decode tile's count bounds the prompt's)
+             8,              @max(1, pairs) * 4, hist_len * 4, // counts, rank, hist
+-            pairs * ew * 2, pairs * D * 4,      rows * 2 * sh * 2,
++            pairs * ew * 2, pairs * D * @as(usize, if (prefill and @import("cuda_exl3.zig").eySmall()) 2 else 4), rows * 2 * sh * 2, // eact, ey (U3e: bf16 prompt slot rows), sgu
+             rows * sh * 2,
+             rows * (sh / 64) * 4, rows * D * 4, // sxs, sy
+             rows * D * 2,         rows * D * 2,
+diff --git a/zig/src/families/glm/dflash_block.zig b/zig/src/families/glm/dflash_block.zig
+index fee5f80f5..80ce6ec9f 100644
+--- a/zig/src/families/glm/dflash_block.zig
++++ b/zig/src/families/glm/dflash_block.zig
+@@ -69,12 +69,16 @@ pub fn download(dr: *const Drafter, e: anytype, dst: []u8, src: u64) !void {
+     _ = dr;
+     try e.stream.synchronize();
+     if (e.group) |g| try g.check();
++    if (e.mesh) |m| try m.check(); // policy bit 17's gathers
+     try e.d.check(e.d.api.cuMemcpyDtoH_v2(dst.ptr, src, dst.len), "cuMemcpyDtoH");
+ }
+ 
+ /// Every rank's `bytes` at buf + rank * bytes into every rank's buf, rank order (the engine's gathers' route).
+ fn gather(e: anytype, buf: u64, bytes: usize) !void {
+     if (e.spans.len == 1) return;
++    // policy bit 17 (U2): over the RoCE mesh when it takes the bytes (every rank runs the same request's mask)
++    if (e.mesh) |m| if (@import("policy.zig").on(e.cur.policy, .dflash_mesh) and m.fits(bytes))
++        return m.allGatherBytes(buf + e.share.rank * bytes, buf, bytes, e.stream.handle);
+     if (e.group) |g| return g.allGather(e.stream, buf + e.share.rank * bytes, buf, bytes);
+     try e.lib.check(e.lib.api.ncclAllGather(buf + e.share.rank * bytes, buf, bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
+ }
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+index 3aa430a72..dd48a9f04 100644
+--- a/zig/src/families/glm/policy.zig
++++ b/zig/src/families/glm/policy.zig
+@@ -16,9 +16,21 @@ pub const Bit = enum(u5) {
+     topk_multi_cta = 3, // multi-CTA top-2048 selection
+     owner_rows = 4, // prefill q_a/kv_a (and indexer query) on owner rows, then gather
+     qkva_bypass = 5, // a decode window's [q_a | kv_a] on the replicated projection, not the split slices
++    // the unified-opt run's candidates (night/unified): bits 16-23, each off unless a request (or the default) asks
++    l2pf_v2 = 16, // U1: TF_GLM_L2PF's sites read what the window reads next (proj_dec, q_b, shared expert, head), stop at the gather's end
++    dflash_mesh = 17, // U2: DFlash2's gathers and greedyRows over the RoCE mesh, not NCCL
++    mm8_p2 = 18, // U3a: decode glm_mm8 16/32-row forms with bpairs8_fast and precomputed stage pointers
++    down_nodead = 19, // U3b: tf_exl3_down_combine skips the fp32 slot rows nobody reads
++    lane8_mul1 = 20, // U3c: lane_states8 on the mul1 codebook
++    kw_overlap = 21, // U3d: the indexer key write on the side stream behind the [q_a | kv_a] gather
+ };
+ 
+ pub const reserved: Mask = 0x3f;
++/// The unified run's bits (16-23): offered where their kernels and tables loaded.
++pub const unified: Mask = 0x00ff_0000;
++/// The mask of the forward now running on this rank's thread (set at each forward's start; 0 outside one): the bits
++/// read deep in shared kernel tables (glm_mm's decode table, the EXL3 experts) without threading the mask through.
++pub var live: Mask = 0;
+ 
+ /// Bits a stream uses on its own (rank 0's drafting), not in a forward: a shared forward never mixes over them.
+ pub const per_stream: Mask = 1 << @backingInt(Bit.dflash2_coupled);
+@@ -60,7 +72,7 @@ pub const Boot = struct {
+     /// else the request's mask (or the default), less the bits this boot does not offer.
+     pub fn effective(b: Boot, asked: ?Mask) ?Mask {
+         if (!b.requests) return null;
+-        return (asked orelse b.default) & b.offered & reserved;
++        return (asked orelse b.default) & b.offered & (reserved | unified);
+     }
+ };
+ 
+@@ -106,7 +118,7 @@ test "GLM policy: the accessor, the bits' places and a shared forward's common m
+     const t = std.testing;
+     try t.expectEqual(@as(Mask, 1), bit(.dflash2_coupled));
+     try t.expectEqual(@as(Mask, 0x20), bit(.qkva_bypass));
+-    for (std.enums.values(Bit)) |b| try t.expect(bit(b) & reserved != 0);
++    for (std.enums.values(Bit)) |b| try t.expect(bit(b) & (reserved | unified) != 0);
+     try t.expect(on(0x21, .qkva_bypass) and on(0x21, .dflash2_coupled) and !on(0x21, .router_small));
+     try t.expectEqual(@as(Mask, 0x20), common(&.{ 0x21, 0x30 }));
+     try t.expectEqual(@as(Mask, 0), common(&.{}));
+-- 
+2.43.0
+

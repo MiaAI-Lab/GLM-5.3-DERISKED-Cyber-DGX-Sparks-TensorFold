@@ -1,0 +1,236 @@
+From ceb1b1ec8eda0b128581c568e0e7363b43c0f717 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:14:32 +0200
+Subject: [PATCH] glm_moe_dsa: prompt chunks in two halves, exchanges under
+ compute
+
+A prompt chunk of 2,048 rows or more on the reduce-scatter path runs as
+two halves of rows: each half's mixer and ffn on the main stream, each
+site's exchange of one half on the side stream over a second NCCL
+communicator (ncclCommSplit at start, three ranks or more), so one half's
+exchange runs under the other half's compute and the main stream's own
+collectives (the index split's gathers) never queue behind it. The second
+half attends to the first half's keys of the same layer. Each half keeps
+its own partial room, token lists and residual rows.
+TF_GLM_DSA_HALVES=0 keeps whole chunks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/cuda/nccl.zig                 |   1 +
+ zig/src/families/glm/cuda_engine.zig  |   4 +-
+ zig/src/families/glm/cuda_forward.zig | 118 ++++++++++++++++++++++++--
+ zig/src/families/glm/cuda_native.zig  |   3 +
+ 4 files changed, 116 insertions(+), 10 deletions(-)
+
+diff --git a/zig/src/cuda/nccl.zig b/zig/src/cuda/nccl.zig
+index e422a82..7b4bbbe 100644
+--- a/zig/src/cuda/nccl.zig
++++ b/zig/src/cuda/nccl.zig
+@@ -60,6 +60,7 @@ pub const Api = struct {
+     ncclAllReduce: *const fn (D, D, usize, DataType, RedOp, Comm, abi.Stream) callconv(.c) R,
+     ncclAllGather: *const fn (D, D, usize, DataType, Comm, abi.Stream) callconv(.c) R,
+     ncclReduceScatter: *const fn (D, D, usize, DataType, RedOp, Comm, abi.Stream) callconv(.c) R,
++    ncclCommSplit: *const fn (Comm, c_int, c_int, *Comm, ?*anyopaque) callconv(.c) R,
+     ncclBroadcast: *const fn (D, D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
+     ncclSend: *const fn (D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
+     ncclRecv: *const fn (D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 58887f6..6b12b06 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -89,6 +89,7 @@ pub const Engine = struct {
+     comm: cuda.nccl.Comm,
+     group: ?*const cuda.tp_group.Group = null, // the main stream's all-gathers (RoCE on two ranks); null: lib and comm
+     mesh: ?*@import("cuda_mesh.zig").Mesh = null, // TF_GLM_ROCE_MESH: decode all-gathers by RoCE writes (3+ ranks)
++    side_comm: cuda.nccl.Comm = null, // a prompt chunk's half exchanges on the side stream (fw.wholeDsaHalves), 3+ ranks
+     ce: ?*cuda.ce_push.Push = null, // TF_GLM_CE_EXCHANGE=1: a prompt chunk's split exchanges by copy engines (cuda_ce.zig)
+     images: ?*images_mod.Images = null, // --vision: a prompt pass's image rows (rank 0 encodes, the others receive)
+     packs: mm_mod.Packed = .{}, // the linears packed at load and their bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
+@@ -283,6 +284,7 @@ pub const Engine = struct {
+         e.stream.synchronize() catch {};
+         if (e.side) |x| x.s.synchronize() catch {}; // shared-expert work still in flight reads buffers and weights freed below
+         if (e.mesh) |m| m.deinit();
++        if (e.side_comm != null) _ = e.lib.api.ncclCommDestroy(e.side_comm);
+         e.gpa.free(e.packs.ptrs);
+         e.gpa.free(e.packs.bits);
+         if (e.drafter) |dr| dr.deinit();
+@@ -384,7 +386,7 @@ pub const Engine = struct {
+     }
+ 
+     pub fn exchange(e: *const Engine) fw.Exchange {
+-        return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .group = e.group, .mesh = e.mesh } };
++        return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .group = e.group, .mesh = e.mesh, .side_comm = e.side_comm } };
+     }
+ 
+     pub fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 906cb58..efd6e0a 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -201,7 +201,7 @@ pub const Exchange = union(enum) {
+     local,
+     // group: the main stream's all-gathers through it (RoCE writes for small ones on two ranks); side streams stay raw
+     // mesh: TF_GLM_ROCE_MESH's decode all-gathers by RoCE writes to every peer (cuda_mesh.zig), three ranks or more
+-    nccl: struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, group: ?*const cuda.tp_group.Group = null, mesh: ?*@import("cuda_mesh.zig").Mesh = null },
++    nccl: struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, group: ?*const cuda.tp_group.Group = null, mesh: ?*@import("cuda_mesh.zig").Mesh = null, side_comm: cuda.nccl.Comm = null },
+ };
+ 
+ /// One rank of the forward: its weights, its sequence's caches, the window's buffers.
+@@ -558,24 +558,123 @@ pub const Forward = struct {
+         }
+         const stamp = prof_mod.span(f.prof, f.stream, .all_gather);
+         defer stamp.end();
++        const r = f.ranks[0];
++        try f.scatterRows(f.stream, f.exchange.nccl.comm, r.b.gathered, r.b.gathered + r.w.share.world * r.b.rows * D * 4, r.b.hidden, R);
++    }
++
++    /// The room a reduce-scatter exchange of R rows takes from `part` (fp32 bytes): this rank's partial padded to
++    /// world x per rows (rows past R unread), the scattered sum of its rows, then the bf16 rows every rank gathers.
++    fn scatterBytes(f: *const Forward, R: usize) usize {
++        const D = f.ranks[0].w.config.hidden;
++        const world = f.ranks[0].w.share.world;
++        const per = (R + world - 1) / world;
++        return per * world * D * 4 + per * D * 4 + per * world * D * 2;
++    }
++
++    /// hidden[0..R) += every rank's partial at `part` (R rows, this rank's), on `stream` over `comm`; `end` bounds the room.
++    fn scatterRows(f: *const Forward, stream: cuda.Stream, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, R: usize) !void {
+         const r = f.ranks[0];
+         const n = f.exchange.nccl;
++        const D = r.w.config.hidden;
+         const world = r.w.share.world;
+         const rank = r.w.share.rank;
+         const per = (R + world - 1) / world;
+         const padded = per * world;
+-        // the gathered room (fp32 [world][rows][D]) holds: this rank's partial padded to world x per rows (rows past R
+-        // unread), the scattered sum of its rows, then the bf16 residual rows every rank gathers
+-        const part = r.b.gathered;
+         const recv = part + padded * D * 4;
+         const rows_b16 = recv + per * D * 4;
+-        if (rows_b16 + padded * D * 2 > r.b.gathered + world * r.b.rows * D * 4) return error.ScatterRoom;
+-        try n.lib.check(n.lib.api.ncclReduceScatter(part, recv, per * D, .f32, .sum, n.comm, f.stream.handle), "ncclReduceScatter");
++        if (rows_b16 + padded * D * 2 > end) return error.ScatterRoom;
++        try n.lib.check(n.lib.api.ncclReduceScatter(part, recv, per * D, .f32, .sum, comm, stream.handle), "ncclReduceScatter");
+         const lo = @min(R, rank * per);
+         const mine = @min(R, lo + per) - lo;
+-        if (mine > 0) try glue.residualAdd(f.set(), f.stream, r.b.hidden + lo * D * 2, rows_b16 + rank * per * D * 2, recv, mine, D, 1);
+-        try n.lib.check(n.lib.api.ncclAllGather(rows_b16 + rank * per * D * 2, rows_b16, per * D, .bf16, n.comm, f.stream.handle), "ncclAllGather");
+-        try f.copy(f.stream, r.b.hidden, rows_b16, R * D * 2);
++        if (mine > 0) try glue.residualAdd(f.set(), stream, hidden + lo * D * 2, rows_b16 + rank * per * D * 2, recv, mine, D, 1);
++        try n.lib.check(n.lib.api.ncclAllGather(rows_b16 + rank * per * D * 2, rows_b16, per * D, .bf16, comm, stream.handle), "ncclAllGather");
++        try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(hidden, rows_b16, R * D * 2, stream.handle), "cuMemcpyDtoDAsync");
++    }
++
++    /// TF_GLM_DSA_HALVES (default on): a prompt chunk of 2,048 rows or more on the scatter path runs as two halves of
++    /// rows, each site's exchange of one half on the side stream (its own NCCL communicator) under the other half's
++    /// compute. The second half attends to the first's keys of the same layer (written by the first half's mixer).
++    fn dsaHalves(f: *const Forward, R: usize) bool {
++        if (R < 2048 or !f.dsaScatter(R) or f.pieces == null or f.exchange.nccl.side_comm == null) return false; // (Comm is a nullable handle)
++        const v = std.c.getenv("TF_GLM_DSA_HALVES") orelse return true;
++        return !std.mem.eql(u8, std.mem.span(v), "0");
++    }
++
++    fn wholeDsaHalves(f: *const Forward, R: usize) !void {
++        const r = f.ranks[0];
++        const c = &r.w.config;
++        const D: usize = c.hidden;
++        const b = r.b;
++        const st = r.st;
++        const p = f.pieces.?;
++        const side_comm = f.exchange.nccl.side_comm;
++        const RA = (R / 2 + 63) / 64 * 64;
++        const lo = [2]usize{ 0, RA };
++        const rows = [2]usize{ RA, R - RA };
++        const room_end = b.gathered + r.w.share.world * b.rows * D * 4;
++        const span_bytes = std.mem.alignForward(usize, f.scatterBytes(RA), 256);
++        const pos_b = room_end - 256; // the second half's device position, an i32 in the room's last bytes
++        if (2 * span_bytes + 256 > room_end - b.gathered) return error.ScatterRoom;
++        var add: cuda.Args = .{};
++        add.add(st.pos_dev);
++        add.add(@as(c_int, @intCast(RA)));
++        add.add(pos_b);
++        try cuda.launch.launch(try f.m.ops().function("tf_glm_add_i32"), .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 } }, f.stream, &add);
++        const pos_dev = [2]u64{ st.pos_dev, pos_b };
++        var part: [2]u64 = undefined;
++        var normed: [2]u64 = undefined;
++        var xs: [2]u64 = undefined;
++        var hidden: [2]u64 = undefined;
++        var dsa: [2]dsa_block.Scratch = .{ b.dsa, b.dsa };
++        for (0..2) |h| {
++            part[h] = b.gathered + h * span_bytes;
++            normed[h] = b.normed + lo[h] * D * 2;
++            xs[h] = b.xs + lo[h] * (D / 64) * 4;
++            hidden[h] = b.hidden + lo[h] * D * 2;
++        }
++        // the second half's token lists after the first's (the shared layers reuse each half's own)
++        dsa[1].tokens += RA * sparse.dsa_width * 4;
++        dsa[1].counts += RA * 4;
++        var di: usize = 0;
++        for (r.w.layers, 0..) |l, j| {
++            prof_mod.context(f.prof, j, null, .mixer);
++            const a = l.mixer.mla;
++            const k: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof, .split = f.indexSplit(r) };
++            for (0..2) |h| {
++                if (j > 0) try f.stream.wait(p.gathered[h]); // this half's ffn exchange of the layer before
++                try glue.rmsnormBy(f.set(), f.stream, hidden[h], D, l.in_norm, normed[h], D, xs[h], c.eps, rows[h], D);
++                const nch = @min(latent.chunksFor(st.pos + lo[h] + rows[h]), b.nch);
++                try dsa_block.body(k, f.stream, a, st.caches[di], dsa[h], normed[h], D, rows[h], pos_dev[h], st.pos + lo[h], nch, b.part_rows);
++                try dsa_block.fill(f.set(), f.stream, a, dsa[h], 0, rows[h], part[h]);
++                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h]);
++            }
++            prof_mod.context(f.prof, j, null, .ffn);
++            for (0..2) |h| {
++                try f.stream.wait(p.gathered[h]);
++                try glue.rmsnormBy(f.set(), f.stream, hidden[h], D, l.post_norm, normed[h], D, xs[h], c.eps, rows[h], D);
++                switch (l.ffn) {
++                    .dense => |m| {
++                        try mlp.body(f.mlpKernels(), f.stream, m, b.dense, normed[h], D, rows[h], true);
++                        try mlp.fill(f.mlpKernels(), f.stream, m, b.dense, 0, rows[h], true, part[h]);
++                    },
++                    .moe => |m| {
++                        try moe.body(f.moeKernels(), f.stream, m, b.moe, normed[h], D, rows[h], true);
++                        try moe.fill(f.moeKernels(), f.stream, m, b.moe, normed[h], D, 0, rows[h], true, part[h]);
++                    },
++                }
++                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h]);
++            }
++            di += 1;
++        }
++        for (0..2) |h| try f.stream.wait(p.gathered[h]);
++    }
++
++    /// Half h's exchange on the side stream after the main stream's work so far; p.gathered[h] marks it done.
++    fn sideExchange(f: *const Forward, p: *const Pieces, h: usize, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, rows: usize) !void {
++        try p.filled[h].record(f.stream);
++        try p.side.wait(p.filled[h]);
++        try f.scatterRows(p.side, comm, part, end, hidden, rows);
++        try p.gathered[h].record(p.side);
+     }
+ 
+     /// whole()'s glm_moe_dsa form: one bf16 residual stream in b.hidden (no mHC streams, no stream mean).
+@@ -585,6 +684,7 @@ pub const Forward = struct {
+         const D = c.hidden;
+         const pf = f.prefetch();
+         if (f.taps != null) return error.DsaTaps;
++        if (f.dsaHalves(R)) return f.wholeDsaHalves(R);
+         var di: usize = 0;
+         for (f.ranks[0].w.layers, 0..) |_, j| {
+             prof_mod.context(f.prof, j, null, .mixer);
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index ff4f835..22a8769 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -237,6 +237,9 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
+     const cap = capacity(o.context);
+     own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .drafts = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null });
+     errdefer own.e.deinit();
++    // three ranks or more: a second communicator for a prompt chunk's half exchanges on the side stream, so the main
++    // stream's own collectives (the index split's gathers) never queue behind them (every rank splits, or none can)
++    if (p.world >= 3) try own.group.lib.check(own.group.lib.api.ncclCommSplit(own.group.comm, 0, @intCast(p.rank), &own.e.side_comm, null), "ncclCommSplit");
+     if (o.vision) |lim| { // before the rooms: the tower's bytes count against rank 0's
+         var problem: []const u8 = "";
+         const ql: cuda.qlinear.Linear = .{ .lane = &own.e.m.lane, .nvfp4_prompt = &own.e.m.prompt }; // the tower's MXFP8, NVFP4
+-- 
+2.43.0
+

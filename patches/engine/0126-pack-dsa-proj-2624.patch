@@ -1,0 +1,31 @@
+From e9ba7fbc67f1c3612391a40c869d9987d3235314 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:29:09 +0200
+Subject: [PATCH] 0305: pack glm_moe_dsa's [q_a | kv_a] proj at its real 2624
+ rows
+
+linears() sized the fused proj q_lora + lw (2560): on glm_moe_dsa the kv_a
+half ends in a 64-wide rope plane, so 64 rows were truncated from the pack,
+the buffer compacted short, and the n=2624 matmul read codes and scales past
+the end (CUDA_ERROR_ILLEGAL_ADDRESS on every rank's first attention layer).
+Flash is unchanged: its rope is 0.
+---
+ zig/src/families/glm/cuda_tile.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_tile.zig b/zig/src/families/glm/cuda_tile.zig
+index 606276a..a97bf32 100644
+--- a/zig/src/families/glm/cuda_tile.zig
++++ b/zig/src/families/glm/cuda_tile.zig
+@@ -39,7 +39,7 @@ fn layerLinears(gpa: std.mem.Allocator, l: *Layer, list: *std.ArrayList(Lin)) !v
+             try addProj(list, gpa, &x.o, x.dims, n);
+         },
+         .mla => |*x| {
+-            try addProj(list, gpa, &x.proj, x.q_lora + x.lw, x.dims);
++            try addProj(list, gpa, &x.proj, x.q_lora + x.lw + x.rope, x.dims);
+             try addProj(list, gpa, &x.q_b, x.heads * x.qk, x.q_lora);
+             try addProj(list, gpa, &x.index.kw, x.index.d + x.index.heads, x.dims);
+             try addProj(list, gpa, &x.index.qb, x.index.heads * x.index.d, x.q_lora);
+-- 
+2.43.0
+

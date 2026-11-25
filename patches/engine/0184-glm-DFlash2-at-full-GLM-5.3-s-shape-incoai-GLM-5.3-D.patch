@@ -1,0 +1,818 @@
+From 18a99c631ce2f2d7aff35a91f93ae0c89804467e Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 08:21:10 +0200
+Subject: [PATCH 184/185] glm: DFlash2 at full GLM-5.3's shape
+ (incoai/GLM-5.3-DFlash2) on glm_moe_dsa
+
+The drafter's shape is read from its config.json: GLM-5.3-Flash's (D 4096, 5 layers, 32 query heads, the 4-stream
+mean taps after 5/14/24/33/42, theta 1e4; the old constants) or full GLM-5.3's (D 6144, 6 layers, 64 query heads of
+128 over 8 KV heads, q wider than D, conv kernel projections 1536 rows, fc 6 x 6144 wide, theta 1e6, taps after layers
+5/19/33/47/61/75 of glm_moe_dsa's one residual stream). glm_dflash.cu's width-dependent kernels (block_qkv, conv,
+attn_part, attn_merge, sumn) are templates: df_* at the Flash shape (bit-identical to before on a GPU check), dg_* at
+the full one. Taps take a layer list (DSpark's by default); the prompt path taps and ingests DSA chunks for any drafter
+that taps the one stream (dsaTaps). A drafter whose shape does not match the target is refused.
+
+Credits: the drafter is Inco AI's DFlash2 for GLM-5.3 (https://huggingface.co/incoai/GLM-5.3-DFlash2, revision
+8f02251dc71a9da2053dfc15bfa293fbee5579b0, Apache-2.0), read unmodified from its BF16 safetensors and quantized in device
+memory at load; no converted copy is written. The DFlash architecture is Z Lab's (https://github.com/z-lab/dflash, MIT).
+The engine side extends the Zig DFlash2 drafter authored by Ash Hart (@ashhart) and the TensorFold contributors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/glm_dflash_host.zig               |  66 ++++++++++++++
+ zig/kernels/cuda/glm_dflash.cu        |  80 +++++++++++------
+ zig/src/families/glm/cuda.zig         |   1 +
+ zig/src/families/glm/cuda_engine.zig  |   4 +-
+ zig/src/families/glm/cuda_taps.zig    |  21 +++--
+ zig/src/families/glm/dflash.zig       |  81 ++++++++++++++++--
+ zig/src/families/glm/dflash_block.zig |  21 ++---
+ zig/src/families/glm/dflash_load.zig  | 119 ++++++++++++++++++--------
+ 8 files changed, 305 insertions(+), 88 deletions(-)
+
+diff --git a/zig/glm_dflash_host.zig b/zig/glm_dflash_host.zig
+index d59d55d18..3cdc4698f 100644
+--- a/zig/glm_dflash_host.zig
++++ b/zig/glm_dflash_host.zig
+@@ -121,3 +121,69 @@ test "glm dflash: every loaded symbol has a measured launch record" {
+         try t.expect(found);
+     }
+ }
++
++const flash_config =
++    \\{"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"mask_token_id":154856,"selector_rank":256,
++    \\"selector_top_k":16,"target_layer_ids":[5,14,24,33,42]},"head_dim":128,"hidden_size":4096,"intermediate_size":12288,
++    \\"num_attention_heads":32,"num_hidden_layers":5,"num_key_value_heads":8,"num_target_layers":45,
++    \\"rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},"sliding_window":2048,"vocab_size":154880}
++;
++const full_config =
++    \\{"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"mask_token_id":154856,"selector_rank":256,
++    \\"selector_top_k":16,"target_layer_ids":[5,19,33,47,61,75]},"head_dim":128,"hidden_size":6144,"intermediate_size":12288,
++    \\"num_attention_heads":64,"num_hidden_layers":6,"num_key_value_heads":8,"num_target_layers":78,
++    \\"rope_parameters":{"rope_theta":1000000,"rope_type":"default"},"sliding_window":2048,"vocab_size":154880}
++;
++
++fn shapeFrom(text: []const u8) !glm.dflash.Shape {
++    const p = try std.json.parseFromSlice(std.json.Value, t.allocator, text, .{});
++    defer p.deinit();
++    return glm.dflash_load.shapeOf(p.value);
++}
++
++test "glm dflash: the two checkpoints' configs pick their shapes; a mixed one is refused" {
++    const df = glm.dflash;
++    const a = try shapeFrom(flash_config);
++    try t.expectEqual(df.D, a.d);
++    try t.expectEqual(df.LAYERS, a.layers);
++    try t.expectEqual(df.QH, a.qh);
++    try t.expect(!a.dsa);
++    try t.expectEqual(df.QKV, a.qkv()); // the Flash shape is the constants it always had
++    try t.expectEqual(df.TAP_ROW, a.tapRow());
++    try t.expectEqual(df.ring_bytes, a.ringBytes());
++    try t.expectEqual(df.KVW, a.dynw()); // its conv projection's 1024 rows
++    const b = try shapeFrom(full_config);
++    try t.expectEqual(@as(usize, 6144), b.d);
++    try t.expectEqual(@as(usize, 6), b.layers);
++    try t.expectEqual(@as(usize, 8192), b.qw()); // 64 heads x 128: wider than D
++    try t.expectEqual(@as(usize, 8192 + 2048), b.qkv());
++    try t.expectEqual(@as(usize, 1536), b.dynw()); // kernel_projection [1536, 6144]
++    try t.expectEqual(@as(usize, 6 * 6144 * 2), b.tapRow()); // fc [6144, 36864]
++    try t.expect(b.dsa);
++    try t.expectEqualSlices(usize, &.{ 5, 19, 33, 47, 61, 75 }, b.taps);
++    try t.expect(b.ringBytes() <= df.max_ring_bytes);
++    // the full shape's fields with the Flash taps, or 32 heads: refused
++    const bad = [_][2][]const u8{ .{ "[5,19,33,47,61,75]", "[5,14,24,33,42]" }, .{ "\"num_attention_heads\":64", "\"num_attention_heads\":32" }, .{ "1000000", "10000.0" } };
++    for (bad) |r| {
++        const text = try std.mem.replaceOwned(u8, t.allocator, full_config, r[0], r[1]);
++        defer t.allocator.free(text);
++        try t.expectError(error.DrafterConfigUnexpected, shapeFrom(text));
++    }
++}
++
++test "glm dflash: the full shape's raw scratch holds its 4-bit linears (fc 6 x 6144 wide, qkv 10240 rows, o 8192 wide)" {
++    const df = glm.dflash;
++    const s = df.full;
++    for (1..17) |world| {
++        const ff = df.mlpSplit(world).ff;
++        const linears = [_][2]usize{ .{ s.qkv(), s.d }, .{ 2 * df.KVW, s.d }, .{ s.d, s.qw() }, .{ 2 * ff, s.d }, .{ s.dynw(), s.d }, .{ s.d, s.taps.len * s.d } };
++        for (linears) |shape| {
++            const nk = shape[0] * shape[1];
++            const need = std.mem.alignForward(usize, nk / 2, 256) + std.mem.alignForward(usize, nk / 32, 256) + nk / 32;
++            try t.expect(need <= df.rawBytesFor(s, 4, world));
++            // the 32-group scratch (TF_GLM_DFLASH2_Q32): scales and biases twice as many
++            const need32 = std.mem.alignForward(usize, nk / 2, 256) + std.mem.alignForward(usize, nk / 16, 256) + nk / 16;
++            try t.expect(need32 <= df.rawBytesFor(s, 4, world));
++        }
++    }
++}
+diff --git a/zig/kernels/cuda/glm_dflash.cu b/zig/kernels/cuda/glm_dflash.cu
+index 18c679bf0..db1169fec 100644
+--- a/zig/kernels/cuda/glm_dflash.cu
++++ b/zig/kernels/cuda/glm_dflash.cu
+@@ -1,4 +1,6 @@
+ // DFlash2 drafter kernels (ours, after z-lab/dflash, MIT): taps, norms+rope, convs, SwiGLU, ring and block attention.
++// The width-dependent kernels are templates on the hidden size and query heads: df_* at GLM-5.3-Flash DFlash2's shape
++// (D 4096, 32 query heads), dg_* at full GLM-5.3 DFlash2's (incoai/GLM-5.3-DFlash2: D 6144, 64 query heads).
+ 
+ #include <cuda_bf16.h>
+ #include <stdint.h>
+@@ -12,7 +14,6 @@ constexpr int KVW = KVH * HD;  // 1024
+ constexpr int WIN = 2048;      // the sliding window (and the ring's slots)
+ constexpr int BLOCK = 8;
+ constexpr int GROUP = 16;  // channels sharing one dynamic tap weight
+-constexpr int GROUPS = D / GROUP;
+ constexpr int CH = 16;  // key chunks of the chunked attention (df_attn_part: a block a kv head and chunk)
+ 
+ __device__ __forceinline__ float bf(__nv_bfloat16 x) { return __bfloat162float(x); }
+@@ -61,23 +62,30 @@ extern "C" __global__ void df_tap(const __nv_bfloat16* __restrict__ x, __nv_bflo
+ }
+ 
+ // The block's queries (fused qkv, stride ldq) normed and rotated at pos[r] into q, keys into kb, values into vb.
+-extern "C" __global__ void df_block_qkv(const __nv_bfloat16* __restrict__ qkv, int ldq, const __nv_bfloat16* __restrict__ qn,
++template <int TD, int TQH>
++__device__ __forceinline__ void block_qkv_t(const __nv_bfloat16* __restrict__ qkv, int ldq, const __nv_bfloat16* __restrict__ qn,
+                                         const __nv_bfloat16* __restrict__ kn, const int* __restrict__ pos, float eps, float theta,
+                                         __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ kb, __nv_bfloat16* __restrict__ vb) {
+     __shared__ float red[2];
+     const int r = blockIdx.x, h = blockIdx.y;
+     const __nv_bfloat16* row = qkv + (long long)r * ldq;
+-    if (h < QH) {
+-        normRope(row + h * HD, qn, eps, pos[r], theta, q + (long long)r * QH * HD + h * HD, red);
++    if (h < TQH) {
++        normRope(row + h * HD, qn, eps, pos[r], theta, q + (long long)r * TQH * HD + h * HD, red);
+     } else {
+-        const int kh = h - QH;
+-        normRope(row + QH * HD + kh * HD, kn, eps, pos[r], theta, kb + (long long)r * KVW + kh * HD, red);
+-        const __nv_bfloat16* v = row + QH * HD + KVW + kh * HD;
++        const int kh = h - TQH;
++        normRope(row + TQH * HD + kh * HD, kn, eps, pos[r], theta, kb + (long long)r * KVW + kh * HD, red);
++        const __nv_bfloat16* v = row + TQH * HD + KVW + kh * HD;
+         __nv_bfloat16* vo = vb + (long long)r * KVW + kh * HD;
+         vo[threadIdx.x] = v[threadIdx.x];
+         vo[threadIdx.x + 64] = v[threadIdx.x + 64];
+     }
+ }
++extern "C" __global__ void df_block_qkv(const __nv_bfloat16* __restrict__ qkv, int ldq, const __nv_bfloat16* __restrict__ qn,
++                                        const __nv_bfloat16* __restrict__ kn, const int* __restrict__ pos, float eps, float theta,
++                                        __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ kb, __nv_bfloat16* __restrict__ vb) { block_qkv_t<4096, 32>(qkv, ldq, qn, kn, pos, eps, theta, q, kb, vb); }
++extern "C" __global__ void dg_block_qkv(const __nv_bfloat16* __restrict__ qkv, int ldq, const __nv_bfloat16* __restrict__ qn,
++                                        const __nv_bfloat16* __restrict__ kn, const int* __restrict__ pos, float eps, float theta,
++                                        __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ kb, __nv_bfloat16* __restrict__ vb) { block_qkv_t<6144, 64>(qkv, ldq, qn, kn, pos, eps, theta, q, kb, vb); }
+ 
+ // Context rows' keys and values (k | v) normed, rotated at pos[r], into rings[r] at slot pos % WIN of ``layer``.
+ extern "C" __global__ void df_ctx_kv(const __nv_bfloat16* __restrict__ kv, const __nv_bfloat16* __restrict__ kn,
+@@ -95,18 +103,23 @@ extern "C" __global__ void df_ctx_kv(const __nv_bfloat16* __restrict__ kv, const
+ }
+ 
+ // Two-tap dynamic causal conv over a block: y[t] = sum_o (base[o] + dyn[t][o][c / 16]) * z[t - o]; add or store.
+-extern "C" __global__ void df_conv(const __nv_bfloat16* __restrict__ z, const __nv_bfloat16* __restrict__ dyn, int which,
++template <int TD, int TQH>
++__device__ __forceinline__ void conv_t(const __nv_bfloat16* __restrict__ z, const __nv_bfloat16* __restrict__ dyn, int which,
+                                    const __nv_bfloat16* __restrict__ base, __nv_bfloat16* __restrict__ out, int add) {
+     const int r = blockIdx.x, t = r % BLOCK;
+-    const __nv_bfloat16* dr = dyn + (long long)r * 4 * GROUPS + which * 2 * GROUPS;
++    const __nv_bfloat16* dr = dyn + (long long)r * 4 * (TD / GROUP) + which * 2 * (TD / GROUP);
+     for (int c = blockIdx.y * 1024 + threadIdx.x; c < (blockIdx.y + 1) * 1024; c += blockDim.x) {
+         const int g = c / GROUP;
+-        float y = (bf(base[c]) + bf(dr[g])) * bf(z[(long long)r * D + c]);
+-        if (t > 0) y += (bf(base[D + c]) + bf(dr[GROUPS + g])) * bf(z[(long long)(r - 1) * D + c]);
+-        __nv_bfloat16* o = out + (long long)r * D + c;
++        float y = (bf(base[c]) + bf(dr[g])) * bf(z[(long long)r * TD + c]);
++        if (t > 0) y += (bf(base[TD + c]) + bf(dr[(TD / GROUP) + g])) * bf(z[(long long)(r - 1) * TD + c]);
++        __nv_bfloat16* o = out + (long long)r * TD + c;
+         *o = add ? tobf(bf(*o) + bf(tobf(y))) : tobf(y);
+     }
+ }
++extern "C" __global__ void df_conv(const __nv_bfloat16* __restrict__ z, const __nv_bfloat16* __restrict__ dyn, int which,
++                                   const __nv_bfloat16* __restrict__ base, __nv_bfloat16* __restrict__ out, int add) { conv_t<4096, 32>(z, dyn, which, base, out, add); }
++extern "C" __global__ void dg_conv(const __nv_bfloat16* __restrict__ z, const __nv_bfloat16* __restrict__ dyn, int which,
++                                   const __nv_bfloat16* __restrict__ base, __nv_bfloat16* __restrict__ out, int add) { conv_t<6144, 64>(z, dyn, which, base, out, add); }
+ 
+ // SwiGLU over [gate | up] rows (width F each): bf16(bf16(silu(g)) * u). grid (R, F / 1024), 256 threads.
+ extern "C" __global__ void df_swiglu(const __nv_bfloat16* __restrict__ gu, __nv_bfloat16* __restrict__ out, int F) {
+@@ -176,7 +189,8 @@ extern "C" __global__ void __launch_bounds__(256) df_attn(const __nv_bfloat16* _
+ }
+ 
+ // df_attn split over CH key chunks (running max, sum, fp32 output), merged by df_attn_merge: not latency-bound.
+-extern "C" __global__ void __launch_bounds__(256) df_attn_part(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kb,
++template <int TD, int TQH>
++__device__ __forceinline__ void attn_part_t(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kb,
+         const __nv_bfloat16* __restrict__ vb, const uint64_t* __restrict__ rings, const long long* __restrict__ starts,
+         const long long* __restrict__ froms, int layer, float scale, float* __restrict__ pm, float* __restrict__ pl,
+         float* __restrict__ pacc) {
+@@ -190,9 +204,9 @@ extern "C" __global__ void __launch_bounds__(256) df_attn_part(const __nv_bfloat
+     const long long n_ctx = start > lo ? start - lo : 0;
+     const long long T = n_ctx + BLOCK, L = (T + CH - 1) / CH;
+     const long long n0 = (long long)c * L, n1 = n0 + L < T ? n0 + L : T;
+-    float qv[4][4], m[4], l[4], acc[4][4];
+-    for (int h = 0; h < 4; ++h) {
+-        const __nv_bfloat16* qh = q + (long long)r * QH * HD + (kh * 4 + h) * HD + lane * 4;
++    float qv[TQH / KVH][4], m[TQH / KVH], l[TQH / KVH], acc[TQH / KVH][4];
++    for (int h = 0; h < TQH / KVH; ++h) {
++        const __nv_bfloat16* qh = q + (long long)r * TQH * HD + (kh * (TQH / KVH) + h) * HD + lane * 4;
+         for (int i = 0; i < 4; ++i) qv[h][i] = bf(qh[i]) * scale;
+         m[h] = -INFINITY;
+         l[h] = 0.f;
+@@ -216,7 +230,7 @@ extern "C" __global__ void __launch_bounds__(256) df_attn_part(const __nv_bfloat
+             kf[i] = bf(kr[i]);
+             vf[i] = bf(vr[i]);
+         }
+-        for (int h = 0; h < 4; ++h) {
++        for (int h = 0; h < TQH / KVH; ++h) {
+             float d = qv[h][0] * kf[0] + qv[h][1] * kf[1] + qv[h][2] * kf[2] + qv[h][3] * kf[3];
+             for (int off = 16; off > 0; off >>= 1) d += __shfl_xor_sync(0xffffffffu, d, off);
+             const float mn = fmaxf(m[h], d);
+@@ -226,8 +240,8 @@ extern "C" __global__ void __launch_bounds__(256) df_attn_part(const __nv_bfloat
+             m[h] = mn;
+         }
+     }
+-    for (int h = 0; h < 4; ++h) {
+-        const long long at = ((long long)r * QH + kh * 4 + h) * CH + c;
++    for (int h = 0; h < TQH / KVH; ++h) {
++        const long long at = ((long long)r * TQH + kh * (TQH / KVH) + h) * CH + c;
+         float* pa = pacc + at * HD + lane * 4;
+         for (int i = 0; i < 4; ++i) pa[i] = acc[h][i];
+         if (lane == 0) {
+@@ -236,12 +250,21 @@ extern "C" __global__ void __launch_bounds__(256) df_attn_part(const __nv_bfloat
+         }
+     }
+ }
++extern "C" __global__ void __launch_bounds__(256) df_attn_part(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kb,
++        const __nv_bfloat16* __restrict__ vb, const uint64_t* __restrict__ rings, const long long* __restrict__ starts,
++        const long long* __restrict__ froms, int layer, float scale, float* __restrict__ pm, float* __restrict__ pl,
++        float* __restrict__ pacc) { attn_part_t<4096, 32>(q, kb, vb, rings, starts, froms, layer, scale, pm, pl, pacc); }
++extern "C" __global__ void __launch_bounds__(256) dg_attn_part(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kb,
++        const __nv_bfloat16* __restrict__ vb, const uint64_t* __restrict__ rings, const long long* __restrict__ starts,
++        const long long* __restrict__ froms, int layer, float scale, float* __restrict__ pm, float* __restrict__ pl,
++        float* __restrict__ pacc) { attn_part_t<6144, 64>(q, kb, vb, rings, starts, froms, layer, scale, pm, pl, pacc); }
+ 
+ // The chunks' partials of row r, head h into o[r][h] (bf16). grid (R, QH), 128 threads (a thread a dim).
+-extern "C" __global__ void df_attn_merge(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
++template <int TD, int TQH>
++__device__ __forceinline__ void attn_merge_t(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
+                                          __nv_bfloat16* __restrict__ o) {
+     const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+-    const long long base = ((long long)r * QH + h) * CH;
++    const long long base = ((long long)r * TQH + h) * CH;
+     float m = -INFINITY;
+     for (int c = 0; c < CH; ++c) m = fmaxf(m, pm[base + c]);
+     float l = 0.f, a = 0.f;
+@@ -250,8 +273,12 @@ extern "C" __global__ void df_attn_merge(const float* __restrict__ pm, const flo
+         l += pl[base + c] * w;
+         a += pacc[(base + c) * HD + d] * w;
+     }
+-    o[(long long)r * QH * HD + h * HD + d] = tobf(a / l);
++    o[(long long)r * TQH * HD + h * HD + d] = tobf(a / l);
+ }
++extern "C" __global__ void df_attn_merge(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
++                                         __nv_bfloat16* __restrict__ o) { attn_merge_t<4096, 32>(pm, pl, pacc, o); }
++extern "C" __global__ void dg_attn_merge(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
++                                         __nv_bfloat16* __restrict__ o) { attn_merge_t<6144, 64>(pm, pl, pacc, o); }
+ 
+ // x += y (bf16 rows of D). grid (R, D / 1024), 256 threads.
+ extern "C" __global__ void df_add(__nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ y) {
+@@ -264,15 +291,18 @@ extern "C" __global__ void df_add(__nv_bfloat16* __restrict__ x, const __nv_bflo
+ // The split down's fp32 partials g[world][R][D] summed in rank order into bf16 out[R][D]: rank 0's, plus rank 1's,
+ // plus ... (at world 2 the one add df_sum2 did), so every rank holds the same sum and a world's choice moves no bit
+ // that a two-rank sum would not.
+-extern "C" __global__ void df_sumn(const float* __restrict__ g, __nv_bfloat16* __restrict__ out, int R, int world) {
++template <int TD, int TQH>
++__device__ __forceinline__ void sumn_t(const float* __restrict__ g, __nv_bfloat16* __restrict__ out, int R, int world) {
+     const long long r = blockIdx.x;
+     for (int c = blockIdx.y * 1024 + threadIdx.x; c < (blockIdx.y + 1) * 1024; c += blockDim.x) {
+-        const long long i = r * D + c;
++        const long long i = r * TD + c;
+         float s = g[i];
+-        for (int k = 1; k < world; ++k) s += g[(long long)k * R * D + i];
++        for (int k = 1; k < world; ++k) s += g[(long long)k * R * TD + i];
+         out[i] = tobf(s);
+     }
+ }
++extern "C" __global__ void df_sumn(const float* __restrict__ g, __nv_bfloat16* __restrict__ out, int R, int world) { sumn_t<4096, 32>(g, out, R, world); }
++extern "C" __global__ void dg_sumn(const float* __restrict__ g, __nv_bfloat16* __restrict__ out, int R, int world) { sumn_t<6144, 64>(g, out, R, world); }
+ 
+ // A rank's 16 largest logits a head row as global ids and fp32 values: per-chunk part, then merge; ties keep low id.
+ namespace {
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index d09f2e6c7..83ed4280f 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -110,6 +110,7 @@ pub const tool_draft = @import("tool_draft.zig");
+ pub const tool_carrier = @import("tool_carrier.zig");
+ pub const dflash_candidates = @import("dflash_candidates.zig");
+ pub const dflash_load_owner = @import("dflash_load_owner.zig");
++pub const dflash_load = @import("dflash_load.zig");
+ 
+ pub const prompts = @import("cuda_prompts.zig");
+ pub const prompt_hold = @import("cuda_prompt_hold.zig");
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 62637ffd2..2646e2910 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -543,7 +543,7 @@ pub const Engine = struct {
+             f.ce = null;
+             if (e.kv_ctx.counts) |c| c.owner_prompts += 1;
+         }
+-        const spark = if (e.drafter) |dr| dr.spark != null else false; // DSpark taps glm_moe_dsa's one stream (dflash2 can't)
++        const spark = if (e.drafter) |dr| dr.dsaTaps() else false; // DSpark and full GLM-5.3's DFlash2 tap glm_moe_dsa's one stream (the Flash DFlash2 can't)
+         if (e.tap_dump == null and ((e.c.dsa and !spark) or start + rows <= len -| @as(usize, @intCast(dflash.WIN)))) f.taps = null; // none read (dflash.promptRun)
+         const as_i32: []const i32 = @ptrCast(part);
+         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
+@@ -574,7 +574,7 @@ pub const Engine = struct {
+         if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..]);
+         stamp.end();
+         stamp = prof_mod.span(f.prof, e.stream, .drafter);
+-        if (e.drafter) |dr| if (!e.c.dsa or dr.spark != null) try dr.prompt(e, e.slot, start, rows, len); // DFlash2 can't tap glm_moe_dsa's one stream; DSpark does
++        if (e.drafter) |dr| if (!e.c.dsa or dr.dsaTaps()) try dr.prompt(e, e.slot, start, rows, len); // the Flash DFlash2 can't tap glm_moe_dsa's one stream; DSpark and the full DFlash2 do
+         if (e.drafter) |dr| if (start + rows == len) try dr.ringDigest(e, e.slot, len);
+         stamp.end();
+         stamp = prof_mod.span(f.prof, e.stream, .draw);
+diff --git a/zig/src/families/glm/cuda_taps.zig b/zig/src/families/glm/cuda_taps.zig
+index 03ed574d3..7ff0007f6 100644
+--- a/zig/src/families/glm/cuda_taps.zig
++++ b/zig/src/families/glm/cuda_taps.zig
+@@ -18,28 +18,39 @@ pub fn slot(j: usize) ?i32 {
+ /// are layer INPUTS, so the residual after 0-based layers 1, 19, 38, 57, 74, in tap-slot order.
+ pub const dsa_layers = [_]usize{ 1, 19, 38, 57, 74 };
+ 
++/// Full GLM-5.3's DFlash2 (incoai/GLM-5.3-DFlash2): target_layer_ids 5, 19, 33, 47, 61, 75, the residual after each
++/// 0-based layer (the Flash drafter's convention, z-lab's hidden_states[id + 1]), on glm_moe_dsa's one stream.
++pub const full_layers = [_]usize{ 5, 19, 33, 47, 61, 75 };
++
+ /// Layer `j`'s DSA tap slot, or null.
+ pub fn dsaSlot(j: usize) ?usize {
+-    for (dsa_layers, 0..) |l, i| if (l == j) return i;
++    return slotIn(&dsa_layers, j);
++}
++
++/// Layer `j`'s slot in `list`, or null.
++pub fn slotIn(list: []const usize, j: usize) ?usize {
++    for (list, 0..) |l, i| if (l == j) return i;
+     return null;
+ }
+ 
+ /// Where a forward's taps go: rows [R][5 * hidden] bf16 at `out`, through glm_dflash's df_tap; or (`dsa` > 0, the
+-/// hidden size of glm_moe_dsa's one residual stream) each tapped layer's whole rows copied into their slot of
+-/// [R][5 * dsa] bf16 (a strided device copy: no mean, no norm).
++/// hidden size of glm_moe_dsa's one residual stream) each tapped layer of `layer_list` (DSpark's by default) whole rows
++/// copied into their slot of [R][layer_list.len * dsa] bf16 (a strided device copy: no mean, no norm).
+ pub const Taps = struct {
+     f: cuda.Function,
+     out: u64,
+     dsa: usize = 0,
++    layer_list: []const usize = &dsa_layers,
+ 
+     /// After layer `j` (nothing off the tapped layers): rows lo..lo + n of residual `x` (bf16 [rows][4][hidden], or
+     /// on the dsa [rows][dsa]).
+     pub fn at(t: Taps, s: cuda.Stream, j: usize, x: u64, lo: usize, n: usize) !void {
+         if (t.dsa != 0) {
+-            const k = dsaSlot(j) orelse return;
++            const k = slotIn(t.layer_list, j) orelse return;
+             if (n == 0) return;
+             const row = t.dsa * 2;
+-            const p: cuda.abi.Memcpy2D = .{ .src = x + lo * row, .src_pitch = row, .dst = t.out + lo * dsa_layers.len * row + k * row, .dst_pitch = dsa_layers.len * row, .width = row, .height = n };
++            const nl = t.layer_list.len;
++            const p: cuda.abi.Memcpy2D = .{ .src = x + lo * row, .src_pitch = row, .dst = t.out + lo * nl * row + k * row, .dst_pitch = nl * row, .width = row, .height = n };
+             return s.d.check(s.d.api.cuMemcpy2DAsync_v2(&p, s.handle), "cuMemcpy2DAsync");
+         }
+         const k = slot(j) orelse return;
+diff --git a/zig/src/families/glm/dflash.zig b/zig/src/families/glm/dflash.zig
+index fa3f924ed..99a030b59 100644
+--- a/zig/src/families/glm/dflash.zig
++++ b/zig/src/families/glm/dflash.zig
+@@ -1,4 +1,6 @@
+-//! DFlash2 drafts (--drafter): incoai/GLM-5.3-Flash-DFlash2 (CC BY-NC-ND 4.0, read unmodified), after z-lab (MIT).
++//! DFlash2 drafts (--drafter): incoai/GLM-5.3-Flash-DFlash2 (CC BY-NC-ND 4.0, read unmodified), after z-lab (MIT), and
++//! at full GLM-5.3's size incoai/GLM-5.3-DFlash2 on glm_moe_dsa (Shape `full`: D 6144, 6 layers, 64 query heads, taps
++//! after layers 5, 19, 33, 47, 61, 75 of the one residual stream).
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const mm = @import("cuda_mm.zig");
+@@ -32,10 +34,43 @@ pub const MAX_CTX: usize = 4096; // context rows one ingest takes (a prompt chun
+ pub const STEP_ROWS: usize = 32; // a verify's tap rows (the shared windows' rows at most)
+ pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's taps
+ 
++/// A DFlash2 checkpoint's shape: GLM-5.3-Flash's (`flash`, the constants above) or full GLM-5.3's (`full`). Head dim,
++/// KV heads, FF, block, window, selector and vocabulary are the same in both.
++pub const Shape = struct {
++    d: usize, // hidden size (the target's)
++    layers: usize,
++    qh: usize, // query heads of HD
++    theta: f32,
++    taps: []const usize, // the target layers tapped, in tap-slot order ("after layer j")
++    dsa: bool, // the target is glm_moe_dsa: one residual stream, whole rows copied (no 4-stream mean)
++    target_layers: usize, // the config's num_target_layers
++
++    pub fn qw(s: Shape) usize {
++        return s.qh * HD;
++    }
++    pub fn qkv(s: Shape) usize {
++        return s.qw() + 2 * KVW;
++    }
++    /// The conv kernel projection's rows: 2 convs x 2 taps x D / 16 groups.
++    pub fn dynw(s: Shape) usize {
++        return 4 * (s.d / 16);
++    }
++    pub fn tapRow(s: Shape) usize {
++        return s.taps.len * s.d * 2;
++    }
++    pub fn ringBytes(s: Shape) u64 {
++        return s.layers * 2 * @as(u64, @intCast(WIN)) * KVW * 2;
++    }
++};
++pub const flash: Shape = .{ .d = D, .layers = LAYERS, .qh = QH, .theta = THETA, .taps = &taps_mod.layers, .dsa = false, .target_layers = 45 };
++pub const full: Shape = .{ .d = 6144, .layers = 6, .qh = 64, .theta = 1e6, .taps = &taps_mod.full_layers, .dsa = true, .target_layers = 78 };
++pub const MAX_LAYERS: usize = 6;
++
+ /// Device bytes a stream's context ring takes (K and V of every layer).
+-pub const ring_bytes: u64 = LAYERS * 2 * @as(u64, @intCast(WIN)) * KVW * 2;
+-/// The larger ring of the two block drafters (DSpark's on glm_moe_dsa), for sizes taken before a drafter is read.
+-pub const max_ring_bytes: u64 = @max(ring_bytes, dspark.ring_bytes);
++pub const ring_bytes: u64 = flash.ringBytes();
++/// The largest ring of the block drafters (DFlash2 at either shape, DSpark's on glm_moe_dsa), for sizes taken before a
++/// drafter is read.
++pub const max_ring_bytes: u64 = @max(@max(ring_bytes, full.ringBytes()), dspark.ring_bytes);
+ 
+ /// The drafter MLP across the ranks: gate and up by rows, down by K, each rank `ff` of FF wide (rank r's slice at
+ /// r * ff), the fp32 partials of down gathered and summed in rank order (df_sumn), so the sum is the same on every
+@@ -49,8 +84,13 @@ pub fn mlpSplit(world: usize) MlpSplit {
+ 
+ /// Device bytes of the loader's raw scratch: a 4-bit linear's words, scales and biases, for the largest at `world`.
+ pub fn rawBytes(bits: u8, world: usize) usize {
++    return rawBytesFor(flash, bits, world);
++}
++
++/// rawBytes at shape `s`.
++pub fn rawBytesFor(s: Shape, bits: u8, world: usize) usize {
+     const ff = mlpSplit(world).ff; // the MLP width a rank holds, as dflash_load splits it
+-    const nk: usize = @max(5 * D * D, 2 * ff * D); // fc, or gate and up stacked
++    const nk: usize = @max(@max(s.taps.len * s.d * s.d, 2 * ff * s.d), @max(s.qkv() * s.d, s.d * s.qw())); // fc, gate and up stacked, qkv or o
+     // the 32-group scratch (TF_GLM_DFLASH2_Q32) doubles the scales and biases: sized for it at either setting
+     return if (bits == 4) nk / 2 + 2 * nk / 16 + 1024 else 256;
+ }
+@@ -70,9 +110,18 @@ pub const Kernels = struct {
+     gsum: cuda.Function,
+     gsum32: cuda.Function, // the 32-group sums (TF_GLM_DFLASH2_Q32's linears)
+ 
++    /// The kernels at `s`: the width-dependent ones (block_qkv, conv, attn_part, attn_merge, sumn) are dg_* at the
++    /// full shape (glm_dflash.cu's templates at D 6144, 64 query heads), df_* otherwise.
+     pub fn load(m: cuda.Module) !Kernels {
++        return loadAt(m, false);
++    }
++    pub fn loadAt(m: cuda.Module, wide: bool) !Kernels {
+         var k: Kernels = undefined;
+-        inline for (@typeInfo(Kernels).@"struct".field_names) |n| @field(k, n) = try m.function("df_" ++ n);
++        inline for (@typeInfo(Kernels).@"struct".field_names) |n| {
++            const g = comptime std.mem.eql(u8, n, "block_qkv") or std.mem.eql(u8, n, "conv") or std.mem.eql(u8, n, "attn_part") or
++                std.mem.eql(u8, n, "attn_merge") or std.mem.eql(u8, n, "sumn");
++            @field(k, n) = try m.function(if (g and wide) "dg_" ++ n else "df_" ++ n);
++        }
+         return k;
+     }
+ };
+@@ -113,7 +162,8 @@ pub const Drafter = struct {
+     module: cuda.Module,
+     k: Kernels,
+     weights: cuda.DeviceBuffer,
+-    layers: [LAYERS]LayerW = undefined,
++    layers: [MAX_LAYERS]LayerW = undefined, // the first shape.layers
++    shape: Shape = flash,
+     fc: Lin = undefined,
+     hproj: mm.Tiled = undefined,
+     hnorm: u64 = 0,
+@@ -219,7 +269,20 @@ pub const Drafter = struct {
+ 
+     /// Where a forward's taps go: a prompt chunk's rows or a verify's.
+     pub fn taps(dr: *const Drafter, chunk: bool) taps_mod.Taps {
+-        return .{ .f = dr.k.tap, .out = if (chunk) dr.taps_prefill else dr.taps_step, .dsa = if (dr.spark != null) dspark.D else 0 };
++        return .{ .f = dr.k.tap, .out = if (chunk) dr.taps_prefill else dr.taps_step, .dsa = dr.dsaWidth(), .layer_list = dr.dsaLayers() };
++    }
++
++    /// Whether the drafter taps glm_moe_dsa's one residual stream (DSpark, or DFlash2 at the full shape).
++    pub fn dsaTaps(dr: *const Drafter) bool {
++        return dr.spark != null or dr.shape.dsa;
++    }
++
++    fn dsaWidth(dr: *const Drafter) usize {
++        return if (dr.spark != null) dspark.D else if (dr.shape.dsa) dr.shape.d else 0;
++    }
++
++    fn dsaLayers(dr: *const Drafter) []const usize {
++        return if (dr.spark != null) &taps_mod.dsa_layers else dr.shape.taps;
+     }
+ 
+     fn slot(dr: *Drafter, i: u32) !*Slot {
+@@ -297,7 +360,7 @@ pub const Drafter = struct {
+     /// the context input past them, idle through the pass. The first's ingest copies its rows in before them, then the
+     /// second's reads its own in place (promptIn), so a pair needs no tap rows of its own.
+     pub fn pairTaps(dr: *const Drafter, first_rows: usize) taps_mod.Taps {
+-        return .{ .f = dr.k.tap, .out = dr.cin + first_rows * dr.tap_row, .dsa = if (dr.spark != null) dspark.D else 0 };
++        return .{ .f = dr.k.tap, .out = dr.cin + first_rows * dr.tap_row, .dsa = dr.dsaWidth(), .layer_list = dr.dsaLayers() };
+     }
+ 
+     /// The runs' rows through fc, the hidden norm and each layer's k, v into their rings.
+diff --git a/zig/src/families/glm/dflash_block.zig b/zig/src/families/glm/dflash_block.zig
+index 107d02b00..fee5f80f5 100644
+--- a/zig/src/families/glm/dflash_block.zig
++++ b/zig/src/families/glm/dflash_block.zig
+@@ -6,7 +6,6 @@ const mm = @import("cuda_mm.zig");
+ const q4 = @import("cuda_q4.zig");
+ const df = @import("dflash.zig");
+ const Drafter = df.Drafter;
+-const D = df.D;
+ const BLOCK = df.BLOCK;
+ 
+ fn go(f: cuda.Function, grid: cuda.Dim3, threads: u32, e: anytype, a: *cuda.Args) !void {
+@@ -97,9 +96,10 @@ pub fn embed(e: anytype, ids: u64, out: u64, tmp: u64, M: usize, d: usize) !void
+ 
+ /// `N` context rows (cin, cpos, crings uploaded) through fc, the hidden norm and each layer's k, v into the rings.
+ pub fn ingestPass(dr: *Drafter, e: anytype, N: usize) !void {
++    const D = dr.shape.d;
+     try lin(dr, e, dr.cin, dr.fc, dr.c1, N, false);
+     try glue.rmsnorm(set(e), e.stream, dr.c1, D, dr.hnorm, dr.ctx, D, null, df.EPS, N, D);
+-    for (dr.layers, 0..) |l, li| {
++    for (dr.layers[0..dr.shape.layers], 0..) |l, li| {
+         try lin(dr, e, dr.ctx, l.kv, dr.ckv, N, false);
+         var a: cuda.Args = .{};
+         a.add(dr.ckv);
+@@ -108,7 +108,7 @@ pub fn ingestPass(dr: *Drafter, e: anytype, N: usize) !void {
+         a.add(dr.crings);
+         a.add(@as(i32, @intCast(li)));
+         a.add(df.EPS);
+-        a.add(df.THETA);
++        a.add(dr.shape.theta);
+         try go(dr.k.ctx_kv, .{ .x = @intCast(N), .y = 8 }, 64, e, &a);
+     }
+ }
+@@ -121,14 +121,15 @@ fn conv(dr: *const Drafter, e: anytype, z: u64, which: i32, base: u64, out: u64,
+     a.add(base);
+     a.add(out);
+     a.add(@as(i32, @intFromBool(add)));
+-    try go(dr.k.conv, .{ .x = @intCast(M), .y = D / 1024 }, 256, e, &a);
++    try go(dr.k.conv, .{ .x = @intCast(M), .y = @intCast(dr.shape.d / 1024) }, 256, e, &a);
+ }
+ 
+ /// The block pass for `S` streams (tables uploaded): embed, 5 layers, norm, each rank's 16 best a row, gathered.
+ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+     const M = S * BLOCK;
++    const D = dr.shape.d;
+     try embed(e, dr.ids, dr.x, dr.y, M, D); // (dr.y: the first norm's output, written next)
+-    for (dr.layers, 0..) |l, li| {
++    for (dr.layers[0..dr.shape.layers], 0..) |l, li| {
+         // attention, wrapped in the attention conv
+         try glue.rmsnorm(set(e), e.stream, dr.x, D, l.in_norm, dr.y, D, null, df.EPS, M, D);
+         try lin(dr, e, dr.y, l.a_proj, dr.dyn, M, false);
+@@ -137,16 +138,16 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+         {
+             var a: cuda.Args = .{};
+             a.add(dr.qkv);
+-            a.add(@as(i32, @intCast(df.QKV)));
++            a.add(@as(i32, @intCast(dr.shape.qkv())));
+             a.add(l.qn);
+             a.add(l.kn);
+             a.add(dr.bpos);
+             a.add(df.EPS);
+-            a.add(df.THETA);
++            a.add(dr.shape.theta);
+             a.add(dr.q);
+             a.add(dr.kb);
+             a.add(dr.vb);
+-            try go(dr.k.block_qkv, .{ .x = @intCast(M), .y = 32 + 8 }, 64, e, &a);
++            try go(dr.k.block_qkv, .{ .x = @intCast(M), .y = @intCast(dr.shape.qh + 8) }, 64, e, &a);
+         }
+         {
+             var a: cuda.Args = .{};
+@@ -157,7 +158,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+             try go(dr.k.attn_part, .{ .x = @intCast(S), .y = 8, .z = df.CH }, 256, e, &a);
+             var b: cuda.Args = .{};
+             for ([_]u64{ dr.pm, dr.pl, dr.pacc, dr.att }) |p| b.add(p);
+-            try go(dr.k.attn_merge, .{ .x = @intCast(M), .y = df.QH }, df.HD, e, &b);
++            try go(dr.k.attn_merge, .{ .x = @intCast(M), .y = @intCast(dr.shape.qh) }, df.HD, e, &b);
+         }
+         try lin(dr, e, dr.att, l.o, dr.a, M, false);
+         try conv(dr, e, dr.a, 1, l.a_base + 2 * D * 2, dr.x, true, M);
+@@ -182,7 +183,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+             a.add(dr.a);
+             a.add(@as(i32, @intCast(M)));
+             a.add(@as(i32, @intCast(dr.world)));
+-            try go(dr.k.sumn, .{ .x = @intCast(M), .y = D / 1024 }, 256, e, &a);
++            try go(dr.k.sumn, .{ .x = @intCast(M), .y = @intCast(D / 1024) }, 256, e, &a);
+         } else try linB(dr, e, dr.act, l.down, dr.a, M, false);
+         try conv(dr, e, dr.a, 1, l.m_base + 2 * D * 2, dr.x, true, M);
+     }
+diff --git a/zig/src/families/glm/dflash_load.zig b/zig/src/families/glm/dflash_load.zig
+index 31f75e13c..111965cb4 100644
+--- a/zig/src/families/glm/dflash_load.zig
++++ b/zig/src/families/glm/dflash_load.zig
+@@ -6,7 +6,6 @@ const q4 = @import("cuda_q4.zig");
+ const quant = @import("cuda_quant.zig");
+ const taps_mod = @import("cuda_taps.zig");
+ const df = @import("dflash.zig");
+-const D = df.D;
+ const KVW = df.KVW;
+ const FF = df.FF;
+ const Drafter = df.Drafter;
+@@ -133,7 +132,15 @@ fn layerName(b: *[96]u8, li: usize, s: []const u8) ![]const u8 {
+ /// The drafter from `dir` (config.json and model.safetensors, bf16) for rank `rank` of `world`, on engine `e`.
+ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, rank: usize, world: usize, bits: u8) !*Drafter {
+     if (bits != 0 and bits != 4) return error.BadDrafterBits;
+-    try checkConfig(gpa, io, dir);
++    const shape = try checkConfig(gpa, io, dir);
++    const D = shape.d;
++    if (e.c.hidden != D or e.c.dsa != shape.dsa) {
++        std.log.err("dflash2: the drafter at {s} is for a {d}-wide {s} target; this one is {d} wide", .{ dir, D, if (shape.dsa) "glm_moe_dsa" else "GLM-5.3-Flash", e.c.hidden });
++        return error.DrafterTargetMismatch;
++    }
++    const QW = shape.qw();
++    const DYN = shape.dynw();
++    const NT = shape.taps.len;
+     const d = e.d;
+     const head = e.w.draft_head orelse return error.DrafterNeedsDraftHead; // borrowed: the weights own it
+     const path = try std.fs.path.join(gpa, &.{ dir, "model.safetensors" });
+@@ -161,17 +168,17 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     const mlp = df.mlpSplit(world);
+     const split = mlp.split;
+     const ff = mlp.ff;
+-    const small: u64 = 6 * 4096 * 2 + 2 * 128 * 2 + 2 * 2 * 2 * D * 2 + 16 * 256;
++    const small: u64 = 6 * D * 2 + 2 * 128 * 2 + 2 * 2 * 2 * D * 2 + 16 * 256;
+     const per: u64 = if (bits == 4) 1 else 4; // quarter-bytes a weight: 4 bits (plus scales and biases below) or bf16
+-    const lin_elems: u64 = df.QKV * D + 2 * KVW * D + D * D + 2 * ff * D + 2 * KVW * D + 5 * D * D / df.LAYERS;
++    const lin_elems: u64 = shape.qkv() * D + 2 * KVW * D + D * QW + 2 * ff * D + 2 * DYN * D + NT * D * D / shape.layers;
+     const q32 = q32env();
+     const gextra: u64 = if (q32) lin_elems / 16 else 0; // the 32 groups' second half of scales and biases
+-    const total: u64 = df.LAYERS * (lin_elems * per / 2 + lin_elems / 16 + gextra + D * ff * 2 + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
++    const total: u64 = shape.layers * (lin_elems * per / 2 + lin_elems / 16 + gextra + D * ff * 2 + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
+     var wbuf = try cuda.DeviceBuffer.alloc(d, total);
+     errdefer wbuf.free();
+-    var tmp = try cuda.DeviceBuffer.alloc(d, 2 * FF * D * 2); // the largest linear as stored
++    var tmp = try cuda.DeviceBuffer.alloc(d, @max(@max(2 * FF * D, NT * D * D), shape.qkv() * D) * 2); // the largest linear as stored
+     defer tmp.free();
+-    var raw = try cuda.DeviceBuffer.alloc(d, df.rawBytes(bits, world));
++    var raw = try cuda.DeviceBuffer.alloc(d, df.rawBytesFor(shape, bits, world));
+     defer raw.free();
+     var module = try cuda.Module.load(d, cuda.kernels.glm_dflash);
+     errdefer module.unload();
+@@ -182,10 +189,10 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     }
+     const dr = try gpa.create(Drafter);
+     errdefer gpa.destroy(dr);
+-    dr.* = .{ .gpa = gpa, .d = d, .module = module, .k = try df.Kernels.load(module), .weights = wbuf, .split = split, .ff = ff, .rank = rank, .world = world };
++    dr.* = .{ .gpa = gpa, .d = d, .module = module, .k = try df.Kernels.loadAt(module, D != df.D), .weights = wbuf, .split = split, .ff = ff, .rank = rank, .world = world, .shape = shape, .tap_row = shape.tapRow(), .ring_size = shape.ringBytes() };
+     defer @import("cuda_load_owner.zig").drain(e.stream, d);
+     var nb: [4][96]u8 = undefined;
+-    for (&dr.layers, 0..) |*lw, i| {
++    for (dr.layers[0..shape.layers], 0..) |*lw, i| {
+         lw.in_norm = try l.raw(try layerName(&nb[0], i, "input_layernorm.weight"), D * 2);
+         lw.post_norm = try l.raw(try layerName(&nb[0], i, "post_attention_layernorm.weight"), D * 2);
+         lw.qn = try l.raw(try layerName(&nb[0], i, "self_attn.q_norm.weight"), 128 * 2);
+@@ -195,9 +202,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+         const q = try layerName(&nb[1], i, "self_attn.q_proj.weight");
+         const kq = try layerName(&nb[2], i, "self_attn.k_proj.weight");
+         const v = try layerName(&nb[3], i, "self_attn.v_proj.weight");
+-        lw.qkv = try l.linear(&.{ q, kq, v }, &.{ D, KVW, KVW }, D, null);
++        lw.qkv = try l.linear(&.{ q, kq, v }, &.{ QW, KVW, KVW }, D, null);
+         lw.kv = try l.linear(&.{ kq, v }, &.{ KVW, KVW }, D, null);
+-        lw.o = try l.linear(&.{try layerName(&nb[1], i, "self_attn.o_proj.weight")}, &.{D}, D, null);
++        lw.o = try l.linear(&.{try layerName(&nb[1], i, "self_attn.o_proj.weight")}, &.{D}, QW, null);
+         const gate = try layerName(&nb[1], i, "mlp.gate_proj.weight");
+         const up = try layerName(&nb[2], i, "mlp.up_proj.weight");
+         const down = try layerName(&nb[3], i, "mlp.down_proj.weight");
+@@ -208,10 +215,10 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, null);
+             lw.down = try l.linearB(&.{down}, &.{D}, FF, null);
+         }
+-        lw.a_proj = try l.linear(&.{try layerName(&nb[1], i, "attention_conv.kernel_projection.weight")}, &.{KVW}, D, null);
+-        lw.m_proj = try l.linear(&.{try layerName(&nb[1], i, "mlp_conv.kernel_projection.weight")}, &.{KVW}, D, null);
++        lw.a_proj = try l.linear(&.{try layerName(&nb[1], i, "attention_conv.kernel_projection.weight")}, &.{DYN}, D, null);
++        lw.m_proj = try l.linear(&.{try layerName(&nb[1], i, "mlp_conv.kernel_projection.weight")}, &.{DYN}, D, null);
+     }
+-    dr.fc = try l.linear(&.{"fc.weight"}, &.{D}, 5 * D, null);
++    dr.fc = try l.linear(&.{"fc.weight"}, &.{D}, NT * D, null);
+     dr.hproj = try l.linearB(&.{"candidate_selector.hidden_projection.weight"}, &.{df.RANK}, D, null);
+     dr.hnorm = try l.raw("hidden_norm.weight", D * 2);
+     dr.norm = try l.raw("norm.weight", D * 2);
+@@ -221,7 +228,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     try @import("dflash_load_owner.zig").acquire(gpa, dr, &tail, Tail, .{ .book = df.VOCAB * df.RANK, .ctx = df.MAX_CTX, .cand = candidates.host, .hidden = df.MAX_M * df.RANK });
+     if (std.c.getenv("TF_GLM_DFLASH2_LOG")) |v| dr.log = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
+     if (std.c.getenv("TF_GLM_DFLASH2_PROF") != null) dr.prof = io;
+-    std.log.info("dflash2: drafter from {s} (CC BY-NC-ND 4.0: non-commercial use only), linears at {d} bits, {d:.2} GiB on the device", .{ dir, if (bits == 0) 16 else bits, @as(f64, @floatFromInt(l.at)) / (1 << 30) });
++    std.log.info("dflash2: drafter from {s} ({s}), linears at {d} bits, {d:.2} GiB on the device", .{ dir, if (shape.dsa) "incoai/GLM-5.3-DFlash2 at full GLM-5.3's shape: D 6144, 6 layers, taps after 5/19/33/47/61/75" else "CC BY-NC-ND 4.0: non-commercial use only", if (bits == 0) 16 else bits, @as(f64, @floatFromInt(l.at)) / (1 << 30) });
+     return dr;
+ }
+ 
+@@ -245,11 +252,15 @@ const Tail = struct {
+ 
+ /// The drafter's scratch, every field one carved piece of one buffer.
+ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
++    const sh = dr.shape;
++    const D: u64 = sh.d;
++    const KVW_: u64 = KVW;
++    const TAP_ROW: u64 = sh.tapRow();
+     const M: u64 = df.MAX_M;
+     const C: u64 = df.MAX_CTX;
+     const chunks: u64 = (head_n + 4095) / 4096;
+     var part: u64 = 16;
+-    for (dr.layers) |l| {
++    for (dr.layers[0..sh.layers]) |l| {
+         for ([_]df.Lin{ l.qkv, l.kv, l.o, l.gu, l.a_proj, l.m_proj }) |w| if (w == .bf16) {
+             part = @max(part, mm.partBytes(64, w.bf16));
+         };
+@@ -259,16 +270,16 @@ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
+     part = @max(part, mm.partBytes(64, dr.hproj));
+     const gwidth: u64 = if (dr.fc == .q4g32) 32 else 64; // the group sums' width (TF_GLM_DFLASH2_Q32)
+     const fields = .{
+-        .{ "x", M * D * 2 },                                                                     .{ "y", M * D * 2 },                        .{ "y2", M * D * 2 },                .{ "dyn", M * KVW * 2 },
+-        .{ "qkv", M * df.QKV * 2 },                                                              .{ "q", M * D * 2 },                        .{ "kb", M * KVW * 2 },              .{ "vb", M * KVW * 2 },
+-        .{ "att", M * D * 2 },                                                                   .{ "a", M * D * 2 },                        .{ "gu", M * 2 * FF * 2 },           .{ "act", M * FF * 2 },
++        .{ "x", M * D * 2 },                                                                     .{ "y", M * D * 2 },                        .{ "y2", M * D * 2 },                .{ "dyn", M * sh.dynw() * 2 },
++        .{ "qkv", M * sh.qkv() * 2 },                                                            .{ "q", M * sh.qw() * 2 },                  .{ "kb", M * KVW_ * 2 },             .{ "vb", M * KVW_ * 2 },
++        .{ "att", M * sh.qw() * 2 },                                                             .{ "a", M * D * 2 },                        .{ "gu", M * 2 * FF * 2 },           .{ "act", M * FF * 2 },
+         .{ "hn", M * D * 2 },                                                                    .{ "xs", M * (D / gwidth) * 4 },            .{ "g", M * df.RANK * 4 },           .{ "logits", M * head_n * 2 },
+-        .{ "part", part },                                                                       .{ "gs", C * 5 * (D / gwidth) * 4 },        .{ "sums", dr.world * M * D * 4 },   .{ "cin", C * df.TAP_ROW },
+-        .{ "c1", C * D * 2 },                                                                    .{ "ctx", C * D * 2 },                      .{ "ckv", C * 2 * KVW * 2 },         .{ "taps_step", df.STEP_ROWS * df.TAP_ROW },
+-        .{ "taps_prefill", C * df.TAP_ROW },                                                     .{ "ids", M * 4 },                          .{ "bpos", M * 4 },                  .{ "rings", df.MAX_S * 8 },
++        .{ "part", part },                                                                       .{ "gs", C * sh.taps.len * (D / gwidth) * 4 }, .{ "sums", dr.world * M * D * 4 }, .{ "cin", C * TAP_ROW },
++        .{ "c1", C * D * 2 },                                                                    .{ "ctx", C * D * 2 },                      .{ "ckv", C * 2 * KVW_ * 2 },        .{ "taps_step", df.STEP_ROWS * TAP_ROW },
++        .{ "taps_prefill", C * TAP_ROW },                                                        .{ "ids", M * 4 },                          .{ "bpos", M * 4 },                  .{ "rings", df.MAX_S * 8 },
+         .{ "starts", df.MAX_S * 8 },                                                             .{ "froms", df.MAX_S * 8 },                 .{ "cpos", C * 8 },                  .{ "crings", C * 8 },
+-        .{ "gtk", @import("dflash_candidates.zig").Layout.init(dr.world, M, df.CW).device * 4 }, .{ "pv", M * chunks * df.TOPK * 4 },        .{ "pi", M * chunks * df.TOPK * 4 }, .{ "pm", M * df.QH * df.CH * 4 },
+-        .{ "pl", M * df.QH * df.CH * 4 },                                                        .{ "pacc", M * df.QH * df.CH * df.HD * 4 },
++        .{ "gtk", @import("dflash_candidates.zig").Layout.init(dr.world, M, df.CW).device * 4 }, .{ "pv", M * chunks * df.TOPK * 4 },        .{ "pi", M * chunks * df.TOPK * 4 }, .{ "pm", M * sh.qh * df.CH * 4 },
++        .{ "pl", M * sh.qh * df.CH * 4 },                                                        .{ "pacc", M * sh.qh * df.CH * df.HD * 4 },
+     };
+     var at: u64 = 0;
+     inline for (fields) |f| {
+@@ -281,24 +292,58 @@ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
+     try d.check(d.api.cuMemsetD8_v2(dr.scratch.ptr, 0, at), "cuMemsetD8");
+ }
+ 
+-/// Device bytes the drafter's scratch takes beside its weights (the memory budget's share, before loading).
+-pub fn checkConfig(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
++/// The checkpoint's shape (GLM-5.3-Flash's DFlash2 or full GLM-5.3's), its config checked against it.
++pub fn checkConfig(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !df.Shape {
+     const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+     defer gpa.free(path);
+     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+     defer gpa.free(text);
+     const p = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+     defer p.deinit();
+-    const o = p.value.object;
+-    const dc = (o.get("dflash_config") orelse return error.NotDFlash2).object;
+-    const ok = o.get("hidden_size").?.integer == D and o.get("num_hidden_layers").?.integer == df.LAYERS and
+-        o.get("num_attention_heads").?.integer == 32 and o.get("num_key_value_heads").?.integer == 8 and
+-        o.get("intermediate_size").?.integer == FF and o.get("vocab_size").?.integer == df.VOCAB and
+-        dc.get("block_size").?.integer == df.BLOCK and dc.get("mask_token_id").?.integer == df.MASK and
+-        dc.get("selector_top_k").?.integer == df.TOPK and dc.get("selector_rank").?.integer == df.RANK and
+-        dc.get("conv_kernel_size").?.integer == 2 and dc.get("conv_group_size").?.integer == 16;
++    return shapeOf(p.value);
++}
++
++fn int(x: ?std.json.Value) i64 {
++    return if (x) |v| (if (v == .integer) v.integer else -1) else -1;
++}
++
++fn num(x: ?std.json.Value) f64 {
++    return if (x) |v| switch (v) {
++        .integer => |i| @floatFromInt(i),
++        .float => |f| f,
++        else => -1,
++    } else -1;
++}
++
++/// The shape a DFlash2 config.json is: hidden_size picks it, every other field must then match it.
++pub fn shapeOf(v: std.json.Value) !df.Shape {
++    if (v != .object) return error.NotDFlash2;
++    const o = v.object;
++    const dcv = o.get("dflash_config") orelse return error.NotDFlash2;
++    if (dcv != .object) return error.NotDFlash2;
++    const dc = dcv.object;
++    const s: df.Shape = switch (int(o.get("hidden_size"))) {
++        @as(i64, df.flash.d) => df.flash,
++        @as(i64, df.full.d) => df.full,
++        else => return error.DrafterConfigUnexpected,
++    };
++    // rope_theta: the Flash checkpoint's rope_parameters (or a top-level rope_theta)
++    var theta = num(o.get("rope_theta"));
++    if (o.get("rope_parameters")) |rp| if (rp == .object) {
++        theta = num(rp.object.get("rope_theta"));
++    };
++    const ok = int(o.get("num_hidden_layers")) == s.layers and int(o.get("num_attention_heads")) == s.qh and
++        int(o.get("num_key_value_heads")) == 8 and (o.get("head_dim") == null or int(o.get("head_dim")) == df.HD) and
++        int(o.get("intermediate_size")) == FF and int(o.get("vocab_size")) == df.VOCAB and
++        (o.get("num_target_layers") == null or int(o.get("num_target_layers")) == s.target_layers) and
++        (theta < 0 or theta == @as(f64, s.theta)) and
++        int(dc.get("block_size")) == df.BLOCK and int(dc.get("mask_token_id")) == df.MASK and
++        int(dc.get("selector_top_k")) == df.TOPK and int(dc.get("selector_rank")) == df.RANK and
++        int(dc.get("conv_kernel_size")) == 2 and int(dc.get("conv_group_size")) == 16 and
++        (o.get("sliding_window") == null or int(o.get("sliding_window")) == df.WIN);
+     if (!ok) return error.DrafterConfigUnexpected;
+-    const taps = dc.get("target_layer_ids").?.array.items;
+-    if (taps.len != taps_mod.layers.len) return error.DrafterConfigUnexpected;
+-    for (taps, taps_mod.layers) |t, w| if (t.integer != w) return error.DrafterConfigUnexpected;
++    const tv = dc.get("target_layer_ids") orelse return error.DrafterConfigUnexpected;
++    if (tv != .array or tv.array.items.len != s.taps.len) return error.DrafterConfigUnexpected;
++    for (tv.array.items, s.taps) |t, w| if (int(t) != @as(i64, @intCast(w))) return error.DrafterConfigUnexpected;
++    return s;
+ }
+-- 
+2.43.0
+

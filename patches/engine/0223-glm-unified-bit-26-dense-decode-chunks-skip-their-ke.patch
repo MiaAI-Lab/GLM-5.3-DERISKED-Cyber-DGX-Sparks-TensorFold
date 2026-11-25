@@ -1,0 +1,148 @@
+From b7c54b3dfabddc48a8546dbb1e6d58962660c28c Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Mon, 23 Nov 2026 03:16:07 +0200
+Subject: [PATCH] glm: unified bit 26 dense decode chunks skip their keyless
+ tiles (U5x)
+
+---
+ zig/kernels/cuda/glm_glue_attn.cuh   | 26 ++++++++++++++++++++------
+ zig/src/families/glm/cuda_glue.zig   |  2 ++
+ zig/src/families/glm/cuda_latent.zig |  2 +-
+ zig/src/families/glm/cuda_native.zig |  1 +
+ zig/src/families/glm/policy.zig      |  1 +
+ 5 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index 7465d74f6..0169b5b70 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -72,7 +72,10 @@ constexpr int wide_smem() {
+ // PAGED8: an E4M3 cache on KV pages (pt, pstep bytes apart): a dense chunk is one page, a sparse key's logical token goes
+ // through the table to its page; codes and scales then load as on a window, so the arithmetic is the window's.
+ // CHL: the keys a chunk covers (CH; glm_moe_dsa's decode windows split a row's 2,048 picks finer, CH / 4, for blocks)
+-template <int HB, bool FP8 = false, bool PAGED8 = false, int LWV = LW, int CHL = CH, bool I8 = false>
++// SKIP (U5x, GLM policy bit 26): a chunk's loop ends at its last tile holding a visible key. A tile with none scores
++// -inf throughout: tm = -inf, alpha = 1, p = 0, so it leaves m, l and o as they were (o + 0 . V over zero-filled keys);
++// skipping it gives the same values (byte-compared offline, glm skip test).
++template <int HB, bool FP8 = false, bool PAGED8 = false, int LWV = LW, int CHL = CH, bool I8 = false, bool SKIP = false>
+ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
+@@ -179,6 +182,9 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+       for (int e = 0; e < 4; ++e) o[i][j][e] = 0.0f;
+   static_assert(CHL % KT == 0 && CH % CHL == 0, "whole key tiles a chunk");
+   constexpr int tiles = CHL / KT;
++  // the tiles this chunk runs: all of them, or (SKIP) through the last one with a visible key
++  const int nt = !SKIP || !live ? tiles
++                                : (int)min((int64_t)tiles, sparse ? (n - start + KT - 1) / KT : (limit - start) / KT + 1);
+   if (live) {
+     for (int idx = t; idx < HB * (LWV / 8); idx += blockDim.x) {
+       const int hd = idx / (LWV / 8), u = idx % (LWV / 8);
+@@ -190,18 +196,18 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+     load_kv(1);
+     commit();
+   }
+-  for (int tile = 0; live && tile < tiles; ++tile) {
++  for (int tile = 0; live && tile < nt; ++tile) {
+     if constexpr (FP8) {
+       wait<0>();
+     } else {
+-      if (tile + 1 < tiles)
++      if (tile + 1 < nt)
+         wait<1>();
+       else
+         wait<0>();
+     }
+     __syncthreads();
+     if constexpr (FP8) {
+-      if (tile + 2 < tiles) fetch8(tile + 2);  // in flight during this tile's math
++      if (tile + 2 < nt) fetch8(tile + 2);  // in flight during this tile's math
+     }
+     const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LWV;
+     const int64_t first = start + tile * KT;
+@@ -285,8 +291,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+     for (int i = 0; i < MT; ++i)
+       for (int hf = 0; hf < 2; ++hf) l[i][hf] = __fmaf_rn(l[i][hf], alpha[i][hf], stat[HB + i * 16 + hf * 8 + g]);
+     if constexpr (FP8) {
+-      if (tile + 2 < tiles) store8(tile + 2);
+-    } else if (tile + 2 < tiles) {
++      if (tile + 2 < nt) store8(tile + 2);
++    } else if (tile + 2 < nt) {
+       load_kv(tile + 2);
+     }
+     commit();
+@@ -724,6 +730,14 @@ extern "C" __global__ void __launch_bounds__(256)
+       qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, nullptr,
+       0, scales);
+ }
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_16_w576_i8_skip(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
++                                  const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
++                                  int64_t heads, int64_t w, float scale, int sparse) {
++  glm_attn::chunks_wide<16, true, false, glm_attn::DSA_LW, glm_attn::CH, true, true>(
++      qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, nullptr,
++      0, scales);
++}
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_w576_s4_i8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
+                                 const int* pos, const int* tok, const int* cnt, float* po, float* pm, float* pl,
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index bb42400c9..a2d261f90 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -118,6 +118,7 @@ pub const Kernels = struct {
+     chunks_16_fused_w576_fp8: cuda.Function,
+     lat_write_i8_w576: cuda.Function, // TF_GLM_KV8_INT8=1: the same cache layout holding int8 codes, two scales a row
+     chunks_16_w576_i8: cuda.Function,
++    chunks_16_w576_i8_skip: cuda.Function, // policy bit 26 (U5x): the dense chunks without their keyless tiles
+     chunks_16_w576_s4_i8: cuda.Function,
+     chunks_16_fused_w576_i8: cuda.Function,
+     dsa_scores_r8: cuda.Function, // policy bit 25 (U6.2): 8 prompt rows a CTA on shared key blocks (glm_dsa_scores_rows.cuh)
+@@ -159,6 +160,7 @@ pub const Kernels = struct {
+         try k.chunks_16_w576_s4_fp8.allowDynamicShared(chunksSmemW(16, dsa_row));
+         try k.chunks_16_fused_w576_fp8.allowDynamicShared(chunksSmemW(16, dsa_row));
+         try k.chunks_16_w576_i8.allowDynamicShared(chunksSmemW(16, dsa_row));
++        try k.chunks_16_w576_i8_skip.allowDynamicShared(chunksSmemW(16, dsa_row));
+         try k.chunks_16_w576_s4_i8.allowDynamicShared(chunksSmemW(16, dsa_row));
+         try k.chunks_16_fused_w576_i8.allowDynamicShared(chunksSmemW(16, dsa_row));
+         try k.latent_mma_kn.allowDynamicShared(latent_mma_smem[0]);
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index 474bbd925..627d63fb5 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -166,7 +166,7 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64,
+     // a paged sparse list's units are the kernel's: positions for E4M3 (Table.logical), the BF16 rows otherwise
+     if (sparse and t.pt != 0 and t.logical != paged8) return error.TokenUnits;
+     const f = switch (hb) {
+-        heads_tile => if (lw == glue.dsa_row) (if (kv8) (if (int8()) set.glue.chunks_16_w576_i8 else set.glue.chunks_16_w576_fp8) else set.glue.chunks_16_w576) else if (!kv8) set.glue.chunks_16 else if (paged8) set.glue.chunks_16_fp8_paged else set.glue.chunks_16_fp8,
++        heads_tile => if (lw == glue.dsa_row) (if (kv8) (if (int8()) (if (!sparse and @import("policy.zig").on(set.policy, .attn_skip)) set.glue.chunks_16_w576_i8_skip else set.glue.chunks_16_w576_i8) else set.glue.chunks_16_w576_fp8) else set.glue.chunks_16_w576) else if (!kv8) set.glue.chunks_16 else if (paged8) set.glue.chunks_16_fp8_paged else set.glue.chunks_16_fp8,
+         heads_tile_wide => if (!kv8) set.glue.chunks_32 else if (paged8) set.glue.chunks_32_fp8_paged else set.glue.chunks_32_fp8,
+         else => return error.HeadBlock,
+     };
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 3e46b69f3..21f602ffd 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -540,6 +540,7 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+     b.offered |= policy.bit(.absorb_one); // 23: tf_glm_latent_mma_kn_hs, every rank loads glm_glue
+     b.offered |= policy.bit(.prompt_hoist); // 24: the prompt buffers' roped-query block (cuda_state, p[76])
+     b.offered |= policy.bit(.scores_rows); // 25: tf_glm_dsa_scores_r8 (with bit 24)
++    b.offered |= policy.bit(.attn_skip); // 26: tf_glm_chunks_16_w576_i8_skip
+     std.log.info("request policies on (TF_GLM_POLICY_REQUESTS=1): default 0x{x}, offered 0x{x}", .{ b.default & b.offered, b.offered });
+     return b;
+ }
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+index 133174632..b26a0f4ca 100644
+--- a/zig/src/families/glm/policy.zig
++++ b/zig/src/families/glm/policy.zig
+@@ -27,6 +27,7 @@ pub const Bit = enum(u5) {
+     absorb_one = 23, // U8b: glm_moe_dsa's prompt absorb_q in one head-batched launch (tf_glm_latent_mma_kn_hs)
+     prompt_hoist = 24, // U6.1: a prompt chunk's indexer queries roped once a row (tf_glm_dsa_qrope + tf_glm_dsa_scores_roped)
+     scores_rows = 25, // U6.2: with bit 24, a prompt select block's scores 8 rows a CTA sharing each staged key block (tf_glm_dsa_scores_r8)
++    attn_skip = 26, // U5x: dense decode chunks end at their last tile with a visible key (tf_glm_chunks_16_w576_i8_skip)
+ };
+ 
+ pub const reserved: Mask = 0x3f;
+-- 
+2.43.0
+

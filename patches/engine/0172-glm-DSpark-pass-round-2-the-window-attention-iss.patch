@@ -1,0 +1,59 @@
+From 329fe88e8f9be4c7572c24e7f50e3f55d026ce61 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 08:49:50 +0200
+Subject: [PATCH] glm: DSpark pass, round 2: the window attention issues all of
+ a thread's K and V loads before staging them (0.34 -> 0.16 ms a layer)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/glm_dspark.cu | 24 ++++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_dspark.cu b/zig/kernels/cuda/glm_dspark.cu
+index 5ab8075..e0abf77 100644
+--- a/zig/kernels/cuda/glm_dspark.cu
++++ b/zig/kernels/cuda/glm_dspark.cu
+@@ -100,10 +100,14 @@ extern "C" __global__ void __launch_bounds__(128)
+   const long long key0 = own ? 0 : lo + (long long)c * CK;
+   const int nkeys = own ? BLOCK : (int)max(0LL, min((long long)CK, start - key0));
+   __nv_bfloat16* ring = reinterpret_cast<__nv_bfloat16*>(rings[s]);
+-  // stage: 8 16-byte units a row, a thread one unit at a time
+-  for (int i = t; i < CK * (HD / 8); i += 128) {
+-    const int row = i / (HD / 8), u = i % (HD / 8);
+-    uint4 kv = make_uint4(0u, 0u, 0u, 0u), vv = make_uint4(0u, 0u, 0u, 0u);
++  // stage: 8 16-byte units a row; a thread issues all its K and V loads before storing any (loads in flight)
++  constexpr int UPT = CK * (HD / 8) / 128;  // 8 units a thread
++  uint4 kreg[UPT], vreg[UPT];
++#pragma unroll
++  for (int k = 0; k < UPT; ++k) {
++    const int i = t + k * 128, row = i / (HD / 8), u = i % (HD / 8);
++    kreg[k] = make_uint4(0u, 0u, 0u, 0u);
++    vreg[k] = make_uint4(0u, 0u, 0u, 0u);
+     if (row < nkeys) {
+       const __nv_bfloat16 *kr, *vr;
+       if (own) {
+@@ -114,12 +118,16 @@ extern "C" __global__ void __launch_bounds__(128)
+         kr = ring_k(ring, layer) + slot;
+         vr = ring_v(ring, layer) + slot;
+       }
+-      kv = __ldg(reinterpret_cast<const uint4*>(kr) + u);
+-      vv = __ldg(reinterpret_cast<const uint4*>(vr) + u);
++      kreg[k] = __ldg(reinterpret_cast<const uint4*>(kr) + u);
++      vreg[k] = __ldg(reinterpret_cast<const uint4*>(vr) + u);
+     }
++  }
++#pragma unroll
++  for (int k = 0; k < UPT; ++k) {
++    const int i = t + k * 128, row = i / (HD / 8), u = i % (HD / 8);
+     uint32_t* kd = reinterpret_cast<uint32_t*>(ks + row * KP + u * 8);
+-    kd[0] = kv.x; kd[1] = kv.y; kd[2] = kv.z; kd[3] = kv.w;
+-    *reinterpret_cast<uint4*>(vs + row * HD + u * 8) = vv;
++    kd[0] = kreg[k].x; kd[1] = kreg[k].y; kd[2] = kreg[k].z; kd[3] = kreg[k].w;
++    *reinterpret_cast<uint4*>(vs + row * HD + u * 8) = vreg[k];
+   }
+   __syncthreads();
+   const bool live = t < nkeys;
+-- 
+2.43.0
+

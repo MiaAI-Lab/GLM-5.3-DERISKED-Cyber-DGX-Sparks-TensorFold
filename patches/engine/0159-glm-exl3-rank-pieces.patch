@@ -1,0 +1,104 @@
+From d32143567c89d74a46aacade97c6ea25f4666d9a Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:28:00 +0200
+Subject: [PATCH] glm: EXL3 experts stored as TP rank pieces (a TP4 build's
+ experts.E.proj.rankR.*)
+
+davidsyoung's GLM-5.3 EXL3 TR3 builds quantize each routed expert for
+tensor parallelism 4: gate, up and down are stored as four rank pieces,
+each its own EXL3 matrix with its own input and output rotations, so the
+pieces do not merge into one expert. When an expert has no whole trellis,
+the loader now counts the pieces, requires this rank's share to be exactly
+one of them (TP equal to the piece count), and loads that piece's trellis,
+codebook marker and scales whole; any other split refuses, naming the TP
+the build needs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_exl3.zig | 36 +++++++++++++++++++++---------
+ 1 file changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index d236852..96e3c20 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -145,13 +145,27 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+         .{ .k = inter, .n = dims, .by_cols = false },
+     };
+     var first_suh: ?[]const u8 = null;
++    // A build quantized for TP4 (davidsyoung's TR3) stores each expert as rank pieces, experts.E.proj.rankR.*, each its
++    // own EXL3 matrix (its own rotations): a rank whose share is exactly piece R loads that piece whole; any other
++    // split cannot use them (the pieces' rotations differ, so they do not merge).
++    const pieced = if (L.get("layers.{d}.mlp.experts.0.gate_proj.trellis", .{i})) |_| false else |_| true;
++    var pr: usize = 0;
++    if (pieced) {
++        var pieces: usize = 0;
++        while (pieces < 16) : (pieces += 1) _ = L.get("layers.{d}.mlp.experts.0.gate_proj.rank{d}.trellis", .{ i, pieces }) catch break;
++        if (pieces == 0 or width * pieces != inter or cut.lo % width != 0) {
++            std.log.err("layer {d}: experts stored as {d} rank pieces; this rank's share ({d} of {d} rows) is not one piece: serve this build at TP={d}", .{ i, pieces, width, inter, pieces });
++            return error.UnreadableExl3;
++        }
++        pr = cut.lo / width;
++    }
+     inline for (mats, .{ "gate_proj", "up_proj", "down_proj" }, .{ "gt", "ut", "dt" }, .{ "suh_g", "suh_u", "suh_d" }, .{ "svh_g", "svh_u", "svh_d" }, 0..) |m, proj, tw, su, sv, pi| {
+         const kt = (if (m.by_cols) m.k else width) / 16; // the rank's tiles
+         const nt = (if (m.by_cols) width else m.n) / 16;
+         const mine = k2s[pi * count ..][0..count];
+         for (0..count, mine) |e, *k2| {
+-            const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".trellis", .{ i, e });
+-            if (refusal(t, m.k, m.n)) |why| {
++            const t = if (pieced) try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}.trellis", .{ i, e, pr }) else try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".trellis", .{ i, e });
++            if (refusal(t, if (pieced) kt * 16 else m.k, if (pieced) nt * 16 else m.n)) |why| {
+                 std.log.err("{s}: {s} (shape {any}); GLM's CUDA experts read mcg or mul1 trellises of 1 to 8 bits", .{ L.last, why, t.shape[0..t.rank] });
+                 return error.UnreadableExl3;
+             }
+@@ -160,7 +174,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+             // the codebook marker (an i32 holding the codebook's multiplier): the layer's first sets it, the rest agree
+             var seen: ?core.exl3_load.Codebook = null;
+             inline for (core.exl3_load.markers) |mk| {
+-                const got = L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ "." ++ mk.name, .{ i, e }) catch null;
++                const got = (if (pieced) L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}." ++ mk.name, .{ i, e, pr }) else L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ "." ++ mk.name, .{ i, e })) catch null;
+                 if (got) |marker| {
+                     if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
+                         std.mem.readInt(u32, marker.bytes[0..4], .little) != mk.value or seen != null)
+@@ -173,7 +187,9 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+                 std.log.err("layer {d}: experts on more than one EXL3 codebook; GLM's CUDA experts take one a layer", .{i});
+                 return error.UnreadableExl3;
+             }
+-            if (m.by_cols) { // every tile row, the rank's tile columns
++            if (pieced) { // the rank's piece, whole
++                try L.host.appendSlice(L.gpa, t.bytes[0 .. kt * nt * tile]);
++            } else if (m.by_cols) { // every tile row, the rank's tile columns
+                 const row = (m.n / 16) * tile;
+                 for (0..kt) |r| try L.host.appendSlice(L.gpa, t.bytes[r * row + (cut.lo / 16) * tile ..][0 .. nt * tile]);
+             } else try L.host.appendSlice(L.gpa, t.bytes[(cut.lo / 16) * nt * tile ..][0 .. kt * nt * tile]); // its tile rows
+@@ -187,9 +203,9 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+         }
+         @field(out, tw) = try L.put("layers.{d}.moe.exl3." ++ tw ++ "_ptrs", .{i});
+         for (0..count) |e| { // suh: the input's scales (gate, up: every input; down: the rank's)
+-            const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".suh", .{ i, e });
+-            if (t.dtype != .f16 or t.numel() != m.k) return error.UnreadableExl3;
+-            const own = if (m.by_cols) t.bytes else t.bytes[cut.lo * 2 .. cut.hi * 2];
++            const t = if (pieced) try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}.suh", .{ i, e, pr }) else try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".suh", .{ i, e });
++            if (t.dtype != .f16 or t.numel() != (if (pieced) kt * 16 else m.k)) return error.UnreadableExl3;
++            const own = if (m.by_cols or pieced) t.bytes else t.bytes[cut.lo * 2 .. cut.hi * 2];
+             if (m.by_cols) { // one rotation shared by the layer's every gate and up input?
+                 if (first_suh) |f| (if (!std.mem.eql(u8, f, own)) {
+                     out.shx = false;
+@@ -199,9 +215,9 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
+         }
+         @field(out, su) = try L.put("layers.{d}.moe.exl3." ++ su, .{i});
+         for (0..count) |e| { // svh: the output's scales (gate, up: the rank's; down: every output)
+-            const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".svh", .{ i, e });
+-            if (t.dtype != .f16 or t.numel() != m.n) return error.UnreadableExl3;
+-            try L.host.appendSlice(L.gpa, if (m.by_cols) t.bytes[cut.lo * 2 .. cut.hi * 2] else t.bytes);
++            const t = if (pieced) try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".rank{d}.svh", .{ i, e, pr }) else try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".svh", .{ i, e });
++            if (t.dtype != .f16 or t.numel() != (if (pieced) nt * 16 else m.n)) return error.UnreadableExl3;
++            try L.host.appendSlice(L.gpa, if (m.by_cols and !pieced) t.bytes[cut.lo * 2 .. cut.hi * 2] else t.bytes);
+         }
+         @field(out, sv) = try L.put("layers.{d}.moe.exl3." ++ sv, .{i});
+     }
+-- 
+2.43.0
+

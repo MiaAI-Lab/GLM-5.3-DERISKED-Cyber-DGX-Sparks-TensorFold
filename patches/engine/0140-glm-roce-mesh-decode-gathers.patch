@@ -1,0 +1,221 @@
+From 606a765523bcba66fbb1e1c060bfb15bee685fe6 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:46:04 +0200
+Subject: [PATCH] glm: decode all-gathers by multirank RoCE writes
+ (TF_GLM_ROCE_MESH)
+
+At three ranks or more a decode window's layer exchanges went through
+NCCL's ring (W - 1 hops). With TF_GLM_ROCE_MESH=1 they go through
+fabric/tp's multirank gather: each rank's shard written once to every
+peer, flags polled by the copy-out kernel. On six GB10s over one 200G
+switch (tf-tp-test suite, world 6) 16 / 32 / 64 KiB a rank take
+23 / 28 / 36 us against NCCL's 52 / 80 / 86.
+
+cuda_mesh.zig brings it up after the group: fabric/tp's bootstrap and
+HCA pick (TF_TP_MASTER, TF_TP_PORT, TF_TP_ROCE_HCA), the mailbox fatbin
+from TF_TP_KERNEL_IMAGE, then a patterned probe gather checked on every
+rank; any rank's failure leaves every rank on NCCL. Prompt chunks and
+gathers past the slot stay on NCCL. glm_cuda imports tp.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/build/cuda_engines.zig            |  1 +
+ zig/src/families/glm/cuda_engine.zig  |  5 +-
+ zig/src/families/glm/cuda_forward.zig |  5 +-
+ zig/src/families/glm/cuda_mesh.zig    | 94 +++++++++++++++++++++++++++
+ zig/src/families/glm/cuda_native.zig  |  5 ++
+ 5 files changed, 108 insertions(+), 2 deletions(-)
+ create mode 100644 zig/src/families/glm/cuda_mesh.zig
+
+diff --git a/zig/build/cuda_engines.zig b/zig/build/cuda_engines.zig
+index bb929f7..cdd6f36 100644
+--- a/zig/build/cuda_engines.zig
++++ b/zig/build/cuda_engines.zig
+@@ -10,6 +10,7 @@ pub fn glmCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     m.addImport("canon", canon);
+     m.addImport("lanes", lanes);
+     m.addImport("heat", heat);
++    m.addImport("tp", @import("tp.zig").module(b, target, optimize, cuda)); // cuda_mesh: fabric/tp's multirank RoCE gather
+     return m;
+ }
+ 
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 217db15..58887f6 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -88,6 +88,7 @@ pub const Engine = struct {
+     lib: *const cuda.nccl.Library,
+     comm: cuda.nccl.Comm,
+     group: ?*const cuda.tp_group.Group = null, // the main stream's all-gathers (RoCE on two ranks); null: lib and comm
++    mesh: ?*@import("cuda_mesh.zig").Mesh = null, // TF_GLM_ROCE_MESH: decode all-gathers by RoCE writes (3+ ranks)
+     ce: ?*cuda.ce_push.Push = null, // TF_GLM_CE_EXCHANGE=1: a prompt chunk's split exchanges by copy engines (cuda_ce.zig)
+     images: ?*images_mod.Images = null, // --vision: a prompt pass's image rows (rank 0 encodes, the others receive)
+     packs: mm_mod.Packed = .{}, // the linears packed at load and their bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
+@@ -281,6 +282,7 @@ pub const Engine = struct {
+     pub fn deinit(e: *Engine) void {
+         e.stream.synchronize() catch {};
+         if (e.side) |x| x.s.synchronize() catch {}; // shared-expert work still in flight reads buffers and weights freed below
++        if (e.mesh) |m| m.deinit();
+         e.gpa.free(e.packs.ptrs);
+         e.gpa.free(e.packs.bits);
+         if (e.drafter) |dr| dr.deinit();
+@@ -382,7 +384,7 @@ pub const Engine = struct {
+     }
+ 
+     pub fn exchange(e: *const Engine) fw.Exchange {
+-        return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .group = e.group } };
++        return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .group = e.group, .mesh = e.mesh } };
+     }
+ 
+     pub fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
+@@ -799,6 +801,7 @@ pub const Engine = struct {
+     /// A failed RoCE gather's error, after a synchronize whose result read gathered rows (they hold nothing then).
+     pub fn checkGathers(e: *const Engine) !void {
+         if (e.group) |g| try g.check();
++        if (e.mesh) |m| try m.check();
+     }
+ 
+     pub fn copy(e: *const Engine, dst: u64, src: u64, bytes: usize) !void {
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 2ea87f3..906cb58 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -200,7 +200,8 @@ pub const Pieces = struct {
+ pub const Exchange = union(enum) {
+     local,
+     // group: the main stream's all-gathers through it (RoCE writes for small ones on two ranks); side streams stay raw
+-    nccl: struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, group: ?*const cuda.tp_group.Group = null },
++    // mesh: TF_GLM_ROCE_MESH's decode all-gathers by RoCE writes to every peer (cuda_mesh.zig), three ranks or more
++    nccl: struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, group: ?*const cuda.tp_group.Group = null, mesh: ?*@import("cuda_mesh.zig").Mesh = null },
+ };
+ 
+ /// One rank of the forward: its weights, its sequence's caches, the window's buffers.
+@@ -262,6 +263,8 @@ pub const Forward = struct {
+             },
+             .nccl => |n| {
+                 const r = f.ranks[0];
++                // a decode window's gathers (not a prompt chunk's) go by the mesh's RoCE writes when they fit its slot
++                if (n.mesh) |m| if (!r.b.prefill and m.fits(bytes)) return m.allGatherBytes(r.b.gathered + r.w.share.rank * bytes, r.b.gathered, bytes, f.stream.handle);
+                 if (n.group) |g| return g.allGather(f.stream, r.b.gathered + r.w.share.rank * bytes, r.b.gathered, bytes);
+                 const count = rows * c.hidden;
+                 try n.lib.check(n.lib.api.ncclAllGather(r.b.gathered + r.w.share.rank * bytes, r.b.gathered, count, .f32, n.comm, f.stream.handle), "ncclAllGather");
+diff --git a/zig/src/families/glm/cuda_mesh.zig b/zig/src/families/glm/cuda_mesh.zig
+new file mode 100644
+index 0000000..fd36790
+--- /dev/null
++++ b/zig/src/families/glm/cuda_mesh.zig
+@@ -0,0 +1,94 @@
++//! TF_GLM_ROCE_MESH=1 at three ranks or more (six Sparks on a switch): a decode window's small all-gathers as
++//! one-shot RoCE writes, each rank's shard posted once to every peer (fabric/tp's multirank gather), where NCCL's ring
++//! took W - 1 hops; prompt chunks and every larger exchange stay on NCCL. Measured on six GB10s over one 200G switch
++//! (tf-tp-test suite, world 6): 16 / 32 / 64 KiB a rank 23 / 28 / 36 us against NCCL's 52 / 80 / 86.
++//!
++//! Its bootstrap and HCA pick are fabric/tp's (TF_TP_MASTER, TF_TP_PORT, TF_TP_ROCE_HCA, TF_TP_MAILBOX_MAX_KB), its
++//! kernel the mailbox fatbin at TF_TP_KERNEL_IMAGE. Every rank keeps it or none does: a failed setup, or a probe
++//! gather whose bytes are not every rank's pattern, on any rank leaves every rank on NCCL.
++const std = @import("std");
++const cuda = @import("cuda");
++const tp = @import("tp");
++
++pub const Mesh = tp.roce_multi.Roce;
++
++const probe_bytes = 64 * 1024;
++
++pub fn wanted() bool {
++    const v = std.c.getenv("TF_GLM_ROCE_MESH") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++/// The mesh for rank `rank` of `world`, or null (not wanted, under three ranks, or any rank could not bring it up).
++pub fn open(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, rank: usize, world: usize, stream: cuda.Stream) !?*Mesh {
++    if (!wanted() or world < 3) return null;
++    var cfg = try tp.Config.fromEnv();
++    cfg.rank = @intCast(rank);
++    cfg.world = @intCast(world);
++    cfg = cfg.resolved();
++    const path = std.c.getenv("TF_TP_KERNEL_IMAGE") orelse {
++        std.log.warn("glm mesh: TF_GLM_ROCE_MESH=1 without TF_TP_KERNEL_IMAGE (the mailbox fatbin); NCCL keeps the gathers", .{});
++        return null;
++    };
++    // the driver keeps its own copy of a loaded image; these bytes live as long as the process (a few hundred KiB)
++    const image = try std.Io.Dir.cwd().readFileAllocOptions(io, std.mem.span(path), gpa, .limited(1 << 26), .@"16", null);
++    var b = try tp.Bootstrap.open(cfg);
++    defer b.close();
++    var specs: [tp.roce_verbs.max_hcas]tp.roce_verbs.HcaSpec = undefined;
++    var n: usize = 0;
++    var ok = true;
++    n = tp.roce_pick.resolve(cfg, &b, &specs) catch blk: {
++        ok = false;
++        break :blk 0;
++    };
++    if (!try agree(&b, ok)) return null;
++    const r: ?*Mesh = Mesh.init(d, &b, image, .{ .wire = .verbs, .hcas = specs[0..n], .traffic_class = cfg.roce_tc, .cpu = cfg.roce_cpu, .max_bytes = cfg.mailbox_max_bytes, .timeout_ns = cfg.mailbox_timeout_ns, .fast = cfg.roce_fast, .blocks = cfg.roce_blocks }) catch |e| blk: {
++        std.log.warn("glm mesh: rank {d}: RoCE setup failed ({s})", .{ rank, @errorName(e) });
++        break :blk null;
++    };
++    if (!try agree(&b, r != null)) {
++        if (r) |x| x.deinit();
++        return null;
++    }
++    const good = probe(gpa, d, r.?, rank, world, stream) catch |e| blk: {
++        std.log.warn("glm mesh: rank {d}: probe failed ({s})", .{ rank, @errorName(e) });
++        break :blk false;
++    };
++    if (!try agree(&b, good)) {
++        r.?.deinit();
++        return null;
++    }
++    std.log.info("glm mesh: rank {d} of {d}: decode all-gathers up to {d} KiB a rank by RoCE writes", .{ rank, world, cfg.mailbox_max_bytes / 1024 });
++    return r.?;
++}
++
++/// Every rank's `mine` over the bootstrap: true only when all are.
++fn agree(b: *tp.Bootstrap, mine: bool) !bool {
++    var blobs: [tp.bootstrap.max_ranks][]const u8 = undefined;
++    var buf: [tp.bootstrap.max_ranks]u8 = undefined;
++    var all = true;
++    for (try b.allGather(&.{@intFromBool(mine)}, &buf, &blobs)) |x| all = all and x.len == 1 and x[0] == 1;
++    return all;
++}
++
++/// One gather of probe_bytes a rank, byte (rank * 131 + i * 7) mod 251 + 1, checked on the host in rank order.
++fn probe(gpa: std.mem.Allocator, d: *const cuda.Driver, r: *Mesh, rank: usize, world: usize, stream: cuda.Stream) !bool {
++    const host = try gpa.alloc(u8, world * probe_bytes);
++    defer gpa.free(host);
++    var dev: cuda.abi.DevicePtr = 0;
++    try d.check(d.api.cuMemAlloc_v2(&dev, world * probe_bytes), "cuMemAlloc");
++    defer _ = d.api.cuMemFree_v2(dev);
++    for (host[0..probe_bytes], 0..) |*x, i| x.* = pattern(rank, i);
++    const mine = dev + rank * probe_bytes;
++    try d.check(d.api.cuMemcpyHtoD_v2(mine, host.ptr, probe_bytes), "cuMemcpyHtoD");
++    try r.allGatherBytes(mine, dev, probe_bytes, stream.handle);
++    try stream.synchronize();
++    try r.check();
++    try d.check(d.api.cuMemcpyDtoH_v2(host.ptr, dev, world * probe_bytes), "cuMemcpyDtoH");
++    for (0..world) |q| for (0..probe_bytes) |i| if (host[q * probe_bytes + i] != pattern(q, i)) return false;
++    return true;
++}
++
++fn pattern(rank: usize, i: usize) u8 {
++    return @intCast((rank * 131 + i * 7) % 251 + 1);
++}
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index c9238a1..ff4f835 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -282,6 +282,11 @@ fn finishRank(a: OpenArgs) !Loaded {
+     }
+     try own.group.openRoce(gpa, io, ctx.d, own.e.stream, roce_bytes); // both ranks bring it up or neither does
+     errdefer if (own.group.fast) |f| f.deinit();
++    own.e.mesh = try @import("cuda_mesh.zig").open(gpa, io, ctx.d, p.rank, p.world, own.e.stream); // every rank, or none
++    errdefer if (own.e.mesh) |m| {
++        m.deinit();
++        own.e.mesh = null;
++    };
+     try @import("cuda_p2p.zig").open(gpa, ctx.d, &own.group, own.e.stream, own.e.m.glue.p2p_gather); // both ranks, or neither
+     errdefer if (own.group.p2p) |x| {
+         x.deinit();
+-- 
+2.43.0
+

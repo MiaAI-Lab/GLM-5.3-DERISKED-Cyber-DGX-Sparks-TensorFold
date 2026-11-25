@@ -1,0 +1,60 @@
+From 67ffeaa78c7de080424ed006f8ce8b6718e5bafd Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:09:04 +0200
+Subject: [PATCH] glm_moe_dsa: the index scores' query rope reads every pair
+ before writing
+
+tf_glm_dsa_scores ropes each head's query in place in shared memory,
+pair (2 i, 2 i + 1) moving to (i, 32 + i): lane i wrote elements other
+lanes had yet to read, ordered only by the compiler's schedule. The index
+scores, so the picks and every sparse prompt row after them, changed from
+run to run (two runs of one 6.6k-token text: mean KL 0.03, 3% top-1 flips,
+identical up to position 2048, the dense limit). Every pair is now read
+and roped into registers, then written after a barrier.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/glm_glue_attn.cuh | 22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index 2df1f6a..cfd9f09 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -909,15 +909,27 @@ extern "C" __global__ void __launch_bounds__(128)
+   glm_attn::wait<0>();
+   __syncthreads();
+   // The queries' rope, in place while q's rows are the only thing in shared: then the fragments read roped queries.
++  // Pair i of (2 i, 2 i + 1) moves to (i, 32 + i), so a lane writes elements another lane has yet to read: every pair
++  // is read and roped into registers first, then (after a barrier) written. Done in one pass, the reads and writes of
++  // a head's lanes raced: the index scores, the picks and every sparse row after them changed from run to run.
+   const int p0q = pos[0] + (int)r;
+-  for (int idx = threadIdx.x; idx < HP * (ROPE / 2); idx += 128) {
+-    const int hh = idx / (ROPE / 2), i = idx % (ROPE / 2);
++  constexpr int PER = HP * (ROPE / 2) / 128;  // pairs a thread ropes (8)
++  float2 rot[PER];
++#pragma unroll
++  for (int k = 0; k < PER; ++k) {
++    const int idx = threadIdx.x + 128 * k, hh = idx / (ROPE / 2), i = idx % (ROPE / 2);
+     if (hh >= heads) continue;
+     const int u0 = (2 * i) / 8, l0 = (2 * i) % 8;
+     const float x0 = __bfloat162float(sm[at(hh, u0) + l0]), x1 = __bfloat162float(sm[at(hh, u0) + l0 + 1]);
+-    const float2 o = glm_dsa_rope(x0, x1, p0q, inv, i);
+-    sm[at(hh, i / 8) + i % 8] = __float2bfloat16_rn(o.x);
+-    sm[at(hh, D / 4 + i / 8) + i % 8] = __float2bfloat16_rn(o.y);
++    rot[k] = glm_dsa_rope(x0, x1, p0q, inv, i);
++  }
++  __syncthreads();
++#pragma unroll
++  for (int k = 0; k < PER; ++k) {
++    const int idx = threadIdx.x + 128 * k, hh = idx / (ROPE / 2), i = idx % (ROPE / 2);
++    if (hh >= heads) continue;
++    sm[at(hh, i / 8) + i % 8] = __float2bfloat16_rn(rot[k].x);
++    sm[at(hh, D / 4 + i / 8) + i % 8] = __float2bfloat16_rn(rot[k].y);
+   }
+   __syncthreads();
+   uint32_t aq[D / 16][2][4];
+-- 
+2.43.0
+

@@ -1,0 +1,837 @@
+From a45d656aa1a9465b7a5c3aaf492565cd5c22bd30 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 19:42:55 +0200
+Subject: glm: TF_GLM_PF_EXPERTS_ONCE, prompt gate/up rotate member rows in
+ tf_exl3_prompt_gu_once (no per-route copies)
+
+Default off. tf_exl3_prompt_gu_once: one block a matrix (gate, up) of a plan item, all 512 columns; each member
+row's 128-wide k block rotated in shared memory with rot_in's arithmetic (FMUL, fwht128 as fwht128f, FMUL, fp16),
+raw rows and suh by cp.async ahead, each warp streaming its own weight tiles; fp32 sums to the xg region, the item's
+second block runs tgateup_n's epilogue. xd byte-identical to rot_in + tf_exl3_prompt_gu; old kernels' SASS unchanged.
+tf-cuda-test exl3-prompt-once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/exl3_experts.cu          |   1 +
+ zig/kernels/cuda/exl3_prompt_once.cuh     | 288 ++++++++++++++++++++++
+ zig/src/cuda/exl3_prompt.zig              |  51 +++-
+ zig/src/families/glm/cuda_exl3.zig        |  14 ++
+ zig/tests/cuda/exl3_prompt_once_tests.zig | 266 ++++++++++++++++++++
+ zig/tests/cuda/main.zig                   |   2 +
+ 6 files changed, 614 insertions(+), 8 deletions(-)
+ create mode 100644 zig/kernels/cuda/exl3_prompt_once.cuh
+ create mode 100644 zig/tests/cuda/exl3_prompt_once_tests.zig
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index 87d6e9ba4..c5a8350e5 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -319,6 +319,7 @@ extern "C" __global__ void tf_exl3_plan_finish(const PlanStage a) {
+ // Transposed fp32 prompt accumulators in the shared EXL3 module; decode kernels above stay unchanged.
+ #include "exl3_prompt.cuh"
+ using namespace tf_exl3_prompt;
++#include "exl3_prompt_once.cuh"   // TF_GLM_PF_EXPERTS_ONCE: tf_exl3_prompt_gu_once (patch 0206)
+ extern "C" __global__ void tf_exl3_prompt_rotate(const __nv_bfloat16* __restrict__ x, int x_stride, const half* __restrict__ suh,
+         half* __restrict__ out, int K) {
+     const int row = blockIdx.x, blk = blockIdx.y;
+diff --git a/zig/kernels/cuda/exl3_prompt_once.cuh b/zig/kernels/cuda/exl3_prompt_once.cuh
+new file mode 100644
+index 000000000..b2e68275a
+--- /dev/null
++++ b/zig/kernels/cuda/exl3_prompt_once.cuh
+@@ -0,0 +1,288 @@
++// Routed experts' prompt gate/up with the input rotation fused into the activation load (TF_GLM_PF_EXPERTS_ONCE,
++// patch 0206, MiaAI-Lab). The same xd, bit for bit, as tf_exl3_experts_rot_in followed by tf_exl3_prompt_gu:
++//  - each member row's rotation (bf16 x * fp16 suh, fwht128 in fp32, * 1/sqrt(128), fp16) is rot_in's arithmetic in
++//    rot_in's order (FMUL, the butterflies of tf_exl3::fwht128, FMUL, round), computed in shared memory a 128-wide k
++//    block at a time from the raw token row: no per-route copies through DRAM;
++//  - every sum is the same chain of mma.m16n8k16 over the ascending k tiles from zero, with the same decoded A
++//    fragments (decode_a8) and the same B values, so the same fp32 bits; the epilogue is tgateup_n's, line for line.
++// A block takes one matrix (gate or up: blockIdx.x) of one plan item (<= 64 members of an expert: blockIdx.y), all
++// N = 512 columns (32 tiles, 4 a warp), so each member row is rotated once per matrix (rot_in's work, without its
++// DRAM round trip) and each weight tile is decoded once an item. Its fp32 sums go to a scratch S [2][pairs][N]; the
++// item's second block to finish (an atomic count an item, zeroed before the launch) runs the epilogue over both.
++#pragma once
++#include "exl3_prompt.cuh"
++
++namespace tf_exl3_once {
++using namespace tf_exl3_prompt;
++
++constexpr int OM = TPM;                 // members a block: one plan item
++constexpr int OW = 8, OT = OW * 32;     // warps, threads
++constexpr int ON = 512;                 // columns (one rank's expert width at TP4)
++constexpr int OTMT = ON / 16 / OW;      // 16-column tiles a warp
++constexpr int OKB = 128;                // k of a rotation block (fwht128's)
++constexpr int OKT = OKB / 16;           // k tiles a rotation block
++constexpr int OXS = OKB + 8;            // halves a rotated row in shared memory (ldmatrix rows 16 bytes apart mod 128)
++constexpr int OXH = OM * OXS;           // halves of one block's rotated rows
++constexpr int OWS = 8;                  // weight stages, one k tile each (a warp streams its own tiles)
++constexpr int ORD = OWS - 2;            // k tiles ahead a raw row's copy is issued (landed by the weight wait)
++constexpr int ORS = 8;                  // raw row slots a warp (256 bytes: 32 lanes x 4 bf16)
++constexpr int OTW = tile_words<8>();    // 32 words a 4-bit tile
++constexpr int OWB = OW * OTMT * OTW * 4;   // bytes a weight stage: 32 tiles
++constexpr int OSU = OKB * 2;            // bytes of a block's suh
++constexpr int smem_bytes() { return 2 * OXH * 2 + OWS * OWB + OW * ORS * 256 + 2 * OSU; }
++static_assert(OTMT == 4 && OKT == OW, "4 tiles a warp; a block's rotations one a k tile a warp");
++static_assert(ORS > ORD && (ORS & (ORS - 1)) == 0 && OKT % ORS == 0, "raw slots by k tile");
++static_assert(smem_bytes() <= 99 * 1024, "one block a multiprocessor");
++
++// One lane's 4 values of a member row's k block rotated as fp16 (raw: the lane's 4 bf16 of the row's block, s: its 4
++// suh). rot_in's arithmetic: FMUL (no contraction), fwht128 (as fwht128f: the same butterflies, each an exact FFMA of
++// +-1, so the same bits), FMUL, round to fp16. A dead row (no member): zeros.
++__device__ __forceinline__ uint2 rot_one(uint2 raw, bool live, const half* s, int lane) {
++    const __nv_bfloat162 x01 = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
++    const __nv_bfloat162 x23 = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
++    const float xv[4] = {__low2float(x01), __high2float(x01), __low2float(x23), __high2float(x23)};
++    const uint2 sw = *reinterpret_cast<const uint2*>(s);
++    const half2 s01 = *reinterpret_cast<const half2*>(&sw.x), s23 = *reinterpret_cast<const half2*>(&sw.y);
++    const float sv[4] = {__low2float(s01), __high2float(s01), __low2float(s23), __high2float(s23)};
++    float v[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) v[j] = __fmul_rn(xv[j], sv[j]);
++    fwht128f(v, lane);
++    half2 o01 = __halves2half2(__float2half_rn(__fmul_rn(v[0], HAD_SCALE)), __float2half_rn(__fmul_rn(v[1], HAD_SCALE)));
++    half2 o23 = __halves2half2(__float2half_rn(__fmul_rn(v[2], HAD_SCALE)), __float2half_rn(__fmul_rn(v[3], HAD_SCALE)));
++    if (!live) o01 = o23 = __float2half2_rn(0.f);
++    uint2 o;
++    o.x = *reinterpret_cast<const uint32_t*>(&o01);
++    o.y = *reinterpret_cast<const uint32_t*>(&o23);
++    return o;
++}
++
++// tgateup_n's epilogue, line for line, for member p's 128-column block cb from its gate and up sums (gs, us: the
++// lane's 4 columns, read through L2: the other block of the item wrote one of them).
++__device__ __forceinline__ void epi_member(const float* gs, const float* us, int p, int lane, int e, int cb, const half* __restrict__ svh_g,
++        const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd, int N, float limit, int act_mode) {
++    const int n = cb * 128 + 4 * lane;
++    const float4 g4 = __ldcg(reinterpret_cast<const float4*>(gs + n)), u4 = __ldcg(reinterpret_cast<const float4*>(us + n));
++    float gv[4] = {g4.x, g4.y, g4.z, g4.w}, uv[4] = {u4.x, u4.y, u4.z, u4.w};
++    fwht128f(gv, lane);
++    fwht128f(uv, lane);
++    float v[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        float gg = gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j]);
++        float uu = uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j]);
++        if (act_mode == 0) { gg = bf16r(gg); uu = bf16r(uu); }
++        if (limit > 0) { gg = upTo(gg, limit); uu = within(uu, limit); }
++        float act = gg / (1.f + expf(-gg));
++        if (act_mode == 0) act = bf16r(act);
++        act *= uu;
++        if (act_mode == 0) act = bf16r(act);
++        v[j] = act * __half2float(suh_d[(size_t)e * N + n + j]);
++    }
++    fwht128f(v, lane);
++    const half2 o01 = __halves2half2(__float2half_rn(v[0] * HAD_SCALE), __float2half_rn(v[1] * HAD_SCALE));
++    const half2 o23 = __halves2half2(__float2half_rn(v[2] * HAD_SCALE), __float2half_rn(v[3] * HAD_SCALE));
++    uint2 packed;
++    packed.x = *reinterpret_cast<const uint32_t*>(&o01);
++    packed.y = *reinterpret_cast<const uint32_t*>(&o23);
++    *reinterpret_cast<uint2*>(xd + (size_t)p * N + n) = packed;
++}
++
++// Matrix `mat` of an item (expert e, cnt members rows_sh, their token rows tok_sh): the fp32 sums into S[mat][p][:].
++template <int NBA>
++__device__ __forceinline__ void sums_n(const __nv_bfloat16* __restrict__ x, int x_stride, const uint64_t* __restrict__ T,
++        const half* __restrict__ suh, float* __restrict__ S, int K, unsigned char* smem, const int* rows_sh, const int* tok_sh, int e) {
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int kts = K >> 4, blocks = K / OKB;
++    half* Xb = reinterpret_cast<half*>(smem);                        // two blocks' rotated rows
++    const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem);
++    const uint32_t wbase = sbase + (uint32_t)(2 * OXH * 2);           // the weight ring
++    // each warp streams its own 4 tiles (no block barrier a k tile): the lane's 16 bytes `part` of tile q
++    const int q = warp * OTMT + (lane >> 3), part = lane & 7;
++    const uint32_t* wsrc = reinterpret_cast<const uint32_t*>(T[e]) + (size_t)q * OTW + part * 4;
++    const size_t wstep = (size_t)(ON / 16) * OTW;                     // words a k tile row of tiles
++    const uint32_t wdst = wbase + (uint32_t)(q * OTW * 4 + part * 16);
++    uint32_t wfill = 0;   // the ring slot (byte offset) the next weight stage goes to
++    int wnext = 0;        // the next weight stage's k tile
++    auto wissue = [&]() {  // past the last k tile: an empty copy (src-size 0) of a valid address, so no branch
++        const bool in = wnext < kts;
++        cp16s(wdst + wfill, wsrc + (size_t)(in ? wnext : 0) * wstep, in ? 16 : 0);
++        wfill = wfill + OWB == (uint32_t)(OWS * OWB) ? 0u : wfill + OWB;
++        ++wnext;
++    };
++    // row j * 8 + warp's raw lane pointer (null: no member, the row is zeros)
++    auto rawp = [&](int j) -> const __nv_bfloat16* {
++        const int t = tok_sh[j * 8 + warp];
++        return t < 0 ? nullptr : x + (size_t)t * x_stride + 4 * lane;
++    };
++    // the raw rows' ring: this lane's 8 bytes of slot s (a copy issued ORD k tiles ahead of its rotation)
++    const uint32_t rbase = wbase + (uint32_t)(OWS * OWB) + (uint32_t)(warp * ORS * 256 + lane * 8);
++    auto rawcopy = [&](int slot, int j, int blk) {   // row j * 8 + warp of block blk; no member: zeros (src-size 0)
++        const __nv_bfloat16* src = rawp(j);
++        asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(rbase + (uint32_t)(slot * 256)), "l"(src ? src + blk * OKB : x),
++                     "r"(src ? 8 : 0));
++    };
++    auto ldsraw = [&](int slot) -> uint2 {
++        uint2 v;
++        asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];\n" : "=r"(v.x), "=r"(v.y) : "r"(rbase + (uint32_t)(slot * 256)));
++        return v;
++    };
++    // the suh of the block the rotations write, two slots (a block's copy issued a block ahead by warp 0, lanes 0-15)
++    const uint32_t ubase = wbase + (uint32_t)(OWS * OWB + OW * ORS * 256);
++    const half* ush = reinterpret_cast<const half*>(smem + (ubase - sbase)) + 4 * lane;
++    auto suhcopy = [&](int blk) {
++        if (warp == 0 && lane < OSU / 16) cp16s(ubase + (uint32_t)((blk & 1) * OSU + lane * 16), suh + (size_t)e * K + blk * OKB + lane * 8, 16);
++    };
++    float acc[OTMT][NBA][4];
++#pragma unroll
++    for (int i = 0; i < OTMT; ++i)
++#pragma unroll
++        for (int j = 0; j < NBA; ++j)
++#pragma unroll
++            for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
++    // the raw rows of k tiles 0 .. ORD - 1's rotations (block 1, rows j * 8 + warp) and block 1's suh, with stage 0
++    const int b1 = blocks > 1 ? 1 : 0;
++#pragma unroll
++    for (int j = 0; j < ORD; ++j)
++        if (j < NBA) rawcopy(j & (ORS - 1), j, b1);
++    suhcopy(b1);
++#pragma unroll
++    for (int s = 0; s < OWS - 1; ++s) {
++        wissue();
++        cp_commit();
++    }
++    // block 0's rows, before the loop
++    const half* sg0 = suh + (size_t)e * K + 4 * lane;
++#pragma unroll
++    for (int j = 0; j < NBA; ++j) {
++        const __nv_bfloat16* src = rawp(j);
++        const uint2 raw = src ? __ldg(reinterpret_cast<const uint2*>(src)) : make_uint2(0u, 0u);
++        *reinterpret_cast<uint2*>(Xb + (size_t)(j * 8 + warp) * OXS + 4 * lane) = rot_one(raw, src != nullptr, sg0, lane);
++    }
++    const uint32_t xlane = (uint32_t)((((lane & 7) + ((lane >> 4) & 1) * 8) * OXS + ((lane >> 3) & 1) * 8) * 2);
++    const uint32_t wwarp = (uint32_t)(warp * OTMT * OTW * 4);
++    uint32_t wo[2];
++    {
++        int word, offset;
++        lane_start<8>(lane, word, offset);
++#pragma unroll
++        for (int i = 0; i < 2; ++i) wo[i] = (uint32_t)(((word + i) % OTW) * 4);
++    }
++    auto decode = [&](uint32_t tile, uint32_t (&a)[4]) { decode_a8(lds32(tile + wo[1]), lds32(tile + wo[0]), a); };
++    cp_wait<OWS - 2>();
++    __syncwarp();
++    uint32_t A[2][OTMT][4];
++#pragma unroll
++    for (int i = 0; i < OTMT; ++i) decode(wbase + wwarp + (uint32_t)(i * OTW * 4), A[0][i]);
++    uint32_t wdec = OWB;   // the slot of the k tile decoded next (k tile 1)
++    for (int b = 0; b < blocks; ++b) {
++        __syncthreads();   // block b's rows and suh are in; every warp is past block b - 1 (whose buffers block b + 1 takes)
++        const int rb = b + 1 < blocks ? b + 1 : b;   // the block this one's rotations write (the last: a dead copy)
++        half* Xn = Xb + ((b + 1) & 1) * OXH;
++        const uint32_t xb = sbase + (uint32_t)((b & 1) * OXH * 2) + xlane;
++        const half* us = ush + (rb & 1) * OKB;
++#pragma unroll
++        for (int j = 0; j < OKT; ++j) {
++            uint32_t (&Ac)[OTMT][4] = A[j & 1];
++            uint32_t (&An)[OTMT][4] = A[(j & 1) ^ 1];
++            cp_wait<OWS - 3>();   // this warp's stage kt + 1 landed, and the raw row of this k tile's rotation
++            __syncwarp();         // all its lanes' pieces; the slot the next stage takes was decoded two k tiles ago
++            {   // the raw row of k tile kt + ORD's rotation (block b3 + 1, row j3 * 8 + warp), in this k tile's group
++                const int j3 = (j + ORD) % OKT, carry = (j + ORD) / OKT;   // compile-time once unrolled
++                if (j3 < NBA) {
++                    const int b3 = b + carry + 1;
++                    rawcopy((j + ORD) & (ORS - 1), j3, b3 < blocks ? b3 : blocks - 1);
++                }
++            }
++            if (j == 0 && b + 2 < blocks) suhcopy(b + 2);   // landed, and seen by every warp, at block b + 1's barrier
++            wissue();
++            cp_commit();
++            if (j < NBA)   // the next block's row j * 8 + warp (compile-time j: no branch)
++                *reinterpret_cast<uint2*>(Xn + (size_t)(j * 8 + warp) * OXS + 4 * lane) =
++                    rot_one(ldsraw(j & (ORS - 1)), tok_sh[j * 8 + warp] >= 0, us, lane);
++            // the next k tile's A (past the last: a stale slot, decoded and never used)
++#pragma unroll
++            for (int i = 0; i < OTMT; ++i) decode(wbase + wdec + wwarp + (uint32_t)(i * OTW * 4), An[i]);
++            wdec = wdec + OWB == (uint32_t)(OWS * OWB) ? 0u : wdec + OWB;
++            const uint32_t xk = xb + (uint32_t)(j * 32);
++#pragma unroll
++            for (int jp = 0; jp < (NBA + 1) / 2; ++jp) {
++                const uint32_t xa = xk + (uint32_t)(jp * 16 * OXS * 2);
++                if (2 * jp + 1 < NBA) {
++                    uint32_t r[4];
++                    ldsm4(r, xa);
++                    const uint32_t bl[2] = {r[0], r[1]}, bh[2] = {r[2], r[3]};
++#pragma unroll
++                    for (int i = 0; i < OTMT; ++i) {
++                        mma16816(acc[i][2 * jp], Ac[i], bl);
++                        mma16816(acc[i][2 * jp + 1], Ac[i], bh);
++                    }
++                } else {
++                    uint32_t r[2];
++                    ldsm2(r, xa);
++#pragma unroll
++                    for (int i = 0; i < OTMT; ++i) mma16816(acc[i][2 * jp], Ac[i], r);
++                }
++            }
++        }
++    }
++    cp_wait<0>();
++    // the sums: S[p][col], col = (warp * 4 + i) * 16 + g (+ 8), members of the NBA blocks below the count
++    const int g = lane >> 2, t = lane & 3;
++#pragma unroll
++    for (int nb = 0; nb < NBA; ++nb) {
++        const int m0 = nb * 8 + 2 * t;
++        const int p0 = rows_sh[m0], p1 = rows_sh[m0 + 1];
++#pragma unroll
++        for (int i = 0; i < OTMT; ++i) {
++            const int col = (warp * OTMT + i) * 16 + g;
++            if (p0 >= 0) {
++                S[(size_t)p0 * ON + col] = acc[i][nb][0];
++                S[(size_t)p0 * ON + col + 8] = acc[i][nb][2];
++            }
++            if (p1 >= 0) {
++                S[(size_t)p1 * ON + col] = acc[i][nb][1];
++                S[(size_t)p1 * ON + col + 8] = acc[i][nb][3];
++            }
++        }
++    }
++}
++
++}  // namespace tf_exl3_once
++
++// Block (matrix: 0 gate, 1 up; item). S: fp32 [2][pairs][512] scratch; done: int [items], zero at launch (the caller
++// zeroes it). Dynamic shared memory: tf_exl3_once::smem_bytes(). 4-bit gate and up, N = 512.
++extern "C" __global__ void __launch_bounds__(256, 1) tf_exl3_prompt_gu_once(const __nv_bfloat16* __restrict__ x, int x_stride, int slots,
++        const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const half* __restrict__ suh_g, const half* __restrict__ suh_u,
++        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_g,
++        const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd, float* __restrict__ S, int* __restrict__ done,
++        int pairs, int K, float limit, int act_mode) {
++    using namespace tf_exl3_once;
++    extern __shared__ __align__(16) unsigned char once_smem[];
++    __shared__ int rows_sh[OM], tok_sh[OM], last_sh;
++    const int mat = blockIdx.x, item = blockIdx.y;
++    if (item >= counts[0]) return;
++    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
++    if (threadIdx.x < OM) {
++        const int p = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
++        rows_sh[threadIdx.x] = p;
++        tok_sh[threadIdx.x] = p < 0 ? -1 : p / slots;   // the member's token row (rot_in's p / slots)
++    }
++    __syncthreads();
++    float* Sm = S + (size_t)mat * pairs * ON;
++#define TF_EXL3_ONCE_SUMS(NBA) \
++    sums_n<NBA>(x, x_stride, mat ? Tu : Tg, mat ? suh_u : suh_g, Sm, K, once_smem, rows_sh, tok_sh, e)
++    TF_EXL3_PROMPT_NBA(cnt, TF_EXL3_ONCE_SUMS)
++#undef TF_EXL3_ONCE_SUMS
++    __threadfence();   // the sums, before the count says so
++    __syncthreads();
++    if (threadIdx.x == 0) last_sh = atomicAdd(done + item, 1);
++    __syncthreads();
++    if (last_sh != 1) return;   // the first block of the item: the second runs the epilogue
++    __threadfence();
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    for (int w = warp; w < cnt * (ON / 128); w += OW) {
++        const int i = w >> 2, cb = w & 3, p = rows_sh[i];
++        epi_member(S + (size_t)p * ON, S + ((size_t)pairs + p) * ON, p, lane, e, cb, svh_g, svh_u, suh_d, xd, ON, limit, act_mode);
++    }
++}
+diff --git a/zig/src/cuda/exl3_prompt.zig b/zig/src/cuda/exl3_prompt.zig
+index f00ade22b..e0f191e16 100644
+--- a/zig/src/cuda/exl3_prompt.zig
++++ b/zig/src/cuda/exl3_prompt.zig
+@@ -11,7 +11,9 @@ pub const tile = 64;
+ /// `y` [pairs][dims] fp32 when `yrow` is 0; with `yrow` set the caller points `y` at its own slot rows ([rows][yrow][dims],
+ /// pair p = row * slots + slot at row * yrow + slot) and the down kernel writes there, so no copy follows.
+ /// `y_bf16` (with `yrow` set): the down kernel writes bf16 slot rows, as an NVFP4 prompt chunk's (GLM's prompt chunks; TF_GLM_EXL3_BF16_SLOTS=0: fp32).
+-pub const Scratch = struct { xg: u64, xu: u64, xd: u64, y: u64, rows: usize, slots: usize, yrow: usize = 0, y_bf16: bool = false };
++/// `once` (GLM's TF_GLM_PF_EXPERTS_ONCE): gate and up from the raw rows in one kernel (onceEligible), no per-route rotated
++/// copies; it takes the xg region for its fp32 sums and item counts (onceFits), so xg and xu hold nothing after it.
++pub const Scratch = struct { xg: u64, xu: u64, xd: u64, y: u64, rows: usize, slots: usize, yrow: usize = 0, y_bf16: bool = false, once: bool = false };
+ /// A group's verified half-bit width: its own field, else uniform_k2; 0 when unverified or the two disagree.
+ fn verified(group: u32, uniform: u32) u32 {
+     if (group == 0) return uniform;
+@@ -67,6 +69,24 @@ pub fn scratchFor(base: u64, l: ex.Layer, rows: usize, slots: usize, own_y: bool
+     _ = std.math.add(u64, base, total) catch return error.Exl3Shape;
+     return .{ .xg = base, .xu = if (l.shared_input) base else base + ns[0], .xd = base + ns[0] + ns[1], .y = if (own_y) base + ns[0] + ns[1] + ns[2] else 0, .rows = rows, .slots = slots };
+ }
++/// tf_exl3_prompt_gu_once (exl3_prompt_once.cuh): its dynamic shared memory (smem_bytes()), width and threads.
++pub const once_smem: u32 = 2 * 64 * 136 * 2 + 8 * 32 * 32 * 4 + 8 * 8 * 256 + 2 * 128 * 2;
++pub const once_width = 512;
++/// The layers the once kernel takes: 4-bit gate and up (mcg, every expert's own input scales), one rank's width 512
++/// (TP4's), whole 128-column k blocks, x rows 8-byte aligned for its 8-byte raw copies.
++pub fn onceEligible(l: ex.Layer, x: u64, stride: usize) bool {
++    return eligible(l) and widths(l).gu == 8 and !l.shared_input and l.width == once_width and l.dims % 128 == 0 and x % 8 == 0 and stride % 4 == 0;
++}
++/// The once kernel's scratch in the xg region: fp32 sums [2][pairs][width], then an int count an item.
++fn onceBytes(l: ex.Layer, pairs: usize, items: usize) !usize {
++    return add(try aligned(try mul(try mul(2 * 4, pairs), l.width)), try mul(items, 4));
++}
++pub fn onceFits(l: ex.Layer, rows: usize, slots: usize) bool {
++    const pairs = std.math.mul(usize, rows, slots) catch return false;
++    const need = onceBytes(l, pairs, grouped.maxItems(pairs, l.experts, tile)) catch return false;
++    const have = aligned(std.math.mul(usize, std.math.mul(usize, pairs, l.dims) catch return false, 2) catch return false) catch return false;
++    return need <= have;
++}
+ fn go(f: Function, s: Stream, grid: [3]usize, threads: u32, values: anytype) !void {
+     var args: launch.Args = .{};
+     inline for (values) |v| args.add(v);
+@@ -83,8 +103,12 @@ pub const Kernels = struct {
+     down_k6: Function, // 3-bit down, down's arguments
+     down_b16: Function, // down and down_k6 writing bf16 slot rows, their arguments
+     down_k6_b16: Function,
++    gateup_once: ?Function = null, // TF_GLM_PF_EXPERTS_ONCE: rotation fused, gate or up a block (onceEligible); null: not in the image
+     pub fn resolve(mod: Module) !Kernels {
++        const once: ?Function = mod.function("tf_exl3_prompt_gu_once") catch null;
++        if (once) |f| try f.allowDynamicShared(once_smem);
+         return .{
++            .gateup_once = once,
+             .rotate = try mod.function("tf_exl3_prompt_rotate"),
+             .gateup = try mod.function("tf_exl3_prompt_gu"),
+             .down = try mod.function("tf_exl3_prompt_down"),
+@@ -102,15 +126,26 @@ pub const Kernels = struct {
+         const pairs = rows * sc.slots;
+         const w = widths(l);
+         try router.route(s, picks, pairs, l.experts, tile, p);
+-        if (l.shared_input) {
+-            try go(k.rotate, s, .{ rows, l.dims / 128, 1 }, 32, .{ x, i(stride), l.suh_g, sc.xg, i(l.dims) });
+-        } else {
++        const items = grouped.maxItems(pairs, l.experts, tile);
++        if (sc.once and k.gateup_once != null and onceEligible(l, x, stride) and onceFits(l, sc.rows, sc.slots)) {
++            // no rotated copies: the sums in xg, an int count an item after them (zeroed: an item's second block to
++            // finish runs the epilogue)
++            const sums = sc.xg;
++            const done = sums + try aligned(try mul(try mul(2 * 4, pairs), l.width));
++            try s.d.check(s.d.api.cuMemsetD32Async(done, 0, items, s.handle), "cuMemsetD32Async");
+             var args: launch.Args = .{};
+-            inline for (.{ x, i(stride), @as(i32, @backingInt(ex.DType.bf16)), picks, l.suh_g, l.suh_u, sc.xg, sc.xu, i(l.dims), i(sc.slots), i(l.experts) }) |v| args.add(v);
+-            try launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(pairs), .y = @intCast(l.dims / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &args);
++            inline for (.{ x, i(stride), i(sc.slots), l.gate, l.up, l.suh_g, l.suh_u, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, sums, done, i(pairs), i(l.dims), l.limit, l.act_mode }) |v| args.add(v);
++            try launch.launch(k.gateup_once.?, .{ .grid = .{ .x = 2, .y = @intCast(items), .z = 1 }, .block = .{ .x = 256 }, .shared = once_smem }, s, &args);
++        } else {
++            if (l.shared_input) {
++                try go(k.rotate, s, .{ rows, l.dims / 128, 1 }, 32, .{ x, i(stride), l.suh_g, sc.xg, i(l.dims) });
++            } else {
++                var args: launch.Args = .{};
++                inline for (.{ x, i(stride), @as(i32, @backingInt(ex.DType.bf16)), picks, l.suh_g, l.suh_u, sc.xg, sc.xu, i(l.dims), i(sc.slots), i(l.experts) }) |v| args.add(v);
++                try launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(pairs), .y = @intCast(l.dims / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &args);
++            }
++            try go(if (w.gu == 6) k.gateup_k6 else k.gateup, s, .{ l.width / 128, items, 1 }, 256, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode });
+         }
+-        const items = grouped.maxItems(pairs, l.experts, tile);
+-        try go(if (w.gu == 6) k.gateup_k6 else k.gateup, s, .{ l.width / 128, items, 1 }, 256, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode });
+         const down = if (sc.y_bf16) (if (w.d == 6) k.down_k6_b16 else k.down_b16) else if (w.d == 6) k.down_k6 else k.down;
+         try go(down, s, .{ l.dims / 256, items, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), i(sc.slots), i(sc.yrow) });
+     }
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index 2a02a1f68..5d51cff52 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -363,6 +363,19 @@ pub fn bf16Slots() bool {
+     S.once = v;
+     return v;
+ }
++/// TF_GLM_PF_EXPERTS_ONCE=1 (default off, patch 0206): a prompt chunk's routed gate/up rotate each member row inside
++/// the gate/up kernel (tf_exl3_prompt_gu_once: one block a matrix of an item, no per-route rotated copies through DRAM)
++/// where the layer allows it (common.prompt.onceEligible: 4-bit gate/up, width 512); the same xd bits as rot_in + gu.
++pub fn expertsOnce() bool {
++    const S = struct {
++        var once: ?bool = null;
++    };
++    if (S.once) |v| return v;
++    const v = if (std.c.getenv("TF_GLM_PF_EXPERTS_ONCE")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
++    if (v) std.log.info("TF_GLM_PF_EXPERTS_ONCE=1: prompt gate/up rotate their rows in tf_exl3_prompt_gu_once (patch 0206)", .{});
++    S.once = v;
++    return v;
++}
+ /// Whether a prompt chunk of `w`'s experts leaves bf16 slot rows (the fused prompt kernels, under bf16Slots).
+ pub fn promptBf16(w: Experts, count: usize, dims: usize, width: usize) bool {
+     return bf16Slots() and common.prompt.eligible(layer(w, count, dims, width, 0));
+@@ -382,6 +395,7 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
+         if (fused) { // the down kernel writes this chunk's routed slots of ey straight (slot top_k: the shared expert's)
+             var scratch = try common.prompt.scratchFor(arena, l, cap, top_k, false);
+             scratch.y_bf16 = bf16Slots();
++            scratch.once = expertsOnce();
+             scratch.y = ey + at * slots * dims * @as(usize, if (scratch.y_bf16) 2 else 4);
+             scratch.yrow = slots;
+             try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, sc.picks, n, scratch, plan_buf);
+diff --git a/zig/tests/cuda/exl3_prompt_once_tests.zig b/zig/tests/cuda/exl3_prompt_once_tests.zig
+new file mode 100644
+index 000000000..4c262f50c
+--- /dev/null
++++ b/zig/tests/cuda/exl3_prompt_once_tests.zig
+@@ -0,0 +1,266 @@
++//! TF_GLM_PF_EXPERTS_ONCE (patch 0206): the prompt path with tf_exl3_prompt_gu_once (rotation fused into gate/up)
++//! against rot_in + tf_exl3_prompt_gu, byte for byte, on GLM-5.3's TP4 shapes (width 6144, a rank's expert width 512,
++//! 8 picks a row): synthetic layers (random trellis words and scales, skewed picks with empty, single-item and
++//! many-item experts) and, given a directory, one real K4 layer with real routes (x9a extract.py's layer.bin).
++//! `tf-cuda-test exl3-prompt-once [dir]`; every case must PASS and the closing line counts them (no vacuous pass).
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const qr = @import("quant_ref_tests.zig");
++const t6 = @import("exl3_prompt_k6_tests.zig");
++const Gpu = check.Gpu;
++const ex = cuda.exl3_experts;
++const h = qr.helpers;
++const Bufs = t6.Bufs;
++
++const D = 6144; // model width
++const N = ex.prompt.once_width; // one rank's expert width at TP4
++const K = 8; // picks a row
++const ES = 64; // synthetic experts
++const tile_words = 8 * 8; // int16 words of a 4-bit 16x16 tile
++
++const Ctx = struct {
++    gpu: Gpu,
++    a: std.mem.Allocator,
++    s: cuda.Stream,
++    exp: *const ex.Experts,
++    router: cuda.grouped.Router,
++    cases: usize = 0,
++};
++
++/// A layer's device tensors (4-bit mcg gate, up and down) and the host suh of gate, for the mutation check.
++const Set = struct {
++    l: ex.Layer,
++    sg_host: []f16,
++};
++
++fn plan(b: *Bufs, pairs: usize, experts: usize) !cuda.grouped.Plan {
++    const wide = pairs > cuda.grouped.small;
++    return .{ .members = try b.alloc(pairs * 4), .items = try b.alloc(cuda.grouped.maxItems(pairs, experts, ex.prompt.tile) * 12), .counts = try b.alloc(8), .rank = try b.alloc((if (wide) pairs else 1) * 4), .hist = try b.alloc((if (wide) (pairs + 1023) / 1024 * experts else 1) * 4) };
++}
++
++fn download(c: *Ctx, ptr: u64, out: []u8) !void {
++    try c.s.synchronize();
++    const buf: cuda.DeviceBuffer = .{ .d = c.gpu.d, .ptr = ptr, .len = out.len };
++    try buf.download(0, out);
++}
++
++/// One prompt call as GLM makes it (bf16 slot rows, K + 1 a row): xd [pairs][N] and y [rows][K + 1][D] bf16, and
++/// whether xu was left as allocated (0xff: no rotated copies written).
++const Out = struct { xd: []u8, y: []u8, xu_untouched: bool };
++fn runOnce(c: *Ctx, l: ex.Layer, x: u64, stride: usize, pk: u64, rows: usize, once: bool) !Out {
++    var b: Bufs = .{ .d = c.gpu.d, .gpa = c.gpu.gpa };
++    defer b.deinit();
++    var sc = try ex.prompt.scratchFor(try b.alloc(try ex.prompt.bytesFor(l, rows, K, false)), l, rows, K, false);
++    sc.y = try b.alloc(rows * (K + 1) * D * 2);
++    sc.yrow = K + 1;
++    sc.y_bf16 = true;
++    sc.once = once;
++    const p = try plan(&b, rows * K, l.experts);
++    try c.exp.prompt.run(c.exp, c.router, c.s, l, x, stride, pk, rows, sc, p);
++    const out: Out = .{ .xd = try c.a.alloc(u8, rows * K * N * 2), .y = try c.a.alloc(u8, rows * (K + 1) * D * 2), .xu_untouched = true };
++    try download(c, sc.xd, out.xd);
++    try download(c, sc.y, out.y);
++    var probe: [64]u8 = undefined;
++    try download(c, sc.xu, &probe);
++    const xu_ff = std.mem.allEqual(u8, &probe, 0xff);
++    try download(c, sc.xu + rows * K * D * 2 - 64, &probe);
++    return .{ .xd = out.xd, .y = out.y, .xu_untouched = xu_ff and std.mem.allEqual(u8, &probe, 0xff) };
++}
++
++/// The once path's xd and y equal the old path's byte for byte, and the once path wrote no rotated copies.
++fn same(c: *Ctx, name: []const u8, l: ex.Layer, x: u64, stride: usize, pk: u64, rows: usize) !void {
++    try check.expect(ex.prompt.onceEligible(l, x, stride) and ex.prompt.onceFits(l, rows, K) and c.exp.prompt.gateup_once != null, "{s}: the once kernel does not take this layer", .{name});
++    const want = try runOnce(c, l, x, stride, pk, rows, false);
++    const got = try runOnce(c, l, x, stride, pk, rows, true);
++    try check.expect(!want.xu_untouched, "{s}: the old path left xu unwritten (the probe proves nothing)", .{name});
++    try check.expect(got.xu_untouched, "{s}: the once path wrote rotated copies (rot_in ran)", .{name});
++    var what: [160]u8 = undefined;
++    try check.sameBytes(try std.fmt.bufPrint(&what, "{s}: xd (gate/up activations)", .{name}), got.xd, want.xd);
++    try check.sameBytes(try std.fmt.bufPrint(&what, "{s}: y (down slot rows)", .{name}), got.y, want.y);
++    c.cases += 1;
++    check.pass("{s}: {d} rows, xd and y byte-identical to rot_in + gu", .{ name, rows });
++}
++
++fn scales(c: *Ctx, rng: std.Random, n: usize, scale: f32) ![]f16 {
++    const out = try c.a.alloc(f16, n);
++    for (out) |*v| v.* = @floatCast((if (rng.boolean()) scale else -scale) * (0.5 + rng.float(f32)));
++    return out;
++}
++
++fn trellis(c: *Ctx, b: *Bufs, rng: std.Random, experts: usize, kt: usize, nt: usize) !u64 {
++    const per = kt * nt * tile_words;
++    const all = try c.a.alloc(i16, experts * per);
++    rng.bytes(std.mem.sliceAsBytes(all));
++    const base = try b.put(std.mem.sliceAsBytes(all));
++    const table = try c.a.alloc(u64, experts);
++    for (table, 0..) |*t, e| t.* = base + e * per * 2;
++    return b.put(std.mem.sliceAsBytes(table));
++}
++
++fn synthetic(c: *Ctx, b: *Bufs, rng: std.Random, limit: f32, act_mode: i32) !Set {
++    const k2: [ES]i32 = @splat(8);
++    const k2p = try b.put(std.mem.sliceAsBytes(&k2));
++    const sg = try scales(c, rng, ES * D, 1.0);
++    return .{ .sg_host = sg, .l = .{
++        .gate = try trellis(c, b, rng, ES, D / 16, N / 16),
++        .up = try trellis(c, b, rng, ES, D / 16, N / 16),
++        .down = try trellis(c, b, rng, ES, N / 16, D / 16),
++        .gate_k2 = k2p,
++        .up_k2 = k2p,
++        .down_k2 = k2p,
++        .suh_g = try b.put(std.mem.sliceAsBytes(sg)),
++        .suh_u = try b.put(std.mem.sliceAsBytes(try scales(c, rng, ES * D, 1.0))),
++        .svh_g = try b.put(std.mem.sliceAsBytes(try scales(c, rng, ES * N, 0.02))),
++        .svh_u = try b.put(std.mem.sliceAsBytes(try scales(c, rng, ES * N, 0.02))),
++        .suh_d = try b.put(std.mem.sliceAsBytes(try scales(c, rng, ES * N, 1.0))),
++        .svh_d = try b.put(std.mem.sliceAsBytes(try scales(c, rng, ES * D, 0.02))),
++        .experts = ES,
++        .dims = D,
++        .width = N,
++        .codebook = .mcg,
++        .uniform_k2 = 8,
++        .uniform_k2_gu = 8,
++        .uniform_k2_d = 8,
++        .limit = limit,
++        .act_mode = act_mode,
++    } };
++}
++
++/// bf16 rows (stride `stride`, the tail garbage) and each row's 8 distinct picks: expert 5 in about 30% of the rows
++/// (many items), experts 0-2 never (empty), the rest uniform.
++fn inputs(c: *Ctx, rng: std.Random, rows: usize, stride: usize) !struct { x: []u16, pk: []i32 } {
++    const x = try c.a.alloc(u16, rows * stride);
++    for (x) |*v| v.* = h.bf16Of(rng.float(f32) * 4 - 2);
++    const pk = try c.a.alloc(i32, rows * K);
++    for (0..rows) |row| {
++        var seen: [ES]bool = @splat(false);
++        seen[0] = true;
++        seen[1] = true;
++        seen[2] = true;
++        for (0..K) |j| {
++            var e: usize = if (j == 0 and rng.uintLessThan(u32, 10) < 3) 5 else rng.uintLessThan(usize, ES);
++            while (seen[e]) e = rng.uintLessThan(usize, ES);
++            seen[e] = true;
++            pk[row * K + j] = @intCast(e);
++        }
++    }
++    return .{ .x = x, .pk = pk };
++}
++
++pub fn run(gpu: Gpu, dir: ?[]const u8) !void {
++    var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
++    defer arena.deinit();
++    var stream = try cuda.Stream.init(gpu.d, false);
++    defer stream.deinit();
++    var exp = try ex.Experts.load(gpu.d);
++    defer exp.unload();
++    var pm = try cuda.Module.load(gpu.d, cuda.kernels.experts);
++    defer pm.unload();
++    var c: Ctx = .{ .gpu = gpu, .a = arena.allocator(), .s = stream, .exp = &exp, .router = try cuda.grouped.Router.resolve(pm) };
++    try check.expect(exp.prompt.gateup_once != null, "tf_exl3_prompt_gu_once is not in the experts image", .{});
++    var prng = std.Random.DefaultPrng.init(0x0206);
++    const rng = prng.random();
++    var want_cases: usize = 0;
++    {
++        var b: Bufs = .{ .d = gpu.d, .gpa = gpu.gpa };
++        defer b.deinit();
++        const set = try synthetic(&c, &b, rng, 0, 0);
++        const in = try inputs(&c, rng, 4096, D);
++        const dx = try b.put(std.mem.sliceAsBytes(in.x));
++        const dpk = try b.put(std.mem.sliceAsBytes(in.pk));
++        for ([_]usize{ 1, 9, 64, 777, 4096 }) |rows| {
++            try same(&c, "synthetic bf16 SwiGLU, no clamp", set.l, dx, D, dpk, rows);
++            want_cases += 1;
++        }
++        var l = set.l;
++        l.limit = 7.0;
++        try same(&c, "synthetic, SwiGLU clamp 7", l, dx, D, dpk, 4096);
++        l.act_mode = 1;
++        try same(&c, "synthetic, fp32 SwiGLU (act_mode 1), clamp 7", l, dx, D, dpk, 1000);
++        want_cases += 2;
++        // rows wider than the layer (stride D + 128, the tail garbage): the raw copies read only the row's own columns
++        const wide = try inputs(&c, rng, 1500, D + 128);
++        try same(&c, "synthetic, x stride D + 128", set.l, try b.put(std.mem.sliceAsBytes(wide.x)), D + 128, try b.put(std.mem.sliceAsBytes(wide.pk)), 1500);
++        want_cases += 1;
++        // sensitivity: one suh value of the many-item expert changed for the once path only must change its output
++        // (so the comparisons above would see a rotation that read the wrong scale)
++        {
++            const rows = 777;
++            const base = try runOnce(&c, set.l, dx, D, dpk, rows, false);
++            const sg = try c.a.dupe(f16, set.sg_host);
++            sg[5 * D + 300] = -sg[5 * D + 300];
++            var lm = set.l;
++            lm.suh_g = try b.put(std.mem.sliceAsBytes(sg));
++            const got = try runOnce(&c, lm, dx, D, dpk, rows, true);
++            try check.expect(!std.mem.eql(u8, got.xd, base.xd), "mutation: a flipped suh of expert 5 left the once path's xd unchanged", .{});
++            c.cases += 1;
++            want_cases += 1;
++            check.pass("mutation: a flipped gate suh value of expert 5 changes the once path's xd (the comparison sees it)", .{});
++        }
++    }
++    if (dir) |path| {
++        try real(&c, path);
++        want_cases += 1;
++    }
++    try check.expect(c.cases == want_cases, "exl3-prompt-once: {d} cases ran, {d} expected", .{ c.cases, want_cases });
++    check.pass("exl3-prompt-once: {d}/{d} cases (tf_exl3_prompt_gu_once byte-identical to rot_in + tf_exl3_prompt_gu)", .{ c.cases, want_cases });
++}
++
++/// x9a extract.py's layer: rank 0 of a real K4 layer (TP4 cut) and 4,096 tap rows with their real top-8 routes.
++fn real(c: *Ctx, dir: []const u8) !void {
++    const io = c.gpu.io;
++    const d = try std.Io.Dir.cwd().openDir(io, dir, .{});
++    defer d.close(io);
++    const manifest = try d.readFileAlloc(io, "layer.json", c.a, .limited(1 << 20));
++    const blob = try d.readFileAlloc(io, "layer.bin", c.a, .limited(4 << 30));
++    const Arr = struct { name: []const u8, offset: usize, bytes: usize };
++    const M = struct { layer: u32, rows: usize, experts: usize, dims: usize, width: usize, arrays: []const Arr };
++    const m = try std.json.parseFromSliceLeaky(M, c.a, manifest, .{ .ignore_unknown_fields = true });
++    try check.expect(m.dims == D and m.width == N and m.rows == 4096, "real layer: dims {d} width {d} rows {d}", .{ m.dims, m.width, m.rows });
++    var b: Bufs = .{ .d = c.gpu.d, .gpa = c.gpu.gpa };
++    defer b.deinit();
++    const get = struct {
++        fn f(mm: M, bb: []const u8, name: []const u8) ![]const u8 {
++            for (mm.arrays) |a| if (std.mem.eql(u8, a.name, name)) return bb[a.offset..][0..a.bytes];
++            return error.MissingArray;
++        }
++    }.f;
++    const E = m.experts;
++    const tables = struct {
++        fn f(cc: *Ctx, bb: *Bufs, bytes: []const u8, experts: usize) !u64 {
++            const base = try bb.put(bytes);
++            const t = try cc.a.alloc(u64, experts);
++            for (t, 0..) |*v, e| v.* = base + e * (bytes.len / experts);
++            return bb.put(std.mem.sliceAsBytes(t));
++        }
++    }.f;
++    const k2 = try c.a.alloc(i32, E);
++    @memset(k2, 8);
++    const k2p = try b.put(std.mem.sliceAsBytes(k2));
++    const l: ex.Layer = .{
++        .gate = try tables(c, &b, try get(m, blob, "gate_proj.trellis"), E),
++        .up = try tables(c, &b, try get(m, blob, "up_proj.trellis"), E),
++        .down = try tables(c, &b, try get(m, blob, "down_proj.trellis"), E),
++        .gate_k2 = k2p,
++        .up_k2 = k2p,
++        .down_k2 = k2p,
++        .suh_g = try b.put(try get(m, blob, "gate_proj.suh")),
++        .suh_u = try b.put(try get(m, blob, "up_proj.suh")),
++        .svh_g = try b.put(try get(m, blob, "gate_proj.svh")),
++        .svh_u = try b.put(try get(m, blob, "up_proj.svh")),
++        .suh_d = try b.put(try get(m, blob, "down_proj.suh")),
++        .svh_d = try b.put(try get(m, blob, "down_proj.svh")),
++        .experts = E,
++        .dims = D,
++        .width = N,
++        .codebook = .mcg,
++        .uniform_k2 = 8,
++        .uniform_k2_gu = 8,
++        .uniform_k2_d = 8,
++        .limit = 0,
++        .act_mode = 0,
++    };
++    var name: [64]u8 = undefined;
++    try same(c, try std.fmt.bufPrint(&name, "real K4 layer {d} (rank 0 of TP4), real routes", .{m.layer}), l, try b.put(try get(m, blob, "x.bf16")), D, try b.put(try get(m, blob, "picks")), m.rows);
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 4b00f3ba8..cc9fb5c8c 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -234,6 +234,7 @@ const usage =
+     \\  exl3 [dir]                EXL3 decode-row linear: float64 checks, row invariance, the Python engine's fixture (dir none skips it)
+     \\  exl3-tp2 <rank> <host:port> [dir]  EXL3 tensor parallel: rank shards vs the Python engine's, all-gathered (dir none skips them)
+     \\  exl3-tiles [DIR]          EXL3's tile candidate: codebooks and tiles bit-equal, FP64, rows through qlinear and Dense
++    \\  exl3-prompt-once [DIR]     TF_GLM_PF_EXPERTS_ONCE gate/up against rot_in + gu, byte for byte (DIR: x9a layer.bin);
+     \\  exl3-prompt-k6 [DIR|none] [BASE]  EXL3 prompt kernels at 3 and 4 bits, GLM's shapes: runSlots, FP64, row bytes, time;
+     \\                            DIR adds a real layer, BASE (an earlier exl3_experts fatbin) its 4-bit bytes
+     \\  train-pack MODEL EXAMPLES [COUNT]   training passes holding several sequences against one a pass: differences, time
+@@ -408,6 +409,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "exlr8-bench")) return exlr8_tests.bench(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else "home", if (rest.len > 2) try std.fmt.parseInt(u16, rest[2], 10) else 40, if (rest.len > 3) try std.fmt.parseInt(usize, rest[3], 10) else 4);
+     if (std.mem.eql(u8, cmd, "exl3")) return exl3_tests.run(gpu, if (rest.len > 0) rest[0] else "none");
+     if (std.mem.eql(u8, cmd, "exl3-tiles")) return exl3_candidate_tests.run(gpu, if (rest.len > 0) rest[0] else null);
++    if (std.mem.eql(u8, cmd, "exl3-prompt-once")) return @import("exl3_prompt_once_tests.zig").run(gpu, if (rest.len > 0) rest[0] else null);
+     if (std.mem.eql(u8, cmd, "exl3-prompt-k6")) return @import("exl3_prompt_k6_tests.zig").run(gpu, if (rest.len > 0) rest[0] else "none", if (rest.len > 1) rest[1] else null);
+     if (std.mem.eql(u8, cmd, "exl3-tp2")) return exl3_tp2_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else "none");
+     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
+-- 
+2.43.0
+
+
+From 65f97a6d711294952a0fdaf23def004781c2cfd6 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 19:49:00 +0200
+Subject: glm: TF_GLM_PF_EXPERTS_ONCE review fixes: an unconfigurable once
+ kernel is optional; repeat and non-finite cases
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/cuda/exl3_prompt.zig              |  7 +++++--
+ zig/tests/cuda/exl3_prompt_once_tests.zig | 17 +++++++++++++++++
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/cuda/exl3_prompt.zig b/zig/src/cuda/exl3_prompt.zig
+index e0f191e16..81d279b75 100644
+--- a/zig/src/cuda/exl3_prompt.zig
++++ b/zig/src/cuda/exl3_prompt.zig
+@@ -105,8 +105,11 @@ pub const Kernels = struct {
+     down_k6_b16: Function,
+     gateup_once: ?Function = null, // TF_GLM_PF_EXPERTS_ONCE: rotation fused, gate or up a block (onceEligible); null: not in the image
+     pub fn resolve(mod: Module) !Kernels {
+-        const once: ?Function = mod.function("tf_exl3_prompt_gu_once") catch null;
+-        if (once) |f| try f.allowDynamicShared(once_smem);
++        // optional: an image without it, or a device whose shared memory refuses its 84,480 bytes, keeps the old path
++        var once: ?Function = mod.function("tf_exl3_prompt_gu_once") catch null;
++        if (once) |f| f.allowDynamicShared(once_smem) catch {
++            once = null;
++        };
+         return .{
+             .gateup_once = once,
+             .rotate = try mod.function("tf_exl3_prompt_rotate"),
+diff --git a/zig/tests/cuda/exl3_prompt_once_tests.zig b/zig/tests/cuda/exl3_prompt_once_tests.zig
+index 4c262f50c..b147d5fd6 100644
+--- a/zig/tests/cuda/exl3_prompt_once_tests.zig
++++ b/zig/tests/cuda/exl3_prompt_once_tests.zig
+@@ -183,6 +183,23 @@ pub fn run(gpu: Gpu, dir: ?[]const u8) !void {
+         const wide = try inputs(&c, rng, 1500, D + 128);
+         try same(&c, "synthetic, x stride D + 128", set.l, try b.put(std.mem.sliceAsBytes(wide.x)), D + 128, try b.put(std.mem.sliceAsBytes(wide.pk)), 1500);
+         want_cases += 1;
++        // repeatable: the once path twice (the count handoff decides which block runs an epilogue: the same bytes)
++        {
++            const r1 = try runOnce(&c, set.l, dx, D, dpk, 4096, true);
++            const r2 = try runOnce(&c, set.l, dx, D, dpk, 4096, true);
++            try check.sameBytes("repeat: the once path's xd twice", r2.xd, r1.xd);
++            try check.sameBytes("repeat: the once path's y twice", r2.y, r1.y);
++            c.cases += 1;
++            want_cases += 1;
++            check.pass("repeat: the once path's xd and y the same bytes in two launches", .{});
++        }
++        // non-finite inputs: rows holding inf, -inf and NaN give the old path's bytes (NaN payloads included)
++        {
++            const bad = try c.a.dupe(u16, in.x);
++            for ([_]usize{ 0, 17, 999 }, [_]u16{ 0x7f80, 0xff80, 0x7fc1 }) |row, v| bad[row * D + 129] = v;
++            try same(&c, "synthetic, inf / -inf / NaN in rows 0, 17, 999", set.l, try b.put(std.mem.sliceAsBytes(bad)), D, dpk, 1000);
++            want_cases += 1;
++        }
+         // sensitivity: one suh value of the many-item expert changed for the once path only must change its output
+         // (so the comparisons above would see a rotation that read the wrong scale)
+         {
+-- 
+2.43.0
+
+
+From 3a531e2fb89e4f6ec2b14be469a68c617a519bc4 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 20:02:43 +0200
+Subject: contract: tf_exl3_prompt_gu_once's launch record (nvcc 13.3 receipts
+ on the five SMs, 84,480 dynamic bytes)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/core/contract/registry.zig | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index 865aa09cb..b23c3f932 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -189,6 +189,8 @@ pub const cuda = @import("flashnext_cuda_records.zig").cuda ++ [_]CudaRecord{
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_rotate", .symbol = "tf_exl3_prompt_rotate", .image = "exl3_experts", .threads = 32 }, .usage = .{ .{ .regs = 24, .static = 0, .bound = 0 }, .{ .regs = 24, .static = 0, .bound = 0 }, .{ .regs = 24, .static = 0, .bound = 0 }, .{ .regs = 20, .static = 0, .bound = 0 }, .{ .regs = 20, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_gu", .symbol = "tf_exl3_prompt_gu", .image = "exl3_experts", .threads = 256 }, .usage = .{ .{ .regs = 128, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 124, .static = 43264, .bound = 256 }, .{ .regs = 124, .static = 43264, .bound = 256 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_down", .symbol = "tf_exl3_prompt_down", .image = "exl3_experts", .threads = 256 }, .usage = .{ .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 } } },
++    // TF_GLM_PF_EXPERTS_ONCE (0206): nvcc 13.3 -O3 receipts (ptxas -v, sm_80/86/89/120/121), 84,480 dynamic bytes
++    .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_gu_once", .symbol = "tf_exl3_prompt_gu_once", .image = "exl3_experts", .threads = 256, .dynamic = 84480 }, .usage = .{ .{ .regs = 255, .static = 528, .bound = 256 }, .{ .regs = 255, .static = 528, .bound = 256 }, .{ .regs = 255, .static = 528, .bound = 256 }, .{ .regs = 224, .static = 528, .bound = 256 }, .{ .regs = 224, .static = 528, .bound = 256 } } },
+     .{ .launch = .{ .name = "exl3_candidate tf_exl3_tc_0", .symbol = "tf_exl3_tc_0", .image = "exl3_candidate", .threads = 256 }, .usage = .{ .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 } } },
+     .{ .launch = .{ .name = "exl3_candidate tf_exl3_tc_1", .symbol = "tf_exl3_tc_1", .image = "exl3_candidate", .threads = 256 }, .usage = .{ .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 } } },
+     .{ .launch = .{ .name = "exl3_candidate tf_exl3_tc_2", .symbol = "tf_exl3_tc_2", .image = "exl3_candidate", .threads = 256 }, .usage = .{ .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 } } },
+-- 
+2.43.0
+

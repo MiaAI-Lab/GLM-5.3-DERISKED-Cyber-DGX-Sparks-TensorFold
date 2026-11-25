@@ -1,0 +1,423 @@
+From 1ed55f10b27a1cf36eae742e91df029a5a47319b Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 13:54:15 +0200
+Subject: [PATCH 186/194] glm_moe_dsa: int8 KV snapshots keep both scale planes
+ of every row
+
+With TF_GLM_KV8_INT8=1 the dsa's 576-wide rows carry two FP32 scales a row
+(tf_glm_lat_write_i8_w576 writes scales[2*at] and scales[2*at+1]), but the
+snapshot plan (cuda_snapshot_layout.zig Plan.rows) kept at * 4 bytes of the
+scale plane with a page_rows * 4 span, and the disk image (cuda_disk_image.zig
+Shape) counted 4 bytes a row: a kept or saved prefix lost the scales of every
+row from at/2 on, so a restored prompt-cache state read wrong scales there.
+
+latent.scaleBytes(lw) is now the one rule (8 on the dsa's int8 rows, 4 on
+E4M3) for cacheBytes, the snapshot plan's scale part and span, and the disk
+image's scale bytes and row. Paged and KV-shard layouts are E4M3 only (int8 is
+the dsa's, whose 8-bit rows are never on pages) and keep 4.
+
+Test: cuda_kv8_snapshot_test.zig fills distinct codes and scales (both int8
+planes), keeps a 1536-row prefix through the real Plan and Pool (device and
+host tiers), overwrites the live rows, restores, and compares every code and
+scale byte below and above at/2, for dsa int8 and E4M3 in the arena, Flash
+E4M3 in the arena and on pages; plus the disk image's int8 byte count. Before
+this change the int8 case loses 3072 rows' scales (4 caches x 768) and the
+image counts no second plane; after it every byte matches.
+
+Found in Codex's analysis report (docs/gpt-sol-new.md, section 6.3).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda.zig                 |   1 +
+ zig/src/families/glm/cuda_disk_image.zig      |   9 +-
+ .../families/glm/cuda_kv8_snapshot_test.zig   | 266 ++++++++++++++++++
+ zig/src/families/glm/cuda_latent.zig          |   9 +-
+ zig/src/families/glm/cuda_snapshot_layout.zig |   7 +-
+ 5 files changed, 286 insertions(+), 6 deletions(-)
+ create mode 100644 zig/src/families/glm/cuda_kv8_snapshot_test.zig
+
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index a77ad37cb..8db287127 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -47,6 +47,7 @@ pub const disk_ranks = @import("cuda_disk_ranks.zig");
+ test {
+     _ = @import("cuda_tile.zig");
+     _ = @import("cuda_kv8_test.zig");
++    _ = @import("cuda_kv8_snapshot_test.zig");
+     _ = kv8_ref;
+     _ = @import("cuda_prof.zig");
+     _ = @import("cuda_load_owner.zig");
+diff --git a/zig/src/families/glm/cuda_disk_image.zig b/zig/src/families/glm/cuda_disk_image.zig
+index 667f0fe5d..65ba8069d 100644
+--- a/zig/src/families/glm/cuda_disk_image.zig
++++ b/zig/src/families/glm/cuda_disk_image.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const st_mod = @import("cuda_state.zig");
+ const sparse = @import("cuda_sparse.zig");
++const latent_mod = @import("cuda_latent.zig");
+ const Config = @import("config.zig").Config;
+ const pages = @import("cuda_snapshot_pages.zig");
+ const State = st_mod.State;
+@@ -56,7 +57,8 @@ pub const Shape = struct {
+     tail: u64, // its fields after them: the head's position and first-draft row
+     layers: u32, // DSA layers, whose rows are shared by position
+     latent: u32, // a latent row's bytes
+-    scales: bool, // fp8 latent rows: a 4-byte scale each
++    scales: bool, // 8-bit latent rows: their FP32 scales follow the codes
++    scale_row: u32 = 4, // a row's scale bytes: 4 (E4M3), 8 on the dsa's int8 rows (TF_GLM_KV8_INT8=1, latent.scaleBytes)
+     ring_rows: u32,
+     ring_row: u32,
+     pk_rows: u32,
+@@ -79,6 +81,7 @@ pub const Shape = struct {
+             .layers = @intCast(st.caches.len),
+             .latent = if (fp8) c.kv_lora + c.rope else (c.kv_lora + c.rope) * 2, // glm_moe_dsa's BF16 rows carry the rope plane
+             .scales = fp8,
++            .scale_row = @intCast(latent_mod.scaleBytes(c.kv_lora + c.rope)),
+             .ring_rows = @intCast(st.ring_rows),
+             .ring_row = @intCast(st.ring_row),
+             .pk_rows = @intCast(capacity / sparse.pool + 2),
+@@ -109,7 +112,7 @@ fn cacheOf(sh: Shape, j: usize, n: u64) [5]u64 {
+     const indexed = j >= 128 or sh.unindexed & (@as(u128, 1) << @intCast(j)) == 0;
+     return .{
+         n * sh.latent,
+-        if (sh.scales) n * 4 else 0,
++        if (sh.scales) n * sh.scale_row else 0,
+         if (indexed) @min(n, sh.ring_rows) * sh.ring_row else 0,
+         if (sh.dsa) 0 else @min(n, sh.ring_rows) * sh.ring_row,
+         if (sh.dsa) 0 else @min(n / sparse.pool + 2, sh.pk_rows) * sh.pooled_row,
+@@ -129,7 +132,7 @@ pub fn parts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator
+     for (0..sh.layers) |j| {
+         const c = cacheOf(sh, j, at);
+         try out.append(a, .{ .bytes = c[0], .row = sh.latent });
+-        if (sh.scales) try out.append(a, .{ .bytes = c[1], .row = 4 });
++        if (sh.scales) try out.append(a, .{ .bytes = c[1], .row = sh.scale_row });
+         try out.append(a, .{ .bytes = c[2] });
+         if (c[3] > 0) try out.append(a, .{ .bytes = c[3] });
+         // whole pools are rows by position; the pool past them and the spare row stay the state's own
+diff --git a/zig/src/families/glm/cuda_kv8_snapshot_test.zig b/zig/src/families/glm/cuda_kv8_snapshot_test.zig
+new file mode 100644
+index 000000000..4d0d55c80
+--- /dev/null
++++ b/zig/src/families/glm/cuda_kv8_snapshot_test.zig
+@@ -0,0 +1,266 @@
++//! 8-bit KV snapshots through real memory: a kept prefix's latent codes and FP32 scales (both planes of the dsa's int8
++//! rows, TF_GLM_KV8_INT8=1) survive overwriting the live rows and a restore, byte for byte. The issue (int8 rows keep two
++//! scales a row; the snapshot plan kept one) was found in Codex's analysis report, docs/gpt-sol-new.md section 6.3.
++//! "Device" memory is host memory here: the real State constructors, snapshot Plan and Pool.move run on it, the
++//! driver's copies and fills being memcpy and memset.
++const std = @import("std");
++const cuda = @import("cuda");
++const weights = @import("cuda_weights.zig");
++const shard = @import("cuda_shard.zig");
++const state = @import("cuda_state.zig");
++const latent = @import("cuda_latent.zig");
++const layout = @import("cuda_snapshot_layout.zig");
++const pages = @import("cuda_snapshot_pages.zig");
++const t = std.testing;
++
++extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
++extern "c" fn unsetenv(name: [*:0]const u8) c_int;
++
++const Mem = struct {
++    fn alloc(out: *u64, n: usize) callconv(.c) c_int {
++        const p = std.c.malloc(@max(n, 1)) orelse return 2;
++        out.* = @intFromPtr(p);
++        return 0;
++    }
++    fn free(p: u64) callconv(.c) c_int {
++        std.c.free(@ptrFromInt(p));
++        return 0;
++    }
++    fn hostAlloc(out: *?*anyopaque, n: usize, _: c_uint) callconv(.c) c_int {
++        out.* = std.c.malloc(@max(n, 1)) orelse return 2;
++        return 0;
++    }
++    fn freeHost(p: ?*anyopaque) callconv(.c) c_int {
++        std.c.free(p);
++        return 0;
++    }
++    fn set8(p: u64, v: u8, n: usize) callconv(.c) c_int {
++        @memset(@as([*]u8, @ptrFromInt(p))[0..n], v);
++        return 0;
++    }
++    fn set8a(p: u64, v: u8, n: usize, _: cuda.abi.Stream) callconv(.c) c_int {
++        return set8(p, v, n);
++    }
++    fn set32(p: u64, v: c_uint, n: usize) callconv(.c) c_int {
++        @memset(@as([*]align(1) u32, @ptrFromInt(p))[0..n], v);
++        return 0;
++    }
++    fn set32a(p: u64, v: c_uint, n: usize, _: cuda.abi.Stream) callconv(.c) c_int {
++        return set32(p, v, n);
++    }
++    fn dtod(dst: u64, src: u64, n: usize) callconv(.c) c_int {
++        @memcpy(@as([*]u8, @ptrFromInt(dst))[0..n], @as([*]const u8, @ptrFromInt(src))[0..n]);
++        return 0;
++    }
++    fn dtoda(dst: u64, src: u64, n: usize, _: cuda.abi.Stream) callconv(.c) c_int {
++        return dtod(dst, src, n);
++    }
++    fn dtoha(dst: ?*anyopaque, src: u64, n: usize, _: cuda.abi.Stream) callconv(.c) c_int {
++        return dtod(@intFromPtr(dst), src, n);
++    }
++    fn htoda(dst: u64, src: ?*const anyopaque, n: usize, _: cuda.abi.Stream) callconv(.c) c_int {
++        return dtod(dst, @intFromPtr(src), n);
++    }
++    fn sync(_: cuda.abi.Stream) callconv(.c) c_int {
++        return 0;
++    }
++    fn driver() cuda.Driver {
++        var d: cuda.Driver = undefined;
++        d.api.cuMemAlloc_v2 = alloc;
++        d.api.cuMemFree_v2 = free;
++        d.api.cuMemHostAlloc = hostAlloc;
++        d.api.cuMemFreeHost = freeHost;
++        d.api.cuMemsetD8_v2 = set8;
++        d.api.cuMemsetD8Async = set8a;
++        d.api.cuMemsetD32_v2 = set32;
++        d.api.cuMemsetD32Async = set32a;
++        d.api.cuMemcpyDtoD_v2 = dtod;
++        d.api.cuMemcpyDtoDAsync_v2 = dtoda;
++        d.api.cuMemcpyDtoHAsync_v2 = dtoha;
++        d.api.cuMemcpyHtoDAsync_v2 = htoda;
++        d.api.cuStreamSynchronize = sync;
++        return d;
++    }
++};
++
++const Codes = enum { int8, e4m3 };
++const Kind = enum { dsa, flash };
++
++/// Where cache `x`'s row `r` codes and scales live: in the arena, or through the paged sequence's table.
++fn rowAddr(st: *const state.State, x: anytype, r: usize, lw: usize, sb: usize) struct { code: u64, scale: u64 } {
++    if (x.pt == 0) return .{ .code = x.lc + r * lw, .scale = x.ls + r * sb };
++    const id: u64 = st.pages[r / state.page_rows];
++    const off = r % state.page_rows;
++    return .{ .code = x.lc + id * x.ps + off * lw, .scale = x.ls + id * x.ps + off * sb };
++}
++
++/// The value row `r` of cache `j` holds: codes a byte pattern of (j, r, i), scales distinct FP32s per plane.
++fn codeByte(j: usize, r: usize, i: usize) u8 {
++    return @truncate((j *% 131) +% (r *% 7) +% (i *% 13) +% (r >> 8));
++}
++fn scaleVal(j: usize, r: usize, plane: usize) f32 {
++    const v: f32 = @floatFromInt(j * 100_000 + r * 3 + 1);
++    return if (plane == 0) v * 0.5 else -v * 0.25 - 7.0; // the rope plane's scale differs from the latent one
++}
++
++fn fillOrPoison(st: *const state.State, caches: anytype, rows: usize, lw: usize, sb: usize, poison: bool) void {
++    for (caches, 0..) |x, j| for (0..rows) |r| {
++        const a = rowAddr(st, x, r, lw, sb);
++        const code: [*]u8 = @ptrFromInt(a.code);
++        for (0..lw) |i| code[i] = if (poison) 0xA5 else codeByte(j, r, i);
++        const sc: [*]align(1) f32 = @ptrFromInt(a.scale);
++        for (0..sb / 4) |q| sc[q] = if (poison) std.math.nan(f32) else scaleVal(j, r, q);
++    };
++}
++
++const Result = struct { code_bad_low: usize = 0, code_bad_high: usize = 0, scale_bad_low: usize = 0, scale_bad_high: usize = 0 };
++
++fn check(st: *const state.State, caches: anytype, at: usize, lw: usize, sb: usize) Result {
++    var res: Result = .{};
++    for (caches, 0..) |x, j| for (0..at) |r| {
++        const a = rowAddr(st, x, r, lw, sb);
++        const code: [*]const u8 = @ptrFromInt(a.code);
++        var cbad = false;
++        for (0..lw) |i| cbad = cbad or code[i] != codeByte(j, r, i);
++        const sc: [*]align(1) const f32 = @ptrFromInt(a.scale);
++        var sbad = false;
++        for (0..sb / 4) |q| sbad = sbad or @as(u32, @bitCast(sc[q])) != @as(u32, @bitCast(scaleVal(j, r, q)));
++        const high = r >= at / 2;
++        if (cbad) {
++            if (high) res.code_bad_high += 1 else res.code_bad_low += 1;
++        }
++        if (sbad) {
++            if (high) res.scale_bad_high += 1 else res.scale_bad_low += 1;
++        }
++    };
++    return res;
++}
++
++fn run(kind: Kind, codes: Codes, paged: bool) !Result {
++    const gpa = t.allocator;
++    if (codes == .int8) _ = setenv("TF_GLM_KV8_INT8", "1", 1) else _ = unsetenv("TF_GLM_KV8_INT8");
++    defer _ = unsetenv("TF_GLM_KV8_INT8");
++    var d = Mem.driver();
++    var w: weights.Weights = undefined;
++    w.config = .{};
++    var layers: [3]weights.Layer = undefined;
++    if (kind == .dsa) {
++        w.config.dsa = true;
++        w.config.rope = 64;
++        for (&layers) |*l| l.mixer = .{ .mla = undefined };
++        w.layers = &layers;
++    } else {
++        layers[0].mixer = .{ .kda = undefined };
++        layers[1].mixer = .{ .mla = undefined };
++        layers[2].mixer = .{ .mla = undefined };
++        w.layers = &layers;
++    }
++    w.share = try shard.Share.of(&w.config, 0, 2);
++    const c = &w.config;
++    const lw: usize = c.kv_lora + c.rope;
++    // the scale bytes a row as the write kernels lay them out (tf_glm_lat_write_i8_w576: scales[2*at], scales[2*at+1];
++    // tf_glm_lat_write_fp8*: scales[at]), not as the code under test sizes them
++    const sb: usize = if (codes == .int8 and kind == .dsa) 8 else 4;
++    try t.expectEqual(4096 * (lw + sb), try latent.cacheBytes(4096, lw, true)); // the arena holds every row's
++    const capacity: usize = 4096;
++    const at: usize = 1536; // the kept prefix (>= 1000 rows); rows on both sides of at / 2 are checked
++    var pool_mem: ?u64 = null;
++    defer if (pool_mem) |m| std.c.free(@ptrFromInt(m));
++    var ids: [8]u32 = undefined;
++    var st = if (!paged) try state.State.initHead(gpa, &d, &w, capacity, true, true) else blk: {
++        const pb = state.pageBytesOf(&w, true, true);
++        const n = capacity / state.page_rows;
++        var m: u64 = undefined;
++        if (Mem.alloc(&m, n * pb) != 0) return error.OutOfMemory;
++        pool_mem = m;
++        var s = try state.State.initPagedFormat(gpa, &d, &w, capacity, .{ .kv = m, .pages = n, .page_bytes = pb }, true, true);
++        for (0..n) |k| ids[k] = @intCast(n - 1 - k); // rows run over the pages in reverse: the table matters
++        s.pages = ids[0..n];
++        s.capacity = n * state.page_rows;
++        break :blk s;
++    };
++    defer st.deinit();
++    try t.expectEqual(@as(usize, if (kind == .dsa) 3 else 2), st.caches.len);
++    const all = if (kind == .dsa) [_]@TypeOf(st.mtp_caches){ st.caches[0], st.caches[1], st.caches[2], st.mtp_caches } else [_]@TypeOf(st.mtp_caches){ st.caches[0], st.caches[1], st.mtp_caches, st.mtp_caches };
++    const caches = if (kind == .dsa) all[0..] else all[0..3]; // every MLA layer's cache and the head's
++    for (caches) |x| try t.expect(x.ls != 0);
++    fillOrPoison(&st, caches, capacity, lw, sb, false);
++
++    // keep the prefix: a lease of one device page and host pages (both tiers' copies)
++    var pool = try pages.Pool.initTiers(gpa, &d, pages.page, 64 * pages.page);
++    defer pool.deinit();
++    const plan = try layout.Plan.init(&st, c, at, at);
++    var lease = try pool.take(plan.len);
++    defer pool.give(&lease);
++    try t.expect(lease.host.ids.items.len > 0 and lease.dev.ids.items.len > 0);
++    const stream: cuda.Stream = .{ .d = &d, .handle = null };
++    try pool.move(stream, &lease, &plan, true);
++
++    // recycle the live storage (another sequence's rows), then restore the kept prefix
++    fillOrPoison(&st, caches, capacity, lw, sb, true);
++    try pool.move(stream, &lease, &plan, false);
++    const res = check(&st, caches, at, lw, sb);
++    std.debug.print("GLM FP8 KV snapshot {s} {s} {s}: prefix {d} rows, {d} caches, scale bytes/row {d}: bad rows below {d}: codes {d} scales {d}; at or above: codes {d} scales {d}\n", .{
++        @tagName(kind), @tagName(codes), if (paged) "paged" else "arena", at, caches.len, sb, at / 2, res.code_bad_low, res.scale_bad_low, res.code_bad_high, res.scale_bad_high,
++    });
++    return res;
++}
++
++fn expectClean(r: Result) !void {
++    try t.expectEqual(Result{}, r);
++}
++
++test "GLM FP8 KV: snapshot poison-restore, dsa int8 codes in the arena keep both scale planes of every row" {
++    try expectClean(try run(.dsa, .int8, false));
++}
++
++test "GLM FP8 KV: snapshot poison-restore, dsa E4M3 codes in the arena" {
++    try expectClean(try run(.dsa, .e4m3, false));
++}
++
++test "GLM FP8 KV: snapshot poison-restore, Flash E4M3 codes in the arena" {
++    try expectClean(try run(.flash, .e4m3, false));
++}
++
++test "GLM FP8 KV: snapshot poison-restore, Flash E4M3 codes on pages through the table" {
++    try expectClean(try run(.flash, .e4m3, true));
++}
++
++test "GLM FP8 KV: int8 codes are the dsa's alone and never on pages (no paged int8 layout to keep)" {
++    _ = setenv("TF_GLM_KV8_INT8", "1", 1);
++    defer _ = unsetenv("TF_GLM_KV8_INT8");
++    try t.expectEqual(@as(usize, 512 + 4), try latent.cacheBytes(1, 512, true)); // Flash's 512-wide rows stay E4M3 under the flag
++    try t.expectEqual(@as(usize, 576 + 8), try latent.cacheBytes(1, 576, true));
++    var d = Mem.driver();
++    // the dsa's 8-bit write refuses a page table (cuda_latent.latentWriteFormat): no paged int8 rows exist
++    try t.expectError(error.LatentShape, latent.latentWriteFormat(undefined, .{ .d = &d, .handle = null }, 0, 576, 1, 1, .{ .pt = 1, .ps = 1 }, 0, 1, 576));
++}
++
++test "GLM FP8 KV: a dsa int8 state's disk image counts both scale planes of every row, as its snapshot plan does" {
++    const image = @import("cuda_disk_image.zig");
++    var d = Mem.driver();
++    var w: weights.Weights = undefined;
++    w.config = .{};
++    w.config.dsa = true;
++    w.config.rope = 64;
++    var layers: [3]weights.Layer = undefined;
++    for (&layers) |*l| l.mixer = .{ .mla = undefined };
++    w.layers = &layers;
++    w.share = try shard.Share.of(&w.config, 0, 2);
++    const capacity: usize = 4096;
++    var bytes: [2][2]u64 = undefined; // [e4m3, int8][at 2048, 4096]
++    for ([_]bool{ false, true }, 0..) |int8_codes, k| {
++        if (int8_codes) _ = setenv("TF_GLM_KV8_INT8", "1", 1) else _ = unsetenv("TF_GLM_KV8_INT8");
++        defer _ = unsetenv("TF_GLM_KV8_INT8");
++        var st = try state.State.initHead(t.allocator, &d, &w, capacity, true, false);
++        defer st.deinit();
++        const sh = try image.Shape.of(&st, &w.config, capacity, false);
++        for ([_]u32{ 2048, 4096 }, 0..) |at, q| {
++            const plan = try layout.Plan.init(&st, &w.config, at, null);
++            try t.expectEqual(@as(u64, plan.len), image.leaseBytes(sh, at, 0));
++            bytes[k][q] = plan.len;
++        }
++    }
++    // int8 rows keep 4 more scale bytes a row than E4M3 in each of the 3 DSA layers (codes as wide either way)
++    for ([_]u64{ 2048, 4096 }, 0..) |at, q| try t.expectEqual(3 * at * 4, bytes[1][q] - bytes[0][q]);
++}
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index 70cd7975a..190cf48a8 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -87,11 +87,18 @@ pub fn int8() bool {
+     return !std.mem.eql(u8, std.mem.span(v), "0");
+ }
+ 
++/// The bytes of one 8-bit latent row's FP32 scales: two on the dsa's 576-wide int8 rows (TF_GLM_KV8_INT8=1: the 512
++/// latent values', the 64 rope values', as tf_glm_lat_write_i8_w576 writes them), one on E4M3 rows. Every place that
++/// sizes, copies or keeps the scale plane takes it from here.
++pub fn scaleBytes(lw: usize) usize {
++    return if (lw == glue.dsa_row and int8()) 8 else 4;
++}
++
+ /// A latent cache holds BF16 rows, or E4M3 rows followed by one FP32 scale per row (512 wide, or the dsa's 576; int8
+ /// dsa rows two scales).
+ pub fn cacheBytes(capacity: usize, lw: usize, kv8: bool) !usize {
+     if (kv8 and lw != 512 and lw != glue.dsa_row) return error.LatentShape;
+-    const row = if (kv8) try std.math.add(usize, lw, if (lw == glue.dsa_row and int8()) 8 else 4) else try std.math.mul(usize, lw, 2);
++    const row = if (kv8) try std.math.add(usize, lw, scaleBytes(lw)) else try std.math.mul(usize, lw, 2);
+     return std.math.mul(usize, capacity, row);
+ }
+ 
+diff --git a/zig/src/families/glm/cuda_snapshot_layout.zig b/zig/src/families/glm/cuda_snapshot_layout.zig
+index a06cb549c..ada015c3b 100644
+--- a/zig/src/families/glm/cuda_snapshot_layout.zig
++++ b/zig/src/families/glm/cuda_snapshot_layout.zig
+@@ -5,6 +5,7 @@ const page_rows = @import("cuda_state.zig").page_rows;
+ const Config = @import("config.zig").Config;
+ const cache = @import("cuda_dsa_block.zig");
+ const sparse = @import("cuda_sparse.zig");
++const latent_mod = @import("cuda_latent.zig");
+ 
+ /// `len` bytes from `live`, or on a paged sequence's pages `span` bytes a page, the pages `page` bytes apart; `lat`: a
+ /// sharded sequence's latent rows (TF_GLM_KV_SHARD), whose pages are its latent table's (`Plan.lids`).
+@@ -73,8 +74,10 @@ pub const Plan = struct {
+         const latent_row = lw * @as(usize, if (x.ls == 0) 2 else 1);
+         if (p.latent) {
+             try p.addLatent(st, x, x.lc, latent, page_rows * latent_row);
+-            // E4M3 scales: beside the codes in the arena, or on pages a part's 512 after its codes
+-            if (x.ls != 0) try p.addLatent(st, x, x.ls, try std.math.mul(usize, at, @sizeOf(f32)), page_rows * @sizeOf(f32));
++            // 8-bit scales: beside the codes in the arena, or on pages a part's 512 after its codes; one FP32 a row
++            // (E4M3), two on the dsa's int8 rows (TF_GLM_KV8_INT8=1), so a prefix keeps every row's scales
++            const sb = latent_mod.scaleBytes(lw);
++            if (x.ls != 0) try p.addLatent(st, x, x.ls, try std.math.mul(usize, at, sb), page_rows * sb);
+         }
+         if (ring > 0) try p.add(st, st.rings[2 * j], ring);
+         if (gate > 0) try p.add(st, st.rings[2 * j + 1], gate);
+-- 
+2.43.0
+

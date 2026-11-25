@@ -1,0 +1,45 @@
+From 9eb1ff6a12d1bd54918ce841205a3b18c0b9c24a Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:47:21 +0200
+Subject: [PATCH] 0310: glm_moe_dsa's index scores scratch is one block, not
+ [rows][np]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+dsaSelect offset each block's tf_glm_dsa_scores/topk at a * np as if the
+scratch held every row's scores; cuda_state allocs it min(seg, 512) x
+np_max floats — a single 512-row block. Past ~460 rows of a chunk with
+~200K keys visible, the a-offset ran past the 512 MiB scratch and every
+rank died on CUDA_ERROR_ILLEGAL_ADDRESS mid-prefill. Each block's topk
+consumes its scores on the same stream, so the blocks reuse s.scores.
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+---
+ zig/src/families/glm/cuda_sparse.zig | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index d0fa598..8568e82 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -112,12 +112,12 @@ pub fn dsaSelect(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64,
+         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(d), -0.5));
+         var stamp = prof_mod.span(profile, stream, .index_score);
+         var sa: cuda.Args = .{};
+-        inline for (.{ qi + a * heads * d * 2, wts + a * stride * 2, @as(i64, @intCast(stride)), ik, s.scores + a * np * 4, at, @as(i64, @intCast(np)), @as(i64, @intCast(nb)), scale, headScale(heads), @as(i64, @intCast(heads)), @as(c_int, @intCast(loop)), inv }) |v| sa.add(v);
++        inline for (.{ qi + a * heads * d * 2, wts + a * stride * 2, @as(i64, @intCast(stride)), ik, s.scores, at, @as(i64, @intCast(np)), @as(i64, @intCast(nb)), scale, headScale(heads), @as(i64, @intCast(heads)), @as(c_int, @intCast(loop)), inv }) |v| sa.add(v);
+         try cuda.launch.launch(set.glue.dsa_scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
+         stamp.end();
+         stamp = prof_mod.span(profile, stream, .index_select);
+         var ta: cuda.Args = .{};
+-        inline for (.{ s.scores + a * np * 4, tokens + a * dsa_width * 4, @as(i64, @intCast(np)), at, @as(c_int, dsa_width), counts + a * 4 }) |v| ta.add(v);
++        inline for (.{ s.scores, tokens + a * dsa_width * 4, @as(i64, @intCast(np)), at, @as(c_int, dsa_width), counts + a * 4 }) |v| ta.add(v);
+         try cuda.launch.launch(set.glue.dsa_topk, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 } }, stream, &ta);
+         stamp.end();
+     }
+-- 
+2.43.0
+

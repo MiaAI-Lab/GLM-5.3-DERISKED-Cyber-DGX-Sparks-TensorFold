@@ -1,0 +1,67 @@
+From 49b84acb930a3a27522a7e92ba8f9999063eac85 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 06:35:20 +0200
+Subject: [PATCH] nvfp4 experts: the decode gate-up prefetches 8 groups ahead
+ into L2
+
+A decode window's gate-up runs about 150 warps (14 experts x 11 column
+blocks a rank at TP6), each streaming one unit's 192 K groups (221 KB)
+through two register stages: ~350 KB in flight across the GPU, about
+GB10's bandwidth-latency product, and the kernel ran ~23% under down's
+bytes a second (down's short units fill every SM). Each step now issues
+prefetch.global.L2 for the group 8 ahead, a 128-byte line a lane, plus a
+prologue for groups 2..7. The loads, the sums and their order are
+unchanged (bit-exact); M = 1 forms (down, relu^2 up) are untouched.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/nvfp4_experts.cu | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/zig/kernels/cuda/nvfp4_experts.cu b/zig/kernels/cuda/nvfp4_experts.cu
+index ff5c606..3660db0 100644
+--- a/zig/kernels/cuda/nvfp4_experts.cu
++++ b/zig/kernels/cuda/nvfp4_experts.cu
+@@ -74,19 +74,37 @@ __device__ __forceinline__ void compute_stage(float (&acc)[M][1][NTW][4], const
+     }
+ }
+ 
++// Group g's M x 576 contiguous bytes into L2, a 128-byte line a lane (lanes past the group's last line idle).
++template <int M>
++__device__ __forceinline__ void prefetch_group(const uint4* blk, int g, int lane) {
++  constexpr int LINES = (M * BLOCK4 * 16 + 127) / 128 + 1;  // +1: the group need not start on a line
++  if (lane < LINES) {
++    const char* p = reinterpret_cast<const char*>(blk + (size_t)g * (M * BLOCK4)) + lane * 128;
++    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(p));
++  }
++}
++
++// A warp streams one unit's KG groups through D register stages. With D = 2 alone a decode gate-up's ~150 warps
++// held ~350 KB in flight, about what GB10's bandwidth-latency product needs: its long units (K 6144) ran ~23% under
++// down's bytes a second. PF groups ahead go to L2 by prefetch (no extra stages, no change to the loads or sums),
++// which also walks the address translations ahead of the loads.
+ template <int M>
+ __device__ __forceinline__ void k_loop(float (&acc)[M][1][NTW][4], const uint4* blk, int KG, int lane, int t,
+                                        const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1) {
+-  constexpr int D = 2;
++  constexpr int D = 2, PF = M == 2 ? 8 : 0;  // gate-up only: down's short units already fill the GPU
+   Stage<M> st[D];
+ #pragma unroll
+   for (int d = 0; d < D; ++d)
+     if (d < KG) load_stage<M>(st[d], blk, d, lane, t, x0, x1, v0, v1);
++  if constexpr (PF > 0)
++    for (int g = D; g < PF && g < KG; ++g) prefetch_group<M>(blk, g, lane);
+   for (int g0 = 0; g0 < KG; g0 += D) {
+ #pragma unroll
+     for (int d = 0; d < D; ++d) {
+       const int g = g0 + d;
+       if (g < KG) {
++        if constexpr (PF > 0)
++          if (g + PF < KG) prefetch_group<M>(blk, g + PF, lane);
+         compute_stage<M>(acc, st[d], v1);
+         if (g + D < KG) load_stage<M>(st[d], blk, g + D, lane, t, x0, x1, v0, v1);
+       }
+-- 
+2.43.0
+

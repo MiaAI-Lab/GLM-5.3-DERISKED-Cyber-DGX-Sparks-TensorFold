@@ -1,0 +1,309 @@
+From c825d865dd300db0459025c2b1f99fee998af7e4 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:46:07 +0200
+Subject: glm: A and C on the E4M3 image (patch 0205 stacked on 0206/0208):
+ exl3-prompt-once-e4m3 and glm-exl3-fuse-e4m3, tf-cuda-test builds again
+
+TF_GLM_PF_EXPERTS_ONCE's tf_exl3_prompt_gu_once and TF_GLM_PF_DOWN_FUSE's fused down decode only through
+exl3_prompt.cuh's mcg2 / decode_a8 / decode_ag / decode_lane, which carry TF_EXL3_MCG_E4M3, so the exl3_experts_e4m3
+image already holds them on EXLR8's values; no kernel or engine change. New GPU tests prove it:
+  exl3-prompt-once-e4m3 [DIR]  the 12 once cases on the E4M3 image (DIR: an up1 layer.bin whose manifest says
+                               mcg_e4m3), each with controls: the K4 image's unfused bytes differ, and so do the
+                               K4 image's once kernel's against the E4M3 unfused result
+  glm-exl3-fuse-e4m3           the 45 fused-down cases on the E4M3 image, with the same K4-image controls
+tf-cuda-test did not compile on 0205 (glm_exl3_layer_tests' Loader had no has(), glm_loader_gate's Modules.load
+lacked the e4m3 argument): fixed.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/tests/cuda/exl3_prompt_once_tests.zig | 43 ++++++++++++++++++-----
+ zig/tests/cuda/glm_exl3_fuse_tests.zig    | 34 ++++++++++++++++--
+ zig/tests/cuda/main.zig                   |  4 +++
+ 3 files changed, 71 insertions(+), 10 deletions(-)
+
+diff --git a/zig/tests/cuda/exl3_prompt_once_tests.zig b/zig/tests/cuda/exl3_prompt_once_tests.zig
+index b147d5fd6..9b23d15a1 100644
+--- a/zig/tests/cuda/exl3_prompt_once_tests.zig
++++ b/zig/tests/cuda/exl3_prompt_once_tests.zig
+@@ -26,6 +26,9 @@ const Ctx = struct {
+     exp: *const ex.Experts,
+     router: cuda.grouped.Router,
+     cases: usize = 0,
++    /// The E4M3 arm (patch 0205's exl3_experts_e4m3 image, EXLR8's values): `exp` is that image and `k4` the plain EXL3
++    /// image on the same inputs, which must give other bytes (the arm is not silently on the K4 codebook).
++    k4: ?*const ex.Experts = null,
+ };
+ 
+ /// A layer's device tensors (4-bit mcg gate, up and down) and the host suh of gate, for the mutation check.
+@@ -49,6 +52,10 @@ fn download(c: *Ctx, ptr: u64, out: []u8) !void {
+ /// whether xu was left as allocated (0xff: no rotated copies written).
+ const Out = struct { xd: []u8, y: []u8, xu_untouched: bool };
+ fn runOnce(c: *Ctx, l: ex.Layer, x: u64, stride: usize, pk: u64, rows: usize, once: bool) !Out {
++    return runOn(c, c.exp, l, x, stride, pk, rows, once);
++}
++
++fn runOn(c: *Ctx, exp: *const ex.Experts, l: ex.Layer, x: u64, stride: usize, pk: u64, rows: usize, once: bool) !Out {
+     var b: Bufs = .{ .d = c.gpu.d, .gpa = c.gpu.gpa };
+     defer b.deinit();
+     var sc = try ex.prompt.scratchFor(try b.alloc(try ex.prompt.bytesFor(l, rows, K, false)), l, rows, K, false);
+@@ -57,7 +64,7 @@ fn runOnce(c: *Ctx, l: ex.Layer, x: u64, stride: usize, pk: u64, rows: usize, on
+     sc.y_bf16 = true;
+     sc.once = once;
+     const p = try plan(&b, rows * K, l.experts);
+-    try c.exp.prompt.run(c.exp, c.router, c.s, l, x, stride, pk, rows, sc, p);
++    try exp.prompt.run(exp, c.router, c.s, l, x, stride, pk, rows, sc, p);
+     const out: Out = .{ .xd = try c.a.alloc(u8, rows * K * N * 2), .y = try c.a.alloc(u8, rows * (K + 1) * D * 2), .xu_untouched = true };
+     try download(c, sc.xd, out.xd);
+     try download(c, sc.y, out.y);
+@@ -78,6 +85,14 @@ fn same(c: *Ctx, name: []const u8, l: ex.Layer, x: u64, stride: usize, pk: u64,
+     var what: [160]u8 = undefined;
+     try check.sameBytes(try std.fmt.bufPrint(&what, "{s}: xd (gate/up activations)", .{name}), got.xd, want.xd);
+     try check.sameBytes(try std.fmt.bufPrint(&what, "{s}: y (down slot rows)", .{name}), got.y, want.y);
++    if (c.k4) |k4| {
++        // the arm's controls: the K4 codebook's bytes differ (the E4M3 image decodes other values), and so does the once
++        // kernel of the K4 image against this unfused E4M3 result (what a once kernel left on the K4 codebook would give)
++        const plain = try runOn(c, k4, l, x, stride, pk, rows, false);
++        try check.expect(!std.mem.eql(u8, plain.xd, want.xd) and !std.mem.eql(u8, plain.y, want.y), "{s}: the E4M3 image gave the K4 image's bytes (the arm decodes the K4 codebook)", .{name});
++        const stale = try runOn(c, k4, l, x, stride, pk, rows, true);
++        try check.expect(!std.mem.eql(u8, stale.xd, want.xd), "{s}: a once kernel on the K4 codebook matched the E4M3 unfused xd (the comparison cannot see a wrong codebook)", .{name});
++    }
+     c.cases += 1;
+     check.pass("{s}: {d} rows, xd and y byte-identical to rot_in + gu", .{ name, rows });
+ }
+@@ -148,16 +163,27 @@ fn inputs(c: *Ctx, rng: std.Random, rows: usize, stride: usize) !struct { x: []u
+     return .{ .x = x, .pk = pk };
+ }
+ 
++/// `exl3-prompt-once [DIR]`: the K4 (mcg) image. `exl3-prompt-once-e4m3 [DIR]`: the same cases on the E4M3 image (DIR: an up1 layer.bin).
+ pub fn run(gpu: Gpu, dir: ?[]const u8) !void {
++    return suite(gpu, dir, false);
++}
++
++pub fn runE4m3(gpu: Gpu, dir: ?[]const u8) !void {
++    return suite(gpu, dir, true);
++}
++
++fn suite(gpu: Gpu, dir: ?[]const u8, e4m3: bool) !void {
+     var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
+     defer arena.deinit();
+     var stream = try cuda.Stream.init(gpu.d, false);
+     defer stream.deinit();
+-    var exp = try ex.Experts.load(gpu.d);
++    var exp = try (if (e4m3) ex.Experts.loadE4m3(gpu.d) else ex.Experts.load(gpu.d));
+     defer exp.unload();
++    var k4 = try ex.Experts.load(gpu.d);
++    defer k4.unload();
+     var pm = try cuda.Module.load(gpu.d, cuda.kernels.experts);
+     defer pm.unload();
+-    var c: Ctx = .{ .gpu = gpu, .a = arena.allocator(), .s = stream, .exp = &exp, .router = try cuda.grouped.Router.resolve(pm) };
++    var c: Ctx = .{ .gpu = gpu, .a = arena.allocator(), .s = stream, .exp = &exp, .router = try cuda.grouped.Router.resolve(pm), .k4 = if (e4m3) &k4 else null };
+     try check.expect(exp.prompt.gateup_once != null, "tf_exl3_prompt_gu_once is not in the experts image", .{});
+     var prng = std.Random.DefaultPrng.init(0x0206);
+     const rng = prng.random();
+@@ -217,24 +243,25 @@ pub fn run(gpu: Gpu, dir: ?[]const u8) !void {
+         }
+     }
+     if (dir) |path| {
+-        try real(&c, path);
++        try real(&c, path, e4m3);
+         want_cases += 1;
+     }
+     try check.expect(c.cases == want_cases, "exl3-prompt-once: {d} cases ran, {d} expected", .{ c.cases, want_cases });
+-    check.pass("exl3-prompt-once: {d}/{d} cases (tf_exl3_prompt_gu_once byte-identical to rot_in + tf_exl3_prompt_gu)", .{ c.cases, want_cases });
++    check.pass("exl3-prompt-once{s}: {d}/{d} cases (tf_exl3_prompt_gu_once byte-identical to rot_in + tf_exl3_prompt_gu)", .{ if (e4m3) "-e4m3" else "", c.cases, want_cases });
+ }
+ 
+ /// x9a extract.py's layer: rank 0 of a real K4 layer (TP4 cut) and 4,096 tap rows with their real top-8 routes.
+-fn real(c: *Ctx, dir: []const u8) !void {
++fn real(c: *Ctx, dir: []const u8, e4m3: bool) !void {
+     const io = c.gpu.io;
+     const d = try std.Io.Dir.cwd().openDir(io, dir, .{});
+     defer d.close(io);
+     const manifest = try d.readFileAlloc(io, "layer.json", c.a, .limited(1 << 20));
+     const blob = try d.readFileAlloc(io, "layer.bin", c.a, .limited(4 << 30));
+     const Arr = struct { name: []const u8, offset: usize, bytes: usize };
+-    const M = struct { layer: u32, rows: usize, experts: usize, dims: usize, width: usize, arrays: []const Arr };
++    const M = struct { layer: u32, rows: usize, experts: usize, dims: usize, width: usize, codebook: []const u8 = "mcg", arrays: []const Arr };
+     const m = try std.json.parseFromSliceLeaky(M, c.a, manifest, .{ .ignore_unknown_fields = true });
+     try check.expect(m.dims == D and m.width == N and m.rows == 4096, "real layer: dims {d} width {d} rows {d}", .{ m.dims, m.width, m.rows });
++    try check.expect(std.mem.eql(u8, m.codebook, if (e4m3) "mcg_e4m3" else "mcg"), "real layer: the manifest's codebook is {s}, this arm reads {s}", .{ m.codebook, if (e4m3) "mcg_e4m3" else "mcg" });
+     var b: Bufs = .{ .d = c.gpu.d, .gpa = c.gpu.gpa };
+     defer b.deinit();
+     const get = struct {
+@@ -279,5 +306,5 @@ fn real(c: *Ctx, dir: []const u8) !void {
+         .act_mode = 0,
+     };
+     var name: [64]u8 = undefined;
+-    try same(c, try std.fmt.bufPrint(&name, "real K4 layer {d} (rank 0 of TP4), real routes", .{m.layer}), l, try b.put(try get(m, blob, "x.bf16")), D, try b.put(try get(m, blob, "picks")), m.rows);
++    try same(c, try std.fmt.bufPrint(&name, "real {s} layer {d} (rank 0 of TP4), real routes", .{ if (e4m3) "up1 (E4M3)" else "K4", m.layer}), l, try b.put(try get(m, blob, "x.bf16")), D, try b.put(try get(m, blob, "picks")), m.rows);
+ }
+diff --git a/zig/tests/cuda/glm_exl3_fuse_tests.zig b/zig/tests/cuda/glm_exl3_fuse_tests.zig
+index f495f5b68..880e6479a 100644
+--- a/zig/tests/cuda/glm_exl3_fuse_tests.zig
++++ b/zig/tests/cuda/glm_exl3_fuse_tests.zig
+@@ -96,7 +96,19 @@ fn rowsLaunch(f: cuda.Function, s: cuda.Stream, n: usize, values: anytype) !void
+     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((n * D + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
+ }
+ 
++/// The K4 (mcg) image.
+ pub fn run(gpu: Gpu) !void {
++    return suite(gpu, false);
++}
++
++/// The same cases on the E4M3 image (patch 0205: EXLR8's values), with K4-image controls: the unfused default path of
++/// the E4M3 image must differ from the K4 image's on the same inputs, and the fused kernel of the K4 image must differ
++/// from the E4M3 unfused result (a fused down left on the K4 codebook would be seen).
++pub fn runE4m3(gpu: Gpu) !void {
++    return suite(gpu, true);
++}
++
++fn suite(gpu: Gpu, e4m3: bool) !void {
+     try check.expect(glm.exl3.downFuse(), "glm-exl3-fuse runs with TF_GLM_PF_DOWN_FUSE=1", .{});
+     try check.expect(glm.exl3.bf16Slots(), "glm-exl3-fuse needs bf16 slot rows (TF_GLM_EXL3_BF16_SLOTS unset)", .{});
+     var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
+@@ -116,8 +128,10 @@ pub fn run(gpu: Gpu) !void {
+     var gl = try cuda.Module.load(gpu.d, cuda.kernels.glm_glue);
+     defer gl.unload();
+     const fns: Fns = .{ .put = try ops.function("tf_glm_put_slot"), .combine = try gl.function("tf_glm_combine"), .fold = try ops.function("tf_glm_fold_slot") };
+-    var k = try glm.exl3.Kernels.load(gpu.d);
++    var k = try (if (e4m3) glm.exl3.Kernels.loadE4m3(gpu.d) else glm.exl3.Kernels.load(gpu.d));
+     defer k.unload();
++    var k4 = try glm.exl3.Kernels.load(gpu.d);
++    defer k4.unload();
+     var ek = try glm.experts.Kernels.load(gpu.d, pm, @intCast(try gpu.ctx.attribute(.multiprocessor_count)));
+     defer ek.unload();
+     var cases: usize = 0;
+@@ -144,6 +158,22 @@ pub fn run(gpu: Gpu) !void {
+                 try cuda.launch.launch(fns.combine, .{ .grid = .{ .x = @intCast(rows), .y = (D + 1023) / 1024 }, .block = .{ .x = 128 } }, r.s, &a);
+             }
+             const ref = try r.back(want, rows * D * 4);
++            if (e4m3) {
++                const ey4 = try r.zeros(rows * slots * D * 2);
++                const want4 = try r.zeros(rows * D * 4);
++                try glm.exl3.run(&k4, &ek, r.s, w, try scratch(&r, rows, w), try plan(&r, rows), dx, D, dpk, slots, rows, E, D, N, limit, true, ey4, try r.zeros(16));
++                try rowsLaunch(fns.put, r.s, rows, .{ dsy, ey4, @as(c_int, @intCast(rows)), @as(c_int, D), @as(c_int, slots), @as(c_int, slots - 1), @as(c_int, 1) });
++                {
++                    var a: cuda.Args = .{};
++                    inline for (.{ ey4, @as(c_int, 0), dwts, want4, @as(i64, D), @as(c_int, slots) }) |v| a.add(v);
++                    try cuda.launch.launch(fns.combine, .{ .grid = .{ .x = @intCast(rows), .y = (D + 1023) / 1024 }, .block = .{ .x = 128 } }, r.s, &a);
++                }
++                try check.expect(!std.mem.eql(u8, try r.back(want4, rows * D * 4), ref), "glm-exl3-fuse e4m3: the E4M3 image's default path gave the K4 image's bytes ({d} rows)", .{rows});
++                // the K4 image's fused kernel on the same inputs: other bytes than the E4M3 reference
++                const k4o0 = try r.zeros(rows * D * 4);
++                try glm.exl3.runFused(&k4, &ek, r.s, w, try scratch(&r, rows, w), try plan(&r, rows), dx, D, dpk, slots, rows, E, D, N, limit, true, try r.zeros(rows * slots * D * 2), try r.zeros(16), .{ .wts = dwts, .sy = dsy, .sy_rows = rows, .out0 = k4o0, .out1 = k4o0, .split = rows });
++                try check.expect(!std.mem.eql(u8, try r.back(k4o0, rows * D * 4), ref), "glm-exl3-fuse e4m3: a fused down on the K4 codebook matched the E4M3 reference ({d} rows)", .{rows});
++            }
+             for ([_]usize{ 0, rows / 2, rows }) |split| {
+                 const ey2 = try r.zeros(rows * slots * D * 2);
+                 const out0 = try r.zeros(split * D * 4);
+@@ -175,5 +205,5 @@ pub fn run(gpu: Gpu) !void {
+         try check.expect(std.meta.isError(res), "glm-exl3-fuse: a split past the rows is refused", .{});
+         try r.s.synchronize();
+     }
+-    check.pass("glm-exl3-fuse: {d} cases byte-equal to the default path (band {d})", .{ cases, glm.exl3.downFuseBand() });
++    check.pass("glm-exl3-fuse{s}: {d} cases byte-equal to the default path (band {d})", .{ if (e4m3) "-e4m3" else "", cases, glm.exl3.downFuseBand() });
+ }
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index c8203b4c4..96c1cd9b7 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -248,6 +248,8 @@ const usage =
+     \\  qwen-pages                qwen35.cu's attention cache through a page table: paged == contiguous, float64, red controls
+     \\  kernel-contract-limits DIR   each registered launch against sm_80/86/89/120/121 from the fatbins in DIR
+     \\  glm-exl3                  GLM's EXL3 routed experts, decode and prompt, against float64 (synthetic)
++    \\  exl3-prompt-once-e4m3 [DIR] the same on the E4M3 image (EXLR8 values; DIR: an up1 layer.bin, codebook mcg_e4m3), with K4-image controls
++    \\  glm-exl3-fuse-e4m3        glm-exl3-fuse on the E4M3 image (EXLR8 values), with K4-image controls; TF_GLM_PF_DOWN_FUSE=1
+     \\  glm-exl3-fuse             TF_GLM_PF_DOWN_FUSE=1: the fused down + fold byte-equal to down + put_slot + combine
+     \\  glm-exl3-layer <ckpt> <layer> <rank> <world>  one checkpoint layer's EXL3 experts through the GLM loader, against float64
+     \\  glm-vision MODEL F32 BF16 IMG  GLM's image tower and preparation against vision_ref.py's torch runs
+@@ -396,6 +398,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "affine4-decode")) return affine4_decode_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "w4a8")) return w4a8_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "glm-exl3")) return glm_exl3_tests.run_(gpu);
++    if (std.mem.eql(u8, cmd, "glm-exl3-fuse-e4m3")) return @import("glm_exl3_fuse_tests.zig").runE4m3(gpu);
+     if (std.mem.eql(u8, cmd, "glm-exl3-fuse")) return @import("glm_exl3_fuse_tests.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "glm-exl3-layer")) return glm_exl3_layer_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
+     if (std.mem.eql(u8, cmd, "glm-mm-fixed")) return glm_mm_fixed.run(gpu);
+@@ -414,6 +417,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "exlr8-bench")) return exlr8_tests.bench(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else "home", if (rest.len > 2) try std.fmt.parseInt(u16, rest[2], 10) else 40, if (rest.len > 3) try std.fmt.parseInt(usize, rest[3], 10) else 4);
+     if (std.mem.eql(u8, cmd, "exl3")) return exl3_tests.run(gpu, if (rest.len > 0) rest[0] else "none");
+     if (std.mem.eql(u8, cmd, "exl3-tiles")) return exl3_candidate_tests.run(gpu, if (rest.len > 0) rest[0] else null);
++    if (std.mem.eql(u8, cmd, "exl3-prompt-once-e4m3")) return @import("exl3_prompt_once_tests.zig").runE4m3(gpu, if (rest.len > 0) rest[0] else null);
+     if (std.mem.eql(u8, cmd, "exl3-prompt-once")) return @import("exl3_prompt_once_tests.zig").run(gpu, if (rest.len > 0) rest[0] else null);
+     if (std.mem.eql(u8, cmd, "exl3-prompt-k6")) return @import("exl3_prompt_k6_tests.zig").run(gpu, if (rest.len > 0) rest[0] else "none", if (rest.len > 1) rest[1] else null);
+     if (std.mem.eql(u8, cmd, "exl3-tp2")) return exl3_tp2_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else "none");
+-- 
+2.43.0
+
+
+From 1fba8d73ddceba0ed0992f3d4c824465b28dd93c Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:37:17 +0200
+Subject: glm: E4M3 arm tests, Codex review fixes: fused-down-only K4 control,
+ EXLR8 refused by glm-exl3-layer, once control must run the once kernel, zig
+ fmt
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/tests/cuda/exl3_prompt_once_tests.zig | 3 ++-
+ zig/tests/cuda/glm_exl3_fuse_tests.zig    | 7 +++++--
+ zig/tests/cuda/glm_exl3_layer_tests.zig   | 3 +++
+ 3 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/zig/tests/cuda/exl3_prompt_once_tests.zig b/zig/tests/cuda/exl3_prompt_once_tests.zig
+index 9b23d15a1..902f3a16f 100644
+--- a/zig/tests/cuda/exl3_prompt_once_tests.zig
++++ b/zig/tests/cuda/exl3_prompt_once_tests.zig
+@@ -91,6 +91,7 @@ fn same(c: *Ctx, name: []const u8, l: ex.Layer, x: u64, stride: usize, pk: u64,
+         const plain = try runOn(c, k4, l, x, stride, pk, rows, false);
+         try check.expect(!std.mem.eql(u8, plain.xd, want.xd) and !std.mem.eql(u8, plain.y, want.y), "{s}: the E4M3 image gave the K4 image's bytes (the arm decodes the K4 codebook)", .{name});
+         const stale = try runOn(c, k4, l, x, stride, pk, rows, true);
++        try check.expect(stale.xu_untouched, "{s}: the K4 image's once control fell back to rot_in + gu (it proves nothing)", .{name});
+         try check.expect(!std.mem.eql(u8, stale.xd, want.xd), "{s}: a once kernel on the K4 codebook matched the E4M3 unfused xd (the comparison cannot see a wrong codebook)", .{name});
+     }
+     c.cases += 1;
+@@ -306,5 +307,5 @@ fn real(c: *Ctx, dir: []const u8, e4m3: bool) !void {
+         .act_mode = 0,
+     };
+     var name: [64]u8 = undefined;
+-    try same(c, try std.fmt.bufPrint(&name, "real {s} layer {d} (rank 0 of TP4), real routes", .{ if (e4m3) "up1 (E4M3)" else "K4", m.layer}), l, try b.put(try get(m, blob, "x.bf16")), D, try b.put(try get(m, blob, "picks")), m.rows);
++    try same(c, try std.fmt.bufPrint(&name, "real {s} layer {d} (rank 0 of TP4), real routes", .{ if (e4m3) "up1 (E4M3)" else "K4", m.layer }), l, try b.put(try get(m, blob, "x.bf16")), D, try b.put(try get(m, blob, "picks")), m.rows);
+ }
+diff --git a/zig/tests/cuda/glm_exl3_fuse_tests.zig b/zig/tests/cuda/glm_exl3_fuse_tests.zig
+index 880e6479a..5e2566d31 100644
+--- a/zig/tests/cuda/glm_exl3_fuse_tests.zig
++++ b/zig/tests/cuda/glm_exl3_fuse_tests.zig
+@@ -169,9 +169,12 @@ fn suite(gpu: Gpu, e4m3: bool) !void {
+                     try cuda.launch.launch(fns.combine, .{ .grid = .{ .x = @intCast(rows), .y = (D + 1023) / 1024 }, .block = .{ .x = 128 } }, r.s, &a);
+                 }
+                 try check.expect(!std.mem.eql(u8, try r.back(want4, rows * D * 4), ref), "glm-exl3-fuse e4m3: the E4M3 image's default path gave the K4 image's bytes ({d} rows)", .{rows});
+-                // the K4 image's fused kernel on the same inputs: other bytes than the E4M3 reference
++                // only the fused down on the K4 codebook (the E4M3 image's gate/up kept, k6 kernel too): other bytes than the E4M3 reference
++                var kmix = k;
++                kmix.prompt.down_fuse = k4.prompt.down_fuse;
++                kmix.prompt.down_k6_fuse = k4.prompt.down_k6_fuse;
+                 const k4o0 = try r.zeros(rows * D * 4);
+-                try glm.exl3.runFused(&k4, &ek, r.s, w, try scratch(&r, rows, w), try plan(&r, rows), dx, D, dpk, slots, rows, E, D, N, limit, true, try r.zeros(rows * slots * D * 2), try r.zeros(16), .{ .wts = dwts, .sy = dsy, .sy_rows = rows, .out0 = k4o0, .out1 = k4o0, .split = rows });
++                try glm.exl3.runFused(&kmix, &ek, r.s, w, try scratch(&r, rows, w), try plan(&r, rows), dx, D, dpk, slots, rows, E, D, N, limit, true, try r.zeros(rows * slots * D * 2), try r.zeros(16), .{ .wts = dwts, .sy = dsy, .sy_rows = rows, .out0 = k4o0, .out1 = k4o0, .split = rows });
+                 try check.expect(!std.mem.eql(u8, try r.back(k4o0, rows * D * 4), ref), "glm-exl3-fuse e4m3: a fused down on the K4 codebook matched the E4M3 reference ({d} rows)", .{rows});
+             }
+             for ([_]usize{ 0, rows / 2, rows }) |split| {
+diff --git a/zig/tests/cuda/glm_exl3_layer_tests.zig b/zig/tests/cuda/glm_exl3_layer_tests.zig
+index 81d40f442..33ca26c31 100644
+--- a/zig/tests/cuda/glm_exl3_layer_tests.zig
++++ b/zig/tests/cuda/glm_exl3_layer_tests.zig
+@@ -181,6 +181,9 @@ pub fn run(gpu: Gpu, dir: []const u8, layer_s: []const u8, rank_s: []const u8, w
+     defer L.deinit();
+     const w = try glm.exl3.load(&L, layer, E, D, c.moe_inter, cut);
+     try stream.synchronize();
++    // this harness opens the plain image and its CPU oracle is the plain mcg codebook on whole-checkpoint tensor names: an
++    // EXLR8 (mcg_e4m3) layer is checked by exl3-prompt-once-e4m3 / glm-exl3-fuse-e4m3 instead
++    try check.expect(!w.e4m3, "glm-exl3-layer reads plain EXL3 layers (this one is EXLR8 mcg_e4m3: use exl3-prompt-once-e4m3 and glm-exl3-fuse-e4m3)", .{});
+     std.debug.print("glm-exl3-layer: layer {d}, rank {d} of {d} (columns {d}..{d}): {d:.2} GiB uploaded; widths gate/up {d}, down {d} half-bits (0: mixed); one rotation {}\n", .{ layer, rank, world, cut.lo, cut.hi, @as(f64, @floatFromInt(L.bytes)) / (1 << 30), w.uniform_gu, w.uniform_d, w.shx });
+     var k2s: [3][]i32 = undefined;
+     for (&k2s, w.tables()) |*t, ptr| {
+-- 
+2.43.0
+

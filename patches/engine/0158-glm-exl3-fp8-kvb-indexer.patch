@@ -1,0 +1,125 @@
+From 985b36dad21053b414a33e87d9288a28a33e1520 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:06:13 +0200
+Subject: [PATCH] glm: an EXL3 checkpoint's block FP8 kv_b and indexer
+ projections
+
+wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 keeps its FP8 source's non-expert
+tensors, kv_b_proj and the indexer's wk / wq_b among them. The loader
+declared an EXL3 checkpoint's modules NVFP4 (no recipe table) and read
+kv_b and the indexer as bf16 only. An EXL3 checkpoint's modules are now
+declared as a block FP8 one's (bf16 / fp16 or block FP8); a block FP8
+kv_b is dequantized on the host (value x its 128 x 128 block's scale,
+rounded to bf16) for the absorb's bf16 halves, and the indexer
+projections take block FP8 on the lane.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_weights.zig | 55 ++++++++++++++++++++++++---
+ 1 file changed, 50 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index ae995a1..926c95a 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -147,7 +147,8 @@ const Loader = struct {
+     /// What config.json declares `module` to be: its MIXED_PRECISION recipe, block FP8 for a quant_method "fp8"
+     /// checkpoint's quantized linears (bf16 for the rest), or NVFP4 for every quantized linear.
+     pub fn declaredAs(L: *const Loader, module: []const u8) formats.Declared {
+-        if (L.w.config.fp8) return .fp8_block;
++        // an EXL3 checkpoint's non-expert layers are as its source stored them: bf16 / fp16, or block FP8 (EXL3-K4-v1)
++        if (L.w.config.fp8 or L.w.config.exl3) return .fp8_block;
+         return if (L.recipes) |r| .{ .mixed = r.of(module) } else .nvfp4;
+     }
+ 
+@@ -261,7 +262,9 @@ const Loader = struct {
+         var kb: [96]u8 = undefined;
+         const kv_name = try std.fmt.bufPrint(&kb, "{s}layers.{d}.self_attn.kv_b_proj", .{ L.pfx, i });
+         const kv_mx = mtp and (try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i})).dtype == .f8_e4m3;
+-        try L.format("layers.{d}.self_attn.kv_b_proj", .{i}, if (kv_mx) .mxfp8 else .bf16);
++        // a block FP8 kv_b (EXL3-K4-v1 keeps its FP8 source's): dequantized on the host to the bf16 its absorb reads
++        const kv_f8 = !kv_mx and (try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i})).dtype == .f8_e4m3;
++        try L.format("layers.{d}.self_attn.kv_b_proj", .{i}, if (kv_mx) .mxfp8 else if (kv_f8) .fp8_pb else .bf16);
+         const kv_wide: ?formats.mxfp8.Mxfp8 = if (kv_mx) try formats.mxfp8.Mxfp8.read(L.ck, kv_name) else null;
+         const proj = try formats.cutProj(L, L.pfx, i, &.{ .{ .rel = "self_attn.q_a_proj" }, .{ .rel = "self_attn.kv_a_proj_with_mqa" } }, wants, "layers.{d}.dsa.proj");
+         // TF_GLM_DSA_SPLIT_QKVA (default on, three ranks or more, not the MTP head): this rank's 64-row units of
+@@ -297,7 +300,14 @@ const Loader = struct {
+         try L.whole(try L.get("layers.{d}.self_attn.kv_a_layernorm.weight", .{i}), .bf16);
+         const kv_norm = try L.put("layers.{d}.dsa.kv_norm", .{i});
+         const q_b = try formats.cutProj(L, L.pfx, i, &.{.{ .rel = "self_attn.q_b_proj", .rows = .{ h.lo * qk, h.hi * qk } }}, wants, "layers.{d}.dsa.q_b");
+-        const kv_b = try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i});
++        var kv_b = try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i});
++        var kv_deq: ?[]u8 = null;
++        defer if (kv_deq) |b| L.gpa.free(b);
++        if (kv_f8) {
++            kv_deq = try fp8BlockBf16(L.gpa, kv_b, try L.get("layers.{d}.self_attn.kv_b_proj.weight_scale_inv", .{i}));
++            kv_b.dtype = .bf16;
++            kv_b.bytes = kv_deq.?;
++        }
+         const per = c.nope + c.v_dim; // a head's kv_b rows: its keys (nope), then its values
+         const total = c.mla_heads * per;
+         for (h.lo..h.hi) |head| try absorbRows(L, kv_wide, kv_b, kv_name, head * per, head * per + c.nope, total);
+@@ -305,7 +315,7 @@ const Loader = struct {
+         for (h.lo..h.hi) |head| try absorbRows(L, kv_wide, kv_b, kv_name, head * per + c.nope, (head + 1) * per, total);
+         const wv = try L.put("layers.{d}.dsa.absorb.wv", .{i});
+         const o = try formats.cutProj(L, L.pfx, i, &.{.{ .rel = "self_attn.o_proj", .cols = .{ h.lo * c.v_dim, h.hi * c.v_dim } }}, wants, "layers.{d}.dsa.o");
+-        const iw: []const formats.Format = if (mtp) &.{ .bf16, .mxfp8 } else &.{.bf16};
++        const iw: []const formats.Format = if (mtp) &.{ .bf16, .mxfp8, .fp8_pb } else &.{ .bf16, .fp8_pb };
+         // glm_moe_dsa computes its top-k on its full layers only (indexer_types): a shared layer carries no
+         // indexer tensors at all and reuses the last full layer's token list, so its index weights stay unset (0).
+         const full = mtp or c.ifull.isSet(i);
+@@ -314,7 +324,17 @@ const Loader = struct {
+         var ln_w: u64 = 0;
+         var ln_b: u64 = 0;
+         if (full) {
+-            kw = try formats.cutProj(L, L.pfx, i, &.{ .{ .rel = "self_attn.indexer.wk" }, .{ .rel = "self_attn.indexer.weights_proj" } }, iw, "layers.{d}.dsa.index.kw");
++            const wk_t = try L.get("layers.{d}.self_attn.indexer.wk.weight", .{i});
++            if (wk_t.dtype == .f8_e4m3) { // block FP8 wk beside a bf16 weights_proj (EXL3-K4-v1): one bf16 stack
++                const deq = try fp8BlockBf16(L.gpa, wk_t, try L.get("layers.{d}.self_attn.indexer.wk.weight_scale_inv", .{i}));
++                defer L.gpa.free(deq);
++                var t = wk_t;
++                t.dtype = .bf16;
++                t.bytes = deq;
++                try L.whole(t, .bf16);
++                try L.whole(try L.get("layers.{d}.self_attn.indexer.weights_proj.weight", .{i}), .bf16);
++                kw = .{ .bf16 = try L.put("layers.{d}.dsa.index.kw", .{i}) };
++            } else kw = try formats.cutProj(L, L.pfx, i, &.{ .{ .rel = "self_attn.indexer.wk" }, .{ .rel = "self_attn.indexer.weights_proj" } }, iw, "layers.{d}.dsa.index.kw");
+             qb = try formats.cutProj(L, L.pfx, i, &.{.{ .rel = "self_attn.indexer.wq_b" }}, iw, "layers.{d}.dsa.index.qb");
+             try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.weight", .{i}), .bf16);
+             ln_w = try L.put("layers.{d}.dsa.index.ln_w", .{i});
+@@ -359,6 +379,31 @@ const Loader = struct {
+     }
+ 
+     /// kv_b's rows [lo, hi) onto the host bytes: bf16 as stored, or MXFP8 (`mx`, the MTP layer's) widened exactly.
++    /// A block FP8 weight ([N][K] e4m3, weight_scale_inv [N/128][K/128] fp32 or bf16) as bf16 bytes: each value times its
++    /// block's scale, rounded to nearest even. The caller frees the bytes.
++    fn fp8BlockBf16(gpa: std.mem.Allocator, w: Tensor, sc: Tensor) ![]u8 {
++        if (w.rank != 2 or sc.rank != 2) return error.UnexpectedTensor;
++        const n = w.dim(0);
++        const k = w.dim(1);
++        const kb = sc.dim(1);
++        if (sc.dim(0) != (n + 127) / 128 or kb != (k + 127) / 128) return error.UnexpectedTensor;
++        const out = try gpa.alloc(u8, n * k * 2);
++        errdefer gpa.free(out);
++        for (0..n) |r| for (0..k) |col| {
++            const j = (r / 128) * kb + col / 128;
++            const s: f32 = switch (sc.dtype) {
++                .f32 => std.mem.bytesToValue(f32, sc.bytes[4 * j ..][0..4]),
++                .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, sc.bytes[2 * j ..][0..2], .little)) << 16),
++                else => return error.UnexpectedTensor,
++            };
++            const v: f32 = core.exlr8.codec.e4m3Value(w.bytes[r * k + col]) * s;
++            const u: u32 = @bitCast(v);
++            const b: u16 = @intCast((u +% 0x7FFF +% ((u >> 16) & 1)) >> 16);
++            std.mem.writeInt(u16, out[2 * (r * k + col) ..][0..2], b, .little);
++        };
++        return out;
++    }
++
+     fn absorbRows(L: *Loader, mx: ?formats.mxfp8.Mxfp8, t: Tensor, name: []const u8, lo: usize, hi: usize, total: usize) !void {
+         if (mx) |p| return formats.mxfp8.appendWide(L, p, name, lo, hi);
+         try L.rows(t, lo, hi, total, .bf16);
+-- 
+2.43.0
+

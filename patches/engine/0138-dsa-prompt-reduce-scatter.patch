@@ -1,0 +1,126 @@
+From dedbbd01a5f4d7f4f0d2b637f78d10dd72ee7e54 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:03:04 +0200
+Subject: [PATCH] glm_moe_dsa: prompt exchanges by reduce-scatter, then a bf16
+ all-gather
+
+wholeDsa all-gathered every rank's fp32 partial of a 4,096-row chunk
+(each rank took in W - 1 partials, 500 MB at TP=6) and summed them on every
+rank: 47% of a TP=6 prompt chunk. A prompt chunk at W >= 3 now
+reduce-scatters the partials (each rank sums its own ceil(R / W) rows),
+adds them to its residual rows and all-gathers the bf16 residual rows,
+about a quarter of the bytes. TF_GLM_DSA_SCATTER=0 keeps the all-gathers.
+Adds ncclReduceScatter to the NCCL binding.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/cuda/nccl.zig                 |  1 +
+ zig/src/families/glm/cuda_forward.zig | 61 +++++++++++++++++++++++----
+ 2 files changed, 53 insertions(+), 9 deletions(-)
+
+diff --git a/zig/src/cuda/nccl.zig b/zig/src/cuda/nccl.zig
+index 277ebd1..e422a82 100644
+--- a/zig/src/cuda/nccl.zig
++++ b/zig/src/cuda/nccl.zig
+@@ -59,6 +59,7 @@ pub const Api = struct {
+     ncclGetErrorString: *const fn (R) callconv(.c) ?[*:0]const u8,
+     ncclAllReduce: *const fn (D, D, usize, DataType, RedOp, Comm, abi.Stream) callconv(.c) R,
+     ncclAllGather: *const fn (D, D, usize, DataType, Comm, abi.Stream) callconv(.c) R,
++    ncclReduceScatter: *const fn (D, D, usize, DataType, RedOp, Comm, abi.Stream) callconv(.c) R,
+     ncclBroadcast: *const fn (D, D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
+     ncclSend: *const fn (D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
+     ncclRecv: *const fn (D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index be9c026..2ea87f3 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -527,6 +527,54 @@ pub const Forward = struct {
+         if (pf) |p| try p.join(f.stream);
+     }
+ 
++    /// wholeDsa's prompt exchanges by reduce-scatter (TF_GLM_DSA_SCATTER, default on; 0: all-gathers): a chunk of R
++    /// rows at world >= 3 over NCCL. Each rank receives the sum of every rank's partial for its own ceil(R / world)
++    /// rows, adds them to its rows of the residual, and the ranks all-gather the bf16 residual rows: (W - 1) / W of an
++    /// fp32 partial out and a bf16 one in, where the all-gather of fp32 partials took W - 1 of them in (about a
++    /// quarter of the bytes at W = 6). Every rank's residual is the same bytes (one rank sums each row).
++    fn dsaScatter(f: *const Forward, R: usize) bool {
++        if (f.ranks.len != 1 or !f.ranks[0].b.prefill or f.exchange != .nccl) return false;
++        const world = f.ranks[0].w.share.world;
++        if (world < 3 or R < world) return false;
++        const v = std.c.getenv("TF_GLM_DSA_SCATTER") orelse return true;
++        return !std.mem.eql(u8, std.mem.span(v), "0");
++    }
++
++    /// Where a site of wholeDsa writes this rank's partial: its gathered room, or (scatter) the room's start, padded.
++    fn slotDsa(f: *const Forward, r: Rank, R: usize) u64 {
++        return if (f.dsaScatter(R)) r.b.gathered else slot(r, R);
++    }
++
++    /// hidden += every rank's partial of the site, R rows.
++    fn reduceDsa(f: *const Forward, R: usize) !void {
++        const D = f.ranks[0].w.config.hidden;
++        if (!f.dsaScatter(R)) {
++            try f.gather(R);
++            for (f.ranks) |r| try glue.residualAdd(f.set(), f.stream, r.b.hidden, r.b.hidden, r.b.gathered, R, D, r.w.share.world);
++            return;
++        }
++        const stamp = prof_mod.span(f.prof, f.stream, .all_gather);
++        defer stamp.end();
++        const r = f.ranks[0];
++        const n = f.exchange.nccl;
++        const world = r.w.share.world;
++        const rank = r.w.share.rank;
++        const per = (R + world - 1) / world;
++        const padded = per * world;
++        // the gathered room (fp32 [world][rows][D]) holds: this rank's partial padded to world x per rows (rows past R
++        // unread), the scattered sum of its rows, then the bf16 residual rows every rank gathers
++        const part = r.b.gathered;
++        const recv = part + padded * D * 4;
++        const rows_b16 = recv + per * D * 4;
++        if (rows_b16 + padded * D * 2 > r.b.gathered + world * r.b.rows * D * 4) return error.ScatterRoom;
++        try n.lib.check(n.lib.api.ncclReduceScatter(part, recv, per * D, .f32, .sum, n.comm, f.stream.handle), "ncclReduceScatter");
++        const lo = @min(R, rank * per);
++        const mine = @min(R, lo + per) - lo;
++        if (mine > 0) try glue.residualAdd(f.set(), f.stream, r.b.hidden + lo * D * 2, rows_b16 + rank * per * D * 2, recv, mine, D, 1);
++        try n.lib.check(n.lib.api.ncclAllGather(rows_b16 + rank * per * D * 2, rows_b16, per * D, .bf16, n.comm, f.stream.handle), "ncclAllGather");
++        try f.copy(f.stream, r.b.hidden, rows_b16, R * D * 2);
++    }
++
+     /// whole()'s glm_moe_dsa form: one bf16 residual stream in b.hidden (no mHC streams, no stream mean).
+     /// The layer bodies, fills and exchanges are the mHC loop's — the same plain-residual graph mtp() runs.
+     fn wholeDsa(f: *const Forward, R: usize) !void {
+@@ -541,26 +589,21 @@ pub const Forward = struct {
+                 const l = r.w.layers[j];
+                 const b = r.b;
+                 try glue.rmsnormBy(f.set(), f.stream, b.hidden, D, l.in_norm, b.normed, D, b.xs, c.eps, R, D);
+-                if (r.segs.len > 0) try shared.mixer(f, r, l, 0, di, R, slot(r, R)) else try f.mixer(r, l, 0, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
++                if (r.segs.len > 0) try shared.mixer(f, r, l, 0, di, R, slot(r, R)) else try f.mixer(r, l, 0, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), f.slotDsa(r, R));
+             }
+             if (f.prof) |p| p.mark(f.stream, .mla);
+             if (pf) |p| try p.fork(f.stream, j, .f);
+-            try f.gather(R);
++            try f.reduceDsa(R);
+             prof_mod.context(f.prof, j, null, .ffn);
+             for (f.ranks) |r| {
+                 const l = r.w.layers[j];
+                 const b = r.b;
+-                try glue.residualAdd(f.set(), f.stream, b.hidden, b.hidden, b.gathered, R, D, r.w.share.world);
+                 try glue.rmsnormBy(f.set(), f.stream, b.hidden, D, l.post_norm, b.normed, D, b.xs, c.eps, R, D);
+-                try f.ffn(r, l, R, slot(r, R));
++                try f.ffn(r, l, R, f.slotDsa(r, R));
+             }
+             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared);
+             if (pf) |p| try p.fork(f.stream, j, .n);
+-            try f.gather(R);
+-            for (f.ranks) |r| {
+-                const b = r.b;
+-                try glue.residualAdd(f.set(), f.stream, b.hidden, b.hidden, b.gathered, R, D, r.w.share.world);
+-            }
++            try f.reduceDsa(R);
+             if (f.prof) |p| p.mark(f.stream, .gather_b);
+             switch (f.ranks[0].w.layers[j].mixer) {
+                 .kda => unreachable, // glm_moe_dsa's layers are all .mla (its config's kind says so)
+-- 
+2.43.0
+

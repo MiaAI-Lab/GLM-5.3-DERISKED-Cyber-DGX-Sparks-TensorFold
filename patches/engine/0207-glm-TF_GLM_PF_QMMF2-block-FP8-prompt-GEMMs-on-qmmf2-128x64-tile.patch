@@ -1,0 +1,705 @@
+From abfb8459bcdb4e6ccb2f162820a8aba5c46a2a45 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 19:33:56 +0200
+Subject: glm: TF_GLM_PF_QMMF2, block-FP8 prompt GEMMs on qmmf2's 128x64 tile,
+ the lane's bytes
+
+Default off. With TF_GLM_PF_QMMF2=1 the lane loads a second image (qmmf2.cu) at boot, and every block-FP8
+(FP8G) lane call with at least 256 rows and 1,024 inputs (GLM's prompt o_proj, [q_a | kv_a], q_b, indexer q_b,
+shared gate|up, dense layers) runs qmmf2_fp8g<128, 64, 2, 2, 2> instead of qmmf_kernel<FP8G, 64, 64, 1, 4, 4>.
+Off, the image is never loaded and matmulOut is unchanged; qmmf.cu is untouched (its SASS is identical).
+
+Bit-exact by construction: per output element the same m16n8k16 bf16 MMA fragments and chains (mma0 at k16
+step 0, then 1..3), the same fp32 fma with the column's scale per 64-input group, the same K slices (qmmf.splitK)
+summed in the fused kernel's order. Only the schedule changes: 128x64 outputs per CTA on 2x2 warps (64x32 each),
+two stages (two CTAs an SM), each group's e4m3 codes widened to bf16 once per warp (byte permute + the same
+bf16x2 fma as fp8pair), m16 row tiles walked one at a time, stage copies from addresses computed once. The
+running total starts at -0 (no select, 64 fewer live registers at the boundary); -0 + x == x for every non-NaN
+x and NaN slice sums are already the canonical 0x7FFFFFFF (FFMA results), proved over all 2^32 inputs on GB10
+by tf_qmmf2_neg0_check, which tf-cuda-test lane-pf2 runs.
+
+GB10 at the 1800 MHz cap (bf16 mma peak 87 TFLOPS), 2,048-row halves: o_proj 42 -> 58-63 TFLOPS,
+[q_a | kv_a] 41.5 -> 57-62, q_b 40 -> 54-60, shared gate|up 38 -> 50-56.
+
+Tests: tf-cuda-test lane-pf2 (14 shapes x bf16/f32 bytes equal to the lane, 11 taken, special values, strided
+rows, odd N, SK 1, tensor scale, 4-mod-8 outputs, the -0 proof); qmmf.zig host test for the plan and names.
+gr8 (kindlingai/gr8) was read for its prefill notes only; no gr8 code or design is used here.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/build/cuda_kernels.zig        |   1 +
+ zig/kernels/cuda/qmmf2.cu         | 243 ++++++++++++++++++++++++++++++
+ zig/src/cuda/kernels.zig          |   1 +
+ zig/src/cuda/qmmf.zig             |  89 +++++++++++
+ zig/tests/cuda/lane_pf2_tests.zig | 130 ++++++++++++++++
+ zig/tests/cuda/main.zig           |   3 +
+ 6 files changed, 467 insertions(+)
+ create mode 100644 zig/kernels/cuda/qmmf2.cu
+ create mode 100644 zig/tests/cuda/lane_pf2_tests.zig
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 017d2d1d1..e98a2e2fa 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -88,6 +88,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "gdn_prep", .flags = &.{"-O3"} }, // ours: Gated DeltaNet conv, norms, g and beta (cuda/gdn_prep.zig)
+     .{ .name = "qk_rows", .flags = &.{"-O3"} }, // ours: QK norm, RoPE and the cache write (cuda/qk_rows.zig)
+     .{ .name = "qmmf", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu's device code (FP8G, FP4), tensorfold_nvfp4_v3
++    .{ .name = "qmmf2", .flags = &.{"-O3"} }, // ours: block-FP8 prompt rows on 128x64 tiles, qmmf's FP8G bytes (TF_GLM_PF_QMMF2)
+     .{ .name = "prompt16", .flags = &.{"-O3"} }, // nvfp4/prompt.cu's FP4 and FP8 tile 4, tensorfold_nvfp4_prompt_v1
+     .{ .name = "tree_attention", .flags = &.{"-O3"} }, // ours: committed keys and paths (cuda/tree_attention.zig)
+     .{ .name = "block_attention", .flags = &.{"-O3"} }, // ours: a drafter's block over its context (cuda/block_attention.zig)
+diff --git a/zig/kernels/cuda/qmmf2.cu b/zig/kernels/cuda/qmmf2.cu
+new file mode 100644
+index 000000000..606c774fb
+--- /dev/null
++++ b/zig/kernels/cuda/qmmf2.cu
+@@ -0,0 +1,243 @@
++// Block-FP8 prompt matmul (TF_GLM_PF_QMMF2): qmmf.cu's FP8G lane sums, bit for bit, on a 128 x 64 tile with fewer
++// instructions and fewer bytes moved a flop. Every output element keeps qmmf_kernel<FP8G, 64, 64, 1, 4, 4, *, *, *>'s
++// arithmetic exactly:
++//   per K slice s (K/64/SK groups each, ascending): acc = 0; per group g: d = the four m16n8k16 bf16 MMAs over k16
++//   steps 0..3 (the first from zero) on the same A and B fragments; acc = fma(d, scale[col][g], acc);
++//   then ((acc_0 + acc_1) + acc_2) + ..., the order of the fused kernel's running total (and of the cluster and
++//   memory sums); times the tensor scale; bf16 (round to nearest even) or fp32 out.
++// Only the schedule changes: a CTA holds BM x BN outputs on WM x WN warps (a staged input row feeds BN columns, a
++// staged weight column BM rows), a warp widens each group's e4m3 codes to bf16 once and walks its m16 row tiles one
++// at a time (the four-step chains of its n8 tiles in flight together), and the stage copies run from addresses
++// computed once.
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++#include "common/qmm_frag.cuh"
++
++namespace tf_qmmf2 {
++
++using namespace qmm_frag;
++
++constexpr int GS = 64; // inputs a stage holds (one column scale each)
++
++// qmmf.cu's fp8pair on the two halves of a word: lo from bytes 0 and 1, hi from bytes 2 and 3, the same bf16x2 bits.
++// fp8pair builds t = ((b & 0x7F) << 4) | ((b & 0x80) << 8) in each half of byte b and multiplies by 2^120 (the bf16x2
++// fma with -0); here the bytes move to bits 8..15 of each half by a byte permute and t follows in two logic ops.
++__device__ __forceinline__ uint32_t widen(uint32_t y) { // y: halves (b << 8)
++    const uint32_t t = ((y & 0x7F007F00u) >> 4) | (y & 0x80008000u);
++    uint32_t r;
++    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7B807B80u), "r"(0x80008000u));
++    return r;
++}
++__device__ __forceinline__ void fp8pairs(uint32_t w, uint32_t& lo, uint32_t& hi) {
++    lo = widen(__byte_perm(w, 0u, 0x1404u));
++    hi = widen(__byte_perm(w, 0u, 0x3424u));
++}
++
++template <int BM, int BN, int WM, int WN, int STAGES>
++struct Tile {
++    static constexpr int THREADS = WM * WN * 32;
++    static constexpr int MT = BM / WM / 16;  // m16 tiles a warp
++    static constexpr int NT = BN / WN / 8;   // n8 tiles a warp
++    static constexpr int TB = BN / 64;       // packed 64-column tiles a CTA
++    static constexpr int ROW = GS * 2;       // bytes of one input row a stage
++    static constexpr int CHUNKS = ROW / 16;
++    static constexpr int X = BM * ROW;
++    static constexpr int W = BN * GS;        // e4m3 codes
++    static constexpr int S = BN * 4;         // fp32 column scales
++    static constexpr int STAGE = (X + W + S + 127) / 128 * 128;
++    static constexpr int SMEM = STAGES * STAGE;
++    static constexpr int XC = BM * CHUNKS / THREADS; // 16-byte input copies a thread a stage
++    static constexpr int WC = W / 16 / THREADS;      // and weight copies
++    static_assert(THREADS % 64 == 0 && 256 % THREADS == 0 && BM % (THREADS / CHUNKS) == 0 && W / 16 % THREADS == 0 && S / 16 <= THREADS,
++                  "whole copies a thread, the swizzle kept by the row step");
++};
++
++// y [M, N] = x [M, K] (rows ldx apart) . w, K in SK slices of K/64/SK groups each (SK from the shape, qmmf.splitK).
++template <int BM, int BN, int WM, int WN, int STAGES, bool F32>
++__global__ void __launch_bounds__(WM * WN * 32) qmmf2_fp8g(
++        const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
++        float scale, void* __restrict__ out, int M, int N, int K, int SK, int ldx, int group) {
++    using T = Tile<BM, BN, WM, WN, STAGES>;
++    static_assert(BN % 64 == 0 && BM % (16 * WM) == 0 && BN % (8 * WN) == 0, "whole packed tiles, whole fragments");
++    extern __shared__ __align__(128) unsigned char buf[];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int wm = warp / WN, wn = warp % WN;
++    const int KG = K / GS, slice_groups = KG / SK, ntiles = (N + 63) / 64;
++    const int2 at = tile_of(blockIdx.x, M, N, BM, BN, group);
++    const int m0 = at.x, n0 = at.y;
++
++    // copy plan: thread tid copies input chunk tid % 8 of rows tid / 8 + u * RP (u < XC), and 16-byte words
++    // tid + u * THREADS of the stage's weight tiles; every source advances by one group (64 inputs) a stage
++    constexpr int RP = T::THREADS / T::CHUNKS;
++    const int xr0 = tid / T::CHUNKS, xch = tid % T::CHUNKS;
++    const __nv_bfloat16* xsrc = x + static_cast<size_t>(m0 + xr0) * ldx + xch * 8;
++    const size_t xstep = static_cast<size_t>(RP) * ldx;
++    const uint32_t xd0 = xr0 * T::ROW + swz<T::CHUNKS>(xr0, xch) * 16; // + u * RP rows: RP % 8 == 0 keeps the swizzle
++    const int xrows = M - m0 - xr0;                                      // copies u with u * RP < xrows read rows
++    const size_t wtile = static_cast<size_t>(KG) * 4096;                 // bytes of one packed 64-column tile
++    const unsigned char* wsrc = w + (n0 / 64) * wtile + tid * 16;
++    const int wtiles = ntiles - n0 / 64;                                 // packed tiles of this CTA that hold columns
++    const bool sr = tid < T::S / 16 && tid / 16 < wtiles;
++    const uint8_t* ssrc = bs + static_cast<size_t>(n0 / 64 + tid / 16) * KG * 256 + (tid % 16) * 16;
++
++    auto stage = [&](int s) { return buf + s * T::STAGE; };
++    auto load = [&](int s, int g) {
++        unsigned char* p = stage(s);
++#pragma unroll
++        for (int u = 0; u < T::XC; ++u) {
++            const bool in = u * RP < xrows;
++            cp16z(p + xd0 + u * RP * T::ROW, in ? xsrc + u * xstep + g * GS : x, in);
++        }
++#pragma unroll
++        for (int u = 0; u < T::WC; ++u) {
++            const int t = u * T::THREADS / 256, off = u * T::THREADS % 256; // THREADS divides 256
++            if (t < wtiles) cp16(p + T::X + (tid + u * T::THREADS) * 16, wsrc + t * wtile + off * 16 + static_cast<size_t>(g) * 4096);
++        }
++        if (sr) cp16(p + T::X + T::W + tid * 16, ssrc + static_cast<size_t>(g) * 256);
++    };
++
++    float acc[T::MT][T::NT][4];
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
++    // the slices' running total, as the fused kernel keeps it (tot = s_0, then tot + s_k at each later slice end), with
++    // the copy done as -0 + s_0: one register set fewer live at the boundary (no select), the same bytes. -0 + x == x
++    // for every non-NaN x (signed zeros included, subnormals kept: no flush), and a NaN s_0 is already the canonical
++    // 0x7FFFFFFF (an FFMA result) that FADD returns for any NaN; checked exhaustively over all 2^32 inputs on GB10
++    // (tf-cuda-test lane-pf2, fadd_neg0_kernel).
++    float tot[T::MT][T::NT][4];
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) tot[i][j][e] = -0.0f;
++#pragma unroll
++    for (int s = 0; s < STAGES - 1; ++s) {
++        if (s < KG) load(s, s);
++        commit();
++    }
++    // ldmatrix rows and chunk of this lane, per m16 tile i: row r0 + i * 16, chunk kt * 2 + (lane >> 4); i * 16 rows
++    // keep r0's swizzle, so the four k16 steps' byte offsets are fixed for the whole kernel
++    const int r0 = wm * (BM / WM) + (lane & 7) + ((lane >> 3) & 1) * 8;
++    uint32_t aoff[4];
++#pragma unroll
++    for (int kt = 0; kt < 4; ++kt) aoff[kt] = r0 * T::ROW + swz<T::CHUNKS>(r0, kt * 2 + (lane >> 4)) * 16;
++    const uint32_t boff = ((wn * T::NT) * 32 + lane) * 16, soff = (wn * (BN / WN) + (lane & 3) * 2) * 4;
++    for (int it = 0; it < KG; ++it) {
++        if (it > 0 && it % slice_groups == 0) { // a slice ends: into the running total, then a fresh slice sum
++#pragma unroll
++            for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++                for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++                    for (int e = 0; e < 4; ++e) {
++                        tot[i][j][e] = __fadd_rn(tot[i][j][e], acc[i][j][e]);
++                        acc[i][j][e] = 0.0f;
++                    }
++        }
++        wait<STAGES - 2>();
++        __syncthreads();
++        const int next = it + STAGES - 1;
++        if (next < KG) load(next % STAGES, next);
++        commit();
++        const unsigned char* p = stage(it % STAGES);
++        const unsigned char* pw = p + T::X;
++        const uint8_t* ps = p + T::X + T::W;
++        // this warp's columns of the group, widened once: b[j][kt] = the lane's (b0, b1) of n8 tile j at k16 step kt
++        uint32_t b[T::NT][4][2];
++        float2 sv[T::NT];
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j) {
++            const uint4 q = *reinterpret_cast<const uint4*>(pw + boff + j * 512);
++            const uint32_t words[4] = {q.x, q.y, q.z, q.w};
++#pragma unroll
++            for (int kt = 0; kt < 4; ++kt) fp8pairs(words[kt], b[j][kt][0], b[j][kt][1]);
++            sv[j] = *reinterpret_cast<const float2*>(ps + soff + j * 32);
++        }
++#pragma unroll
++        for (int i = 0; i < T::MT; ++i) {
++            uint32_t a[4][4];
++#pragma unroll
++            for (int kt = 0; kt < 4; ++kt) ldmatrix4(a[kt], p + aoff[kt] + i * 16 * T::ROW);
++            float d[T::NT][4];
++#pragma unroll
++            for (int kt = 0; kt < 4; ++kt)
++#pragma unroll
++                for (int j = 0; j < T::NT; ++j) {
++                    if (kt == 0) mma0(d[j], a[kt], b[j][kt][0], b[j][kt][1]);
++                    else mma(d[j], a[kt], b[j][kt][0], b[j][kt][1]);
++                }
++#pragma unroll
++            for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++                for (int e = 0; e < 4; ++e) acc[i][j][e] = __fmaf_rn(d[j][e], (e & 1) ? sv[j].y : sv[j].x, acc[i][j][e]);
++        }
++    }
++    wait<0>();
++    if (SK > 1) {
++#pragma unroll
++        for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++            for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++                for (int e = 0; e < 4; ++e) acc[i][j][e] = __fadd_rn(tot[i][j][e], acc[i][j][e]);
++    }
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j) {
++            const int col = n0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2;
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
++                if (row >= M) continue;
++                const float v0 = __fmul_rn(acc[i][j][2 * h], scale), v1 = __fmul_rn(acc[i][j][2 * h + 1], scale);
++                if (F32) {
++                    float* dst = reinterpret_cast<float*>(out) + static_cast<size_t>(row) * N + col;
++                    if (col < N) dst[0] = v0; // scalar stores, as the lane's: any 4-byte aligned output
++                    if (col + 1 < N) dst[1] = v1;
++                } else {
++                    __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(out) + static_cast<size_t>(row) * N + col;
++                    if (col + 1 < N && (N & 1) == 0)
++                        *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
++                    else {
++                        if (col < N) dst[0] = __float2bfloat16_rn(v0);
++                        if (col + 1 < N) dst[1] = __float2bfloat16_rn(v1);
++                    }
++                }
++            }
++        }
++}
++
++// The -0 copy's proof, over every fp32 bit pattern: bad[0] counts x whose -0 + x bytes differ from x (non-NaN) or
++// from 0x7FFFFFFF (NaN); bad[1] counts NaN payloads an FFMA (d * s + acc, NaN in any operand) does not return as
++// 0x7FFFFFFF, so the total's NaN inputs are canonical before the add.
++extern "C" __global__ void tf_qmmf2_neg0_check(unsigned long long base, unsigned int* bad) {
++    const unsigned long long i = base + static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i > 0xFFFFFFFFull) return;
++    const uint32_t u = static_cast<uint32_t>(i);
++    const float x = __uint_as_float(u);
++    const bool nan = (u & 0x7FFFFFFFu) > 0x7F800000u;
++    const uint32_t r = __float_as_uint(__fadd_rn(-0.0f, x));
++    if (r != (nan ? 0x7FFFFFFFu : u)) atomicAdd(&bad[0], 1u);
++    if (nan) {
++        const uint32_t f0 = __float_as_uint(__fmaf_rn(x, 1.5f, 2.0f)), f1 = __float_as_uint(__fmaf_rn(1.5f, x, 2.0f));
++        const uint32_t f2 = __float_as_uint(__fmaf_rn(1.5f, 2.0f, x));
++        if (f0 != 0x7FFFFFFFu || f1 != 0x7FFFFFFFu || f2 != 0x7FFFFFFFu) atomicAdd(&bad[1], 1u);
++    }
++}
++
++#ifndef QMMF2_NO_INSTANCES
++// The instances qmmf.zig loads by name: 128 x 64 outputs on 2 x 2 warps, two stages (two CTAs an SM), bf16 / fp32 out.
++template __global__ void qmmf2_fp8g<128, 64, 2, 2, 2, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, int, int, int, int, int, int);
++template __global__ void qmmf2_fp8g<128, 64, 2, 2, 2, true>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, int, int, int, int, int, int);
++#endif
++
++} // namespace tf_qmmf2
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 5ae4d2d86..7ba65c576 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -57,6 +57,7 @@ pub const qwen35_kv8: []const u8 = if (available) &Blob("fatbin_qwen35_kv8").byt
+ pub const qwen35_bf16_rows: []const u8 = if (available) &Blob("fatbin_qwen35_bf16_rows").bytes else &.{};
+ pub const gdn_prefill: []const u8 = if (available) &Blob("fatbin_gdn_prefill").bytes else &.{};
+ pub const qmmf: []const u8 = if (available) &Blob("fatbin_qmmf").bytes else &.{};
++pub const qmmf2: []const u8 = if (available) &Blob("fatbin_qmmf2").bytes else &.{};
+ pub const prompt16: []const u8 = if (available) &Blob("fatbin_prompt16").bytes else &.{};
+ pub const tree_attention: []const u8 = if (available) &Blob("fatbin_tree_attention").bytes else &.{};
+ pub const block_attention: []const u8 = if (available) &Blob("fatbin_block_attention").bytes else &.{};
+diff --git a/zig/src/cuda/qmmf.zig b/zig/src/cuda/qmmf.zig
+index 0b4774e55..f41ac6841 100644
+--- a/zig/src/cuda/qmmf.zig
++++ b/zig/src/cuda/qmmf.zig
+@@ -116,6 +116,37 @@ pub const reduce_symbols = [2][:0]const u8{
+ };
+ const row_tiles = [_]u32{ 16, 32, 64 };
+ 
++/// TF_GLM_PF_QMMF2=1 (default off; read once, at Lane.load): block-FP8 prompt calls of at least `pf2_rows` rows and
++/// `pf2_min_k` inputs run qmmf2.cu's 128x64 tile (2 x 2 warps, two stages) instead of the 64-row lane tile. Its bytes
++/// are the lane's: the same MMA chains, scale fma and K-slice sum order (qmmf2.cu), so a row's bits still do not
++/// depend on the row count or on which kernel ran. Off, the qmmf2 image is never loaded and every call is unchanged.
++pub const pf2_env = "TF_GLM_PF_QMMF2";
++pub const pf2_rows = fused_rows; // prompt rows: the lane's fused-slice plan, every row count above it alike
++pub const pf2_min_k = 1024; // below 16 groups the 64-row tile is as fast (measured on GB10: K 512 is 10% slower)
++pub const pf2_bm = 128;
++const pf2_threads = 128; // WM 2 x WN 2 warps
++
++pub const pf2_symbols = [2][:0]const u8{ // by Out: bf16, f32
++    "_ZN8tf_qmmf210qmmf2_fp8gILi128ELi64ELi2ELi2ELi2ELb0EEEvPK13__nv_bfloat16PKhS5_fPviiiiii",
++    "_ZN8tf_qmmf210qmmf2_fp8gILi128ELi64ELi2ELi2ELi2ELb1EEEvPK13__nv_bfloat16PKhS5_fPviiiiii",
++};
++
++/// qmmf2.cu's Tile<128, 64, 2, 2, 2>::SMEM: two stages of 128 input rows, 64 columns of codes and their scales.
++pub fn pf2Shared() u32 {
++    const stage: u32 = (pf2_bm * group * 2 + bn * group + bn * 4 + 127) / 128 * 128;
++    return 2 * stage;
++}
++
++/// Whether a call of `m` rows on `w` takes the qmmf2 tile (when loaded).
++pub fn pf2Takes(m: usize, w: Weight) bool {
++    return w.mode == .fp8g and m >= pf2_rows and w.k >= pf2_min_k and w.k % group == 0;
++}
++
++fn pf2On() bool {
++    const v = std.c.getenv(pf2_env) orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
+ /// What a call writes: bf16 rows, or the fp32 sums unrounded (a tensor-parallel rank's partial rows).
+ pub const Out = enum { bf16, f32 };
+ 
+@@ -139,6 +170,9 @@ pub const Lane = struct {
+     half: [2][2][2]Function, // by halfModeIndex, Out, then plain / cluster
+     half_below: usize = half_below_default,
+     clusters: bool, // sm_90 on: slices meet in a cluster's shared memory
++    pf2: ?Pf2 = null, // TF_GLM_PF_QMMF2: the qmmf2 image and its two instances, by Out
++
++    pub const Pf2 = struct { mod: Module, fns: [2]Function };
+ 
+     pub fn load(d: *const Driver, capability_major: u32) !Lane {
+         if (!kernels.available) return error.BuiltWithoutKernels;
+@@ -163,10 +197,24 @@ pub const Lane = struct {
+             l.half[mi][oi][ci] = f;
+         };
+         l.half_below = halfBelow();
++        if (pf2On()) l.pf2 = try loadPf2(d);
+         return l;
+     }
+ 
++    /// The qmmf2 image (TF_GLM_PF_QMMF2): its bf16 and fp32 instances, shared bytes allowed.
++    pub fn loadPf2(d: *const Driver) !Pf2 {
++        var mod = try Module.load(d, kernels.qmmf2);
++        errdefer mod.unload();
++        var p: Pf2 = .{ .mod = mod, .fns = undefined };
++        for (&p.fns, pf2_symbols) |*f, name| {
++            f.* = try mod.function(name);
++            try f.allowDynamicShared(pf2Shared());
++        }
++        return p;
++    }
++
+     pub fn unload(l: *Lane) void {
++        if (l.pf2) |*p| p.mod.unload();
+         l.mod.unload();
+     }
+ 
+@@ -190,6 +238,7 @@ pub const Lane = struct {
+     pub fn matmulOut(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64) !void {
+         const p = plan(m, w.n, w.k, l.clusters);
+         if (p.reduce and part == 0) return error.MissingLanePart;
++        if (l.pf2) |q| if (pf2Takes(m, w)) return pf2Launch(q, s, x, ldx, m, w, y, out, p.sk);
+         const set = (if (out == .f32) l.f32_fns else l.fns)[modeIndex(w.mode)];
+         const ti: usize = if (p.bm == 16) 0 else if (p.bm == 32) 1 else 2;
+         const rows_t = (m + p.bm - 1) / p.bm;
+@@ -234,6 +283,29 @@ pub const Lane = struct {
+     }
+ };
+ 
++/// One qmmf2 launch: rows in 128-row bands of `group` tiles (the lane's band rule at 128 rows), K in the shape's slices.
++fn pf2Launch(q: Lane.Pf2, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, sk: u32) !void {
++    const rows_t = (m + pf2_bm - 1) / pf2_bm;
++    const band = @max(1, @min(rows_t, (12 << 20) / (@as(usize, pf2_bm) * w.k * 2)));
++    var args: launch_.Args = .{};
++    args.add(x);
++    args.add(w.codes);
++    args.add(w.scales);
++    args.add(w.scale);
++    args.add(y);
++    args.add(@as(i32, @intCast(m)));
++    args.add(@as(i32, @intCast(w.n)));
++    args.add(@as(i32, @intCast(w.k)));
++    args.add(@as(i32, @intCast(sk)));
++    args.add(@as(i32, @intCast(ldx)));
++    args.add(@as(i32, @intCast(band)));
++    try launch_.launch(q.fns[@backingInt(out)], .{
++        .grid = .{ .x = @intCast(rows_t * ((w.n + bn - 1) / bn)), .y = 1, .z = 1 },
++        .block = .{ .x = pf2_threads, .y = 1, .z = 1 },
++        .shared = pf2Shared(),
++    }, s, &args);
++}
++
+ /// bf16 [n, k] in the BF16 mode's order [npad/64][k/64][8][4][32][4]: n8 tile, k16 step, lane, b0 then b1 halves.
+ pub fn packBf16(out: []u16, w: []const u16, n: usize, k: usize) void {
+     const npad = (n + 127) / 128 * 128;
+@@ -296,6 +368,23 @@ test "tile shared bytes, slices and row tiles as the Python host picks them" {
+     try std.testing.expect(r.reduce and !r.cluster);
+ }
+ 
++test "TF_GLM_PF_QMMF2 plan: block-FP8 prompt rows from 256 rows and 1,024 inputs, qmmf2.cu's tile and names" {
++    try std.testing.expectEqual(@as(u32, 41472), pf2Shared()); // 2 x (128 x 128 + 64 x 64 + 64 x 4)
++    const w = @import("fp8.zig").weight(0, 0, 6144, 4096); // TP4 o_proj
++    try std.testing.expect(pf2Takes(256, w) and pf2Takes(2048, w) and pf2Takes(4096, w));
++    try std.testing.expect(!pf2Takes(255, w) and !pf2Takes(1, w) and !pf2Takes(32, w));
++    try std.testing.expect(!pf2Takes(2048, @import("fp8.zig").weight(0, 0, 6144, 512))); // shared down: lane tile
++    try std.testing.expect(pf2Takes(2048, @import("fp8.zig").weight(0, 0, 2624, 6144))); // [q_a | kv_a]
++    var mx = w;
++    mx.mode = .mxfp8;
++    try std.testing.expect(!pf2Takes(2048, mx));
++    mx.mode = .fp4;
++    try std.testing.expect(!pf2Takes(2048, mx));
++    try std.testing.expect(std.mem.indexOf(u8, pf2_symbols[0], "ILi128ELi64ELi2ELi2ELi2ELb0E") != null);
++    try std.testing.expect(std.mem.indexOf(u8, pf2_symbols[1], "ILi128ELi64ELi2ELi2ELi2ELb1E") != null);
++    try std.testing.expectEqual(@as(usize, 1), @backingInt(Out.f32));
++}
++
+ test "instance names are qmmf.cu's" {
+     try std.testing.expectEqualStrings("_ZN7tf_qmmf11qmmf_kernelILi4ELi64ELi64ELi1ELi4ELi4ELb1ELb0ELb1EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", symbol(.bf16, 64, false, true, true));
+     try std.testing.expectEqualStrings("_ZN7tf_qmmf11qmmf_kernelILi2ELi16ELi64ELi1ELi4ELi4ELb0ELb1ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", symbol(.mxfp8, 16, true, false, false));
+diff --git a/zig/tests/cuda/lane_pf2_tests.zig b/zig/tests/cuda/lane_pf2_tests.zig
+new file mode 100644
+index 000000000..0572bf928
+--- /dev/null
++++ b/zig/tests/cuda/lane_pf2_tests.zig
+@@ -0,0 +1,130 @@
++//! `lane-pf2`: TF_GLM_PF_QMMF2's qmmf2 tile against the lane's 64-row tile on block-FP8 prompt calls: equal bytes
++//! (bf16 and fp32 out) on GLM-5.3's TP4 dense shapes, partial row and column tiles and special values, the calls it
++//! must leave to the lane, and the two kernels' times.
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const rig = @import("flashnext_rig.zig");
++
++/// `pad`: inputs past k in each activation row (ldx = k + pad); every call writes 4 bytes past an 8-byte boundary.
++const Shape = struct { m: usize, n: usize, k: usize, what: []const u8, pad: usize = 0 };
++
++/// GLM-5.3 TP4 rank shapes (a 4,096-row chunk runs as two 2,048-row halves), then edges.
++const shapes = [_]Shape{
++    .{ .m = 2048, .n = 6144, .k = 4096, .what = "o_proj" },
++    .{ .m = 2048, .n = 2624, .k = 6144, .what = "[q_a | kv_a]" },
++    .{ .m = 2048, .n = 4096, .k = 2048, .what = "q_b / indexer q_b" },
++    .{ .m = 2048, .n = 1024, .k = 6144, .what = "shared gate|up" },
++    .{ .m = 2048, .n = 160, .k = 6144, .what = "indexer k|w" },
++    .{ .m = 2048, .n = 6144, .k = 3072, .what = "dense down" },
++    .{ .m = 4096, .n = 2624, .k = 6144, .what = "whole chunk" },
++    .{ .m = 1000, .n = 6144, .k = 4096, .what = "partial row tile, strided rows", .pad = 192 },
++    .{ .m = 256, .n = 4096, .k = 2048, .what = "fewest rows" },
++    .{ .m = 777, .n = 2689, .k = 1024, .what = "odd columns" },
++    .{ .m = 512, .n = 12288, .k = 1024, .what = "one slice (SK 1)" },
++    .{ .m = 2048, .n = 6144, .k = 512, .what = "shared down (lane)" },
++    .{ .m = 255, .n = 6144, .k = 4096, .what = "under 256 rows (lane)" },
++    .{ .m = 16, .n = 2624, .k = 6144, .what = "decode rows (lane)" },
++};
++
++const Built = struct { w: cuda.qmmf.Weight };
++
++/// A random block-FP8 weight packed as GLM's loader packs it; `specials`: some NaN / -0 codes and 0 / inf scales.
++fn build(r: *rig.Rig, a: std.mem.Allocator, rng: std.Random, n: usize, k: usize, specials: bool) !cuda.qmmf.Weight {
++    const codes = try a.alloc(u8, n * k);
++    for (codes, 0..) |*c, i| {
++        c.* = rng.int(u8);
++        if (c.* & 0x7F == 0x7F) c.* ^= 1; // finite unless placed below
++        if (specials and i % 4099 == 0) c.* = if (i % 3 == 0) 0x7F else 0x80;
++    }
++    const kb = (k + 127) / 128;
++    const inv = try a.alloc(f32, ((n + 127) / 128) * kb);
++    for (inv, 0..) |*s, i| {
++        s.* = std.math.ldexp(@as(f32, 1) + rng.float(f32), -@as(i32, @intCast(rng.uintLessThan(u32, 12))) - 4);
++        if (specials and i % 37 == 5) s.* = if (i % 2 == 0) 0 else std.math.inf(f32);
++    }
++    const pc = try a.alloc(u8, cuda.fp8.padded(n) * k);
++    cuda.fp8.packCodes(pc, codes, n, k);
++    const ps = try a.alloc(f32, cuda.fp8.padded(n) * (k / cuda.fp8.group));
++    cuda.fp8.packScales(ps, inv, n, k);
++    var w = cuda.fp8.weight(try r.dev(pc), try r.dev(std.mem.sliceAsBytes(ps)), n, k);
++    if (specials) w.scale = 0.73; // a tensor scale on half the shapes
++    return w;
++}
++
++pub fn run(gpu: check.Gpu) !void {
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var prng = std.Random.DefaultPrng.init(0x9b2f);
++    const rng = prng.random();
++    var r = try rig.Rig.init(gpu, a, rng);
++    defer r.deinit();
++    var lane = try cuda.qmmf.Lane.load(gpu.d, @intCast(try gpu.ctx.capability() / 10));
++    defer lane.unload();
++    if (lane.pf2 != null) return check.expect(false, "lane-pf2 runs with {s} unset (it loads the image itself)", .{cuda.qmmf.pf2_env});
++    var pf2 = try cuda.qmmf.Lane.loadPf2(gpu.d);
++    defer pf2.mod.unload();
++    var taken: usize = 0;
++    var compared: usize = 0;
++    for (shapes, 0..) |sh, si| {
++        const specials = si % 2 == 1;
++        const w = try build(&r, a, rng, sh.n, sh.k, specials);
++        const ldx = sh.k + sh.pad;
++        const xs = r.bfs(sh.m * ldx, 2.0);
++        if (specials) for (0..sh.m) |row| {
++            if (row % 7 == 0) @memset(xs[row * ldx ..][0..sh.k], if (row % 14 == 0) 0x0000 else 0x8000); // +0 / -0 rows
++            if (row % 11 == 3) for (0..sh.k / 97) |c| {
++                // NaN payloads, infinities, subnormals and the largest finite bf16 in the activations
++                xs[row * ldx + c * 97] = ([_]u16{ 0x7FC1, 0xFF81, 0x7F80, 0xFF80, 0x0001, 0x807F, 0x7F7F })[c % 7];
++            };
++        };
++        const x = try r.dev(std.mem.sliceAsBytes(xs));
++        const part = try r.out(@max(16, lane.partBytes(sh.m, w)));
++        const takes = cuda.qmmf.pf2Takes(sh.m, w);
++        if (takes) taken += 1;
++        var ms: [2]f64 = .{ 0, 0 };
++        inline for (.{ cuda.qmmf.Out.f32, cuda.qmmf.Out.bf16 }) |out| {
++            const bytes = sh.m * sh.n * (if (out == .f32) @as(usize, 4) else 2);
++            const ys = [2]u64{ try r.out(bytes + 16) + 4, try r.out(bytes + 16) + 4 }; // 4 mod 8: scalar fp32 stores
++            for (0..2) |on| {
++                var l = lane;
++                l.pf2 = if (on == 1) pf2 else null;
++                try l.matmulOut(r.s, x, ldx, sh.m, w, ys[on], out, part);
++                try r.s.synchronize();
++            }
++            try check.sameBytes(sh.what, try r.back(u8, ys[1], bytes), try r.back(u8, ys[0], bytes));
++            compared += 1;
++            if (out == .f32) for (0..2) |on| {
++                var l = lane;
++                l.pf2 = if (on == 1) pf2 else null;
++                const reps = 20;
++                for (0..2) |_| try l.matmulOut(r.s, x, ldx, sh.m, w, ys[on], out, part);
++                try r.s.synchronize();
++                const t0 = check.now(gpu.io);
++                for (0..reps) |_| try l.matmulOut(r.s, x, ldx, sh.m, w, ys[on], out, part);
++                try r.s.synchronize();
++                ms[on] = @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e6 / reps;
++            };
++        }
++        const tf = 2.0 * @as(f64, @floatFromInt(sh.m * sh.n * sh.k)) / 1e9;
++        std.debug.print("lane-pf2 {s} m={d} n={d} k={d}{s}: lane {d:.3} ms ({d:.1} TFLOPS), {s} {d:.3} ms ({d:.1} TFLOPS), bytes equal (bf16, f32)\n", .{ sh.what, sh.m, sh.n, sh.k, if (specials) " specials" else "", ms[0], tf / ms[0], if (takes) "qmmf2" else "not taken", ms[1], tf / ms[1] });
++    }
++    try check.expect(taken == 11 and compared == 2 * shapes.len, "qmmf2 takes the 11 prompt shapes ({d}) and every output was compared ({d})", .{ taken, compared });
++    // qmmf2's running total starts at -0: its proof over every fp32 input (qmmf2.cu, tf_qmmf2_neg0_check)
++    {
++        const f = try pf2.mod.function("tf_qmmf2_neg0_check");
++        const zero = [2]u32{ 0, 0 };
++        const bad = try r.dev(std.mem.sliceAsBytes(&zero));
++        var base: u64 = 0;
++        while (base <= 0xFFFFFFFF) : (base += 1 << 30) {
++            var args: cuda.launch.Args = .{};
++            args.add(base);
++            args.add(bad);
++            try cuda.launch.launch(f, .{ .grid = .{ .x = (1 << 30) / 256, .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, r.s, &args);
++        }
++        const got = try r.back(u32, bad, 2);
++        try check.expect(got[0] == 0 and got[1] == 0, "-0 + x is x (NaN: 0x7FFFFFFF) and FFMA NaNs are canonical over all 2^32 inputs ({d}, {d} bad)", .{ got[0], got[1] });
++    }
++    check.pass("lane-pf2: qmmf2's bytes equal the lane's on {d} shapes x 2 outputs ({d} taken by qmmf2)", .{ shapes.len, taken });
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index cc9fb5c8c..5ae855e81 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -98,6 +98,7 @@ const flashnext_shared_tests = @import("flashnext_shared_tests.zig");
+ const flashnext_nvfp4_tp_tests = @import("flashnext_nvfp4_tp_tests.zig");
+ const nvfp4_fact_tests = @import("nvfp4_fact_tests.zig");
+ const lane_half_tests = @import("lane_half_tests.zig");
++const lane_pf2_tests = @import("lane_pf2_tests.zig");
+ const flashnext_dense_hc_tests = @import("flashnext_dense_hc_tests.zig");
+ const flashnext_hc_tests = @import("flashnext_hc_tests.zig");
+ const flashnext_attn_tests = @import("flashnext_attn_tests.zig");
+@@ -141,6 +142,7 @@ const usage =
+     \\  flashnext-nvfp4-tp        rank-local expert cuts and FP32 partials against FP64 (one GPU)
+     \\  nvfp4-fact                NVFP4 experts' prompt tiles with the decode form's sums: its bytes at every row, FP64
+     \\  lane-half                 lane half tiles (MXFP8, BF16): bytes equal to the 64-column tile, FP64, cold-weight time
++    \\  lane-pf2                  TF_GLM_PF_QMMF2: qmmf2's block-FP8 prompt tile, bytes equal to the lane's, times
+     \\  flashnext-dense-hc        dense connection weights and FP32 normalization against FP64
+     \\  flashnext-hc              Flash Next's own hyper-connection and n-gram glue against float64 (synthetic rows)
+     \\  flashnext-attn            Flash Next's own attention glue, pooling and block scores against float64 (synthetic)
+@@ -350,6 +352,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "flashnext-nvfp4-tp")) return flashnext_nvfp4_tp_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "nvfp4-fact")) return nvfp4_fact_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "lane-half")) return lane_half_tests.run(gpu);
++    if (std.mem.eql(u8, cmd, "lane-pf2")) return lane_pf2_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-dense-hc")) return flashnext_dense_hc_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-hc")) return flashnext_hc_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-attn")) return flashnext_attn_tests.run(gpu);
+-- 
+2.43.0
+
+
+From f6daf52ce98bcdf6e10e97adc2b428332de028c2 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 19:50:14 +0200
+Subject: glm: TF_GLM_PF_QMMF2 takes outputs of 256 columns and more (the
+ indexer k|w, N = 160, keeps the lane tile)
+
+Either tile gives the same bytes; qmmf2 is ~8% slower at N = 160 (X9B). Coordinator's stacking note.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/cuda/qmmf.zig | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/cuda/qmmf.zig b/zig/src/cuda/qmmf.zig
+index f41ac6841..78111db45 100644
+--- a/zig/src/cuda/qmmf.zig
++++ b/zig/src/cuda/qmmf.zig
+@@ -123,6 +123,7 @@ const row_tiles = [_]u32{ 16, 32, 64 };
+ pub const pf2_env = "TF_GLM_PF_QMMF2";
+ pub const pf2_rows = fused_rows; // prompt rows: the lane's fused-slice plan, every row count above it alike
+ pub const pf2_min_k = 1024; // below 16 groups the 64-row tile is as fast (measured on GB10: K 512 is 10% slower)
++pub const pf2_min_n = 256; // narrower outputs keep the lane tile: the indexer's k|w (N = 160) is ~8% slower on qmmf2 (X9B)
+ pub const pf2_bm = 128;
+ const pf2_threads = 128; // WM 2 x WN 2 warps
+ 
+@@ -139,7 +140,7 @@ pub fn pf2Shared() u32 {
+ 
+ /// Whether a call of `m` rows on `w` takes the qmmf2 tile (when loaded).
+ pub fn pf2Takes(m: usize, w: Weight) bool {
+-    return w.mode == .fp8g and m >= pf2_rows and w.k >= pf2_min_k and w.k % group == 0;
++    return w.mode == .fp8g and m >= pf2_rows and w.k >= pf2_min_k and w.n >= pf2_min_n and w.k % group == 0;
+ }
+ 
+ fn pf2On() bool {
+@@ -375,6 +376,8 @@ test "TF_GLM_PF_QMMF2 plan: block-FP8 prompt rows from 256 rows and 1,024 inputs
+     try std.testing.expect(!pf2Takes(255, w) and !pf2Takes(1, w) and !pf2Takes(32, w));
+     try std.testing.expect(!pf2Takes(2048, @import("fp8.zig").weight(0, 0, 6144, 512))); // shared down: lane tile
+     try std.testing.expect(pf2Takes(2048, @import("fp8.zig").weight(0, 0, 2624, 6144))); // [q_a | kv_a]
++    try std.testing.expect(!pf2Takes(2048, @import("fp8.zig").weight(0, 0, 160, 6144))); // indexer k|w: lane tile
++    try std.testing.expect(pf2Takes(2048, @import("fp8.zig").weight(0, 0, 256, 6144)));
+     var mx = w;
+     mx.mode = .mxfp8;
+     try std.testing.expect(!pf2Takes(2048, mx));
+-- 
+2.43.0
+
+
+From 5fb0e87ead9189f4b6a0b52de46e64c75af4a53c Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 20:13:14 +0200
+Subject: qmmf2 N >= 256: lane-pf2 expects 10 taken shapes (the indexer k|w
+ stays on the lane tile)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/tests/cuda/lane_pf2_tests.zig | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/zig/tests/cuda/lane_pf2_tests.zig b/zig/tests/cuda/lane_pf2_tests.zig
+index 0572bf928..85750017f 100644
+--- a/zig/tests/cuda/lane_pf2_tests.zig
++++ b/zig/tests/cuda/lane_pf2_tests.zig
+@@ -15,7 +15,7 @@ const shapes = [_]Shape{
+     .{ .m = 2048, .n = 2624, .k = 6144, .what = "[q_a | kv_a]" },
+     .{ .m = 2048, .n = 4096, .k = 2048, .what = "q_b / indexer q_b" },
+     .{ .m = 2048, .n = 1024, .k = 6144, .what = "shared gate|up" },
+-    .{ .m = 2048, .n = 160, .k = 6144, .what = "indexer k|w" },
++    .{ .m = 2048, .n = 160, .k = 6144, .what = "indexer k|w (lane: N < 256)" },
+     .{ .m = 2048, .n = 6144, .k = 3072, .what = "dense down" },
+     .{ .m = 4096, .n = 2624, .k = 6144, .what = "whole chunk" },
+     .{ .m = 1000, .n = 6144, .k = 4096, .what = "partial row tile, strided rows", .pad = 192 },
+@@ -110,7 +110,7 @@ pub fn run(gpu: check.Gpu) !void {
+         const tf = 2.0 * @as(f64, @floatFromInt(sh.m * sh.n * sh.k)) / 1e9;
+         std.debug.print("lane-pf2 {s} m={d} n={d} k={d}{s}: lane {d:.3} ms ({d:.1} TFLOPS), {s} {d:.3} ms ({d:.1} TFLOPS), bytes equal (bf16, f32)\n", .{ sh.what, sh.m, sh.n, sh.k, if (specials) " specials" else "", ms[0], tf / ms[0], if (takes) "qmmf2" else "not taken", ms[1], tf / ms[1] });
+     }
+-    try check.expect(taken == 11 and compared == 2 * shapes.len, "qmmf2 takes the 11 prompt shapes ({d}) and every output was compared ({d})", .{ taken, compared });
++    try check.expect(taken == 10 and compared == 2 * shapes.len, "qmmf2 takes the 10 prompt shapes ({d}) and every output was compared ({d})", .{ taken, compared });
+     // qmmf2's running total starts at -0: its proof over every fp32 input (qmmf2.cu, tf_qmmf2_neg0_check)
+     {
+         const f = try pf2.mod.function("tf_qmmf2_neg0_check");
+-- 
+2.43.0
+

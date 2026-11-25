@@ -1,0 +1,58 @@
+From 3c72916dd938cc0e2383781ae3e0ac5f1d29b7c4 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:56:16 +0200
+Subject: [PATCH] glm_moe_dsa: the index scores' query rope writes its second
+ half to element 32 + i
+
+tf_glm_dsa_scores ropes each head's 64-wide query tail in place in
+shared memory, pair (2 i, 2 i + 1) moving to (i, 32 + i), the layout the
+index keys are written in. The shared rows are XOR-swizzled in 8-element
+chunks, and at(row, u) takes a chunk, but the second half went to
+at(hh, D / 4 + i / 8): chunk 32 + i / 8, element 256 + ..., two heads
+down. It overwrote another head's roped pairs, racing that head's own
+writes, and left dims 32..63 of every head unroped (heads 30 and 31 wrote
+into the first key buffers before they were staged).
+
+The index scores, the picks and every sparse prompt row after them were
+wrong and changed from run to run: two runs of one 6.6k-token text gave
+mean KL 0.03 and 3% top-1 flips past position 2048, the dense limit,
+with the kernel's inputs byte-identical and its scores differing in
+nearly every visible entry (correlation 0.98). The second half now goes
+to at(hh, (32 + i) / 8) + i % 8.
+
+The bug is in the base engine (commit 168e0e2); the read-before-write
+reorder in the previous commit was needed but not sufficient.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/glm_glue_attn.cuh | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index cfd9f09..d835655 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -911,7 +911,9 @@ extern "C" __global__ void __launch_bounds__(128)
+   // The queries' rope, in place while q's rows are the only thing in shared: then the fragments read roped queries.
+   // Pair i of (2 i, 2 i + 1) moves to (i, 32 + i), so a lane writes elements another lane has yet to read: every pair
+   // is read and roped into registers first, then (after a barrier) written. Done in one pass, the reads and writes of
+-  // a head's lanes raced: the index scores, the picks and every sparse row after them changed from run to run.
++  // a head's lanes raced. The second half once went to chunk 32 + i / 8 (element 256 + ..., two heads down) instead of
++  // element 32 + i: it overwrote another head's roped pairs, racing that head's own writes, and left this head's
++  // dims 32..63 unroped. The index scores, the picks and every sparse row after them changed from run to run.
+   const int p0q = pos[0] + (int)r;
+   constexpr int PER = HP * (ROPE / 2) / 128;  // pairs a thread ropes (8)
+   float2 rot[PER];
+@@ -929,7 +931,7 @@ extern "C" __global__ void __launch_bounds__(128)
+     const int idx = threadIdx.x + 128 * k, hh = idx / (ROPE / 2), i = idx % (ROPE / 2);
+     if (hh >= heads) continue;
+     sm[at(hh, i / 8) + i % 8] = __float2bfloat16_rn(rot[k].x);
+-    sm[at(hh, D / 4 + i / 8) + i % 8] = __float2bfloat16_rn(rot[k].y);
++    sm[at(hh, (ROPE / 2 + i) / 8) + i % 8] = __float2bfloat16_rn(rot[k].y);  // element 32 + i: at() takes 8-wide chunks
+   }
+   __syncthreads();
+   uint32_t aq[D / 16][2][4];
+-- 
+2.43.0
+

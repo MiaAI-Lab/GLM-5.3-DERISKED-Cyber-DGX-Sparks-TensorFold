@@ -1,0 +1,145 @@
+From 75e07d0c7533737dc4418df4d66c68525152b241 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 14:16:02 +0200
+Subject: [PATCH 190/194] glm_moe_dsa: a prompt chunk's second half never
+ outgrows its exchange room (ScatterRoom)
+
+wholeDsaHalves (TF_GLM_DSA_HALVES, default on at 3+ ranks) split a chunk of R
+rows at RA = R / 2 rounded up to 64 rows and sized each half's reduce-scatter
+span by RA's rows. An odd chunk of 128k + 1 rows (R / 2 already a multiple of
+64) left the second half R - RA = RA + 1 rows: its exchange needs one more
+padded row a rank than the span holds (D 6144: 172,032 bytes at TP4), so
+scatterRows returned error.ScatterRoom on every rank at layer 0 and the server
+stopped. At TP4 that is a chunk of 2049, 2177, ..., 3969 rows (16 tail
+lengths); at TP3 and TP6 the five of them with RA % world == 0 (2305, 2689,
+3073, 3457, 3841). A 28,417-id prompt's last chunk is 3,841 rows (soak C2,
+chatcmpl-8ff51232): ScatterRoom at TP4.
+
+The first half now rounds the larger half, (R + 1) / 2, up to 64 rows, so the
+second is never longer. RA changes only for the lengths that failed (odd R
+with R / 2 a multiple of 64); every other chunk splits as before.
+
+scatterRoom/halfRows/halvesFit are the forward's own arithmetic as pure
+functions (scatterRows' room check and wholeDsaHalves call them), and
+zig build test-glm-halves-host checks every R in 2048..4096 at TP3-TP8
+(3 tests: 2 fail before this change, 10/10 pass after).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/build/glm_family_host.zig         |  1 +
+ zig/src/families/glm/cuda_forward.zig | 60 +++++++++++++++++++++++----
+ 2 files changed, 54 insertions(+), 7 deletions(-)
+
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 88392753c..000eec308 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -8,6 +8,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     b.step("test-glm-startup-host", "Page refusals propagate through rank liveness before engine construction").dependOn(&startup_run.step);
+     step.dependOn(&startup_run.step);
+     b.step("test-glm-tp3-host", "Uneven KDA head shares through actual projection and load planning, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM TP3:"} })).step);
++    b.step("test-glm-halves-host", "A prompt chunk's two halves and their exchange rooms (TF_GLM_DSA_HALVES), without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM halves room:"} })).step);
+     b.step("test-glm-exl3-host", "GLM EXL3 admission, mixed-width expert loading and scratch sizing, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM EXL3:"} })).step);
+     // TF_GLM_INDEX_CUDA: the launch rules, and (its own slower step) glm_index_*.cuh as host C++ against plain models
+     const index_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM index:"} }));
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index e21b31af4..084dde45e 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -33,6 +33,31 @@ pub const window_rows = state.window_rows;
+ pub const State = state.State;
+ pub const Buffers = state.Buffers;
+ 
++/// The bytes a reduce-scatter exchange of R rows takes from its room (Forward.scatterRows): this rank's fp32 partial
++/// padded to world x per rows, the scattered sum of its per rows, then the bf16 rows every rank gathers.
++pub fn scatterRoom(R: usize, world: usize, D: usize) usize {
++    const per = (R + world - 1) / world;
++    return per * world * D * 4 + per * D * 4 + per * world * D * 2;
++}
++
++/// TF_GLM_DSA_HALVES: a chunk's two halves of rows, the first on a 64-row boundary. Each half's exchange room is
++/// sized by the first half's rows, so the second must not be longer: the first rounds the larger half, (R + 1) / 2,
++/// up (R / 2 left an odd chunk of 128k + 1 rows a second half one row longer, past its room: ScatterRoom).
++pub fn halfRows(R: usize) [2]usize {
++    const RA = ((R + 1) / 2 + 63) / 64 * 64;
++    return .{ RA, R - RA };
++}
++
++/// Whether wholeDsaHalves' rooms fit a chunk of R rows in a gathered room of world x cap rows: two spans of the first
++/// half's exchange and the second half's position, and each half's exchange inside its span (scatterRows' check).
++pub fn halvesFit(R: usize, cap: usize, world: usize, D: usize) bool {
++    const rows = halfRows(R);
++    const span = std.mem.alignForward(usize, scatterRoom(rows[0], world, D), 256);
++    if (2 * span + 256 > world * cap * D * 4) return false;
++    for (rows) |n| if (scatterRoom(n, world, D) > span) return false;
++    return true;
++}
++
+ /// The modules a forward launches from: our fatbins.
+ pub const Modules = struct {
+     glue: glue.Kernels,
+@@ -644,10 +669,7 @@ pub const Forward = struct {
+     /// The room a reduce-scatter exchange of R rows takes from `part` (fp32 bytes): this rank's partial padded to
+     /// world x per rows (rows past R unread), the scattered sum of its rows, then the bf16 rows every rank gathers.
+     fn scatterBytes(f: *const Forward, R: usize) usize {
+-        const D = f.ranks[0].w.config.hidden;
+-        const world = f.ranks[0].w.share.world;
+-        const per = (R + world - 1) / world;
+-        return per * world * D * 4 + per * D * 4 + per * world * D * 2;
++        return scatterRoom(R, f.ranks[0].w.share.world, f.ranks[0].w.config.hidden);
+     }
+ 
+     /// hidden[0..R) += every rank's partial at `part` (R rows, this rank's), on `stream` over `comm`; `end` bounds the room.
+@@ -661,7 +683,7 @@ pub const Forward = struct {
+         const padded = per * world;
+         const recv = part + padded * D * 4;
+         const rows_b16 = recv + per * D * 4;
+-        if (rows_b16 + padded * D * 2 > end) return error.ScatterRoom;
++        if (part + scatterRoom(R, world, D) > end) return error.ScatterRoom; // (= rows_b16 + padded * D * 2)
+         try n.lib.check(n.lib.api.ncclReduceScatter(part, recv, per * D, .f32, .sum, comm, stream.handle), "ncclReduceScatter");
+         const lo = @min(R, rank * per);
+         const mine = @min(R, lo + per) - lo;
+@@ -695,9 +717,9 @@ pub const Forward = struct {
+         const st = r.st;
+         const p = f.pieces.?;
+         const side_comm = f.exchange.nccl.side_comm;
+-        const RA = (R / 2 + 63) / 64 * 64;
++        const rows = halfRows(R);
++        const RA = rows[0];
+         const lo = [2]usize{ 0, RA };
+-        const rows = [2]usize{ RA, R - RA };
+         const room_end = b.gathered + r.w.share.world * b.rows * D * 4;
+         const span_bytes = std.mem.alignForward(usize, f.scatterBytes(RA), 256);
+         const pos_b = room_end - 256; // the second half's device position, an i32 in the room's last bytes
+@@ -939,3 +961,27 @@ pub const Forward = struct {
+         }
+     }
+ };
++
++test "GLM halves room: every prompt chunk's two halves fit their exchange rooms (TP3-TP8, GLM-5.3's D 6144)" {
++    for (3..9) |world| for (2048..prefill_rows + 1) |R| {
++        const rows = halfRows(R);
++        try std.testing.expect(rows[0] % 64 == 0 and rows[1] >= 1 and rows[0] + rows[1] == R);
++        if (!halvesFit(R, prefill_rows, world, 6144)) {
++            std.debug.print("GLM halves room: R {d} at world {d}: halves {d} + {d} overflow the first half's span\n", .{ R, world, rows[0], rows[1] });
++            return error.TestUnexpectedResult;
++        }
++    };
++}
++
++test "GLM halves room: the 28,417-id prompt's last chunk (3,841 rows at TP4) splits so its second half is not longer" {
++    const R = 28417 - 6 * prefill_rows;
++    try std.testing.expectEqual(@as(usize, 3841), R);
++    const rows = halfRows(R);
++    try std.testing.expect(rows[1] <= rows[0]);
++    try std.testing.expect(halvesFit(R, prefill_rows, 4, 6144));
++    try std.testing.expect(halvesFit(R, prefill_rows, 6, 6144));
++}
++
++test "GLM halves room: chunks that split evenly keep their halves (the fix moves only the overflowing lengths)" {
++    for ([_]usize{ 2048, 2050, 3478, 3840, 3842, 4096 }) |R| try std.testing.expectEqual((R / 2 + 63) / 64 * 64, halfRows(R)[0]);
++}
+-- 
+2.43.0
+

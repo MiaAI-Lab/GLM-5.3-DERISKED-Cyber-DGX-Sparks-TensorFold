@@ -1,0 +1,54 @@
+From 09cd15bc83615d4da73a3e1c39de5a9c6af1a71b Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Mon, 23 Nov 2026 05:07:39 +0200
+Subject: [PATCH] glm: TF_GLM_UNI_KSPLIT_ALL=1 sizes decode partials so every
+ window's sparse rows take the 128-key split (U0b)
+
+---
+ zig/src/families/glm/cuda_latent.zig | 12 ++++++++++++
+ zig/src/families/glm/cuda_state.zig  |  6 +++++-
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index 627d63fb5..bd9df5aa8 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -198,6 +198,18 @@ pub fn sparseAttentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache:
+ 
+ /// glm_moe_dsa's decode rows (TF_GLM_DSA_KSPLIT, default on; 0: 512-key chunks): its sparse lists in chunks of 128
+ /// keys, 16 a row's 2,048, then the merge over them; false (nothing launched) when the partials hold fewer rows.
++/// TF_GLM_UNI_KSPLIT_ALL=1 (boot): decode buffers sized so sparseDsaSplit takes every window (cuda_state partials).
++pub fn ksplitAll() bool {
++    const S = struct {
++        var once: ?bool = null;
++    };
++    if (S.once) |v| return v;
++    const v = if (std.c.getenv("TF_GLM_UNI_KSPLIT_ALL")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
++    if (v) std.log.info("TF_GLM_UNI_KSPLIT_ALL=1: every decode window's sparse rows in 128-key chunks", .{});
++    S.once = v;
++    return v;
++}
++
+ pub fn sparseDsaSplit(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !bool {
+     if (lw != glue.dsa_row or t.pt != 0 or w != 2048) return false;
+     if (std.c.getenv("TF_GLM_DSA_KSPLIT")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return false;
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 847df3349..0a9a54e09 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -317,7 +317,11 @@ pub const Buffers = struct {
+         // shared decode window holds every segment's chunks apart (one attention launch)
+         const shared_decode = !prefill and shared;
+         const part_chunks = @max(nch, latent.chunksFor(sparse.width));
+-        const partial_rows = if (prefill) nch * part_rows else if (shared_decode) part_chunks * rows else @max(nch * part_rows, latent.chunksFor(sparse.width) * seg);
++        // TF_GLM_UNI_KSPLIT_ALL=1 (U0b fix, night/unified S0c): a decode buffer holds sparseDsaSplit's 16 chunks for every
++        // row it can take, so every window (1 row or a verify window) attends in the same 128-key chunks; without it a
++        // window past 5 x seg / 16 rows fell back to 512-key chunks: other merge boundaries, other bits than 1 row's
++        const split_all = if (!prefill and latent.ksplitAll()) 4 * latent.chunksFor(2048) * @max(rows, seg) else 0;
++        const partial_rows = if (prefill) nch * part_rows else if (shared_decode) @max(part_chunks * rows, split_all) else @max(nch * part_rows, latent.chunksFor(sparse.width) * seg, split_all);
+         // a Flash select's scores are one fp32 a pool; glm_moe_dsa's dsa_scores writes one a visible key
+         const np_max = if (c.dsa) capacity else capacity / sparse.pool;
+         var mm: usize = 4;
+-- 
+2.43.0
+

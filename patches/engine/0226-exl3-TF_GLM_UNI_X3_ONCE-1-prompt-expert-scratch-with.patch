@@ -1,0 +1,86 @@
+From 3a55ea70fbfad9ad4dbdc80e3f1ff97ef800dfd3 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Mon, 23 Nov 2026 05:44:16 +0200
+Subject: [PATCH] exl3: TF_GLM_UNI_X3_ONCE=1 prompt expert scratch without
+ rotated copies where gu_once runs (U8a memory)
+
+---
+ zig/src/cuda/exl3_prompt.zig       | 11 +++++++++++
+ zig/src/families/glm/cuda_exl3.zig | 14 ++++++++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/zig/src/cuda/exl3_prompt.zig b/zig/src/cuda/exl3_prompt.zig
+index 01005fc83..a600d1d73 100644
+--- a/zig/src/cuda/exl3_prompt.zig
++++ b/zig/src/cuda/exl3_prompt.zig
+@@ -67,10 +67,19 @@ fn sizes(l: ex.Layer, rows: usize, slots: usize) ![4]usize {
+     return sizesFor(l, rows, slots, true);
+ }
+ /// `own_y` false: the caller's slot rows take the output (Scratch.yrow), so the arena holds no y.
++/// GLM's TF_GLM_UNI_X3_ONCE=1 with TF_GLM_PF_EXPERTS_ONCE=1 (U8a, night/unified; set before the buffers size): a layer the
++/// once kernel takes by shape holds only its sums and counts in xg and no xu (no rotated copies are ever made); a call
++/// that would take the copying path refuses (error.Exl3Shape) instead of overrunning.
++pub var once_only: bool = false;
++fn onceShape(l: ex.Layer) bool {
++    return eligible(l) and widths(l).gu == 8 and !l.shared_input and l.width == once_width and l.dims % 128 == 0;
++}
++
+ fn sizesFor(l: ex.Layer, rows: usize, slots: usize, own_y: bool) ![4]usize {
+     if (!eligible(l) or rows == 0 or slots == 0 or slots > 32 or l.experts == 0 or l.experts > grouped.max_experts) return error.Exl3Shape;
+     const pairs = try mul(rows, slots);
+     if (pairs > std.math.maxInt(i32) or l.dims > std.math.maxInt(i32) or l.width > std.math.maxInt(i32)) return error.Exl3Shape;
++    if (once_only and onceShape(l)) return .{ try aligned(try onceBytes(l, pairs, grouped.maxItems(pairs, l.experts, tile))), 0, try aligned(try mul(try mul(pairs, l.width), 2)), if (own_y) try aligned(try mul(try mul(pairs, l.dims), 4)) else 0 };
+     const rotated = try aligned(try mul(try mul(if (l.shared_input) rows else pairs, l.dims), 2));
+     return .{ rotated, if (l.shared_input) 0 else rotated, try aligned(try mul(try mul(pairs, l.width), 2)), if (own_y) try aligned(try mul(try mul(pairs, l.dims), 4)) else 0 };
+ }
+@@ -106,6 +115,7 @@ fn onceBytes(l: ex.Layer, pairs: usize, items: usize) !usize {
+     return add(try aligned(try mul(try mul(2 * 4, pairs), l.width)), try mul(items, 4));
+ }
+ pub fn onceFits(l: ex.Layer, rows: usize, slots: usize) bool {
++    if (once_only and onceShape(l)) return true; // xg sized for the sums (sizesFor)
+     const pairs = std.math.mul(usize, rows, slots) catch return false;
+     const need = onceBytes(l, pairs, grouped.maxItems(pairs, l.experts, tile)) catch return false;
+     const have = aligned(std.math.mul(usize, std.math.mul(usize, pairs, l.dims) catch return false, 2) catch return false) catch return false;
+@@ -193,6 +203,7 @@ pub const Kernels = struct {
+             inline for (.{ x, i(stride), i(sc.slots), l.gate, l.up, l.suh_g, l.suh_u, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, sums, done, i(pairs), i(l.dims), l.limit, l.act_mode }) |v| args.add(v);
+             try launch.launch(k.onceFor(l).?, .{ .grid = .{ .x = 2, .y = @intCast(items), .z = 1 }, .block = .{ .x = 256 }, .shared = once_smem }, s, &args);
+         } else {
++            if (once_only and onceShape(l)) return error.Exl3Shape; // U8a: no room for rotated copies
+             if (l.shared_input) {
+                 try go(k.rotate, s, .{ rows, l.dims / 128, 1 }, 32, .{ x, i(stride), l.suh_g, sc.xg, i(l.dims) });
+             } else {
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index bc589a0e9..b94e11641 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -340,6 +340,7 @@ pub fn picksBytes(rows: usize) usize {
+ /// The scratch `run` takes on `w`'s experts: the prompt kernels' when `prefill` and they take this layer, else the
+ /// grouped path's (a layer the prompt kernels refuse runs its prompt chunks there, in the same arena).
+ pub fn scratchFor(rows: usize, dims: usize, width: usize, prefill: bool, w: Experts) [4]usize {
++    common.prompt.once_only = x3Once();
+     const n: usize = @min(rows, chunk_rows);
+     const l = layer(w, cuda.grouped.max_experts, dims, width, 0);
+     // the prompt kernels write the slot rows (Scratch.yrow): no y [pairs][dims] in the arena
+@@ -377,6 +378,19 @@ pub fn eySmall() bool {
+     return v;
+ }
+ 
++/// TF_GLM_UNI_X3_ONCE=1 (U8a, night/unified; boot-time, off by default; needs TF_GLM_PF_EXPERTS_ONCE=1): prompt
++/// buffers hold no rotated expert inputs for the layers tf_exl3_prompt_gu_once takes (common.prompt.once_only).
++pub fn x3Once() bool {
++    const S = struct {
++        var once: ?bool = null;
++    };
++    if (S.once) |v| return v;
++    const v = expertsOnce() and (if (std.c.getenv("TF_GLM_UNI_X3_ONCE")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false);
++    if (v) std.log.info("TF_GLM_UNI_X3_ONCE=1: prompt expert scratch without rotated copies", .{});
++    S.once = v;
++    return v;
++}
++
+ pub fn bf16Slots() bool {
+     const S = struct {
+         var once: ?bool = null;
+-- 
+2.43.0
+

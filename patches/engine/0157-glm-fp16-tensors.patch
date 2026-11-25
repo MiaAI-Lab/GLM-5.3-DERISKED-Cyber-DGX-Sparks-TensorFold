@@ -1,0 +1,70 @@
+From 374bb8f988ffffa188bcbc1ecd32655189a156cd Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 15:32:20 +0200
+Subject: [PATCH] glm: fp16 checkpoint tensors read as bf16 (an EXL3 build's
+ unquantized layers)
+
+exllamav3 writes a checkpoint's unquantized layers in fp16
+(drowzeys/keys-GLM-5.3-EXL3: attention, shared experts, dense MLPs,
+router, indexer, head), and the loader read only bf16 or fp32 there:
+every such module refused as FormatMismatch. An fp16 weight with no
+scale now classifies as bf16, and the loader converts it: exactly to
+fp32, and to bf16 rounded to nearest even (its three low mantissa bits
+go, below the int8 or FP8 the dense layers are packed to anyway).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_formats.zig |  3 ++-
+ zig/src/families/glm/cuda_weights.zig | 11 ++++++++++-
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_formats.zig b/zig/src/families/glm/cuda_formats.zig
+index f4acfc8..b0ec7cf 100644
+--- a/zig/src/families/glm/cuda_formats.zig
++++ b/zig/src/families/glm/cuda_formats.zig
+@@ -68,7 +68,8 @@ fn fromTensors(s: Stored) Refusal!Format {
+     const k = if (w.dtype == .u8) try checked(std.math.mul(usize, 2, w.shape[1])) else w.shape[1]; // two FP4 codes a byte
+     _ = try checked(std.math.mul(usize, n, k));
+     switch (w.dtype) {
+-        .bf16 => return if (s.scale == null and !s.csf) .bf16 else error.FormatMismatch,
++        // fp16 (an EXL3 build's unquantized layers) is read as bf16, rounded at load (cuda_weights' add)
++        .bf16, .f16 => return if (s.scale == null and !s.csf) .bf16 else error.FormatMismatch,
+         .u8 => {
+             if (s.csf) return if (s.scale == null) .nvfp4_csf else error.FormatMismatch;
+             const sc = s.scale orelse return error.FormatMismatch;
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index dcaf3ad..ae995a1 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -158,7 +158,9 @@ const Loader = struct {
+         return ptr;
+     }
+ 
+-    /// Elements [lo, hi) of `t` flat as `to` (bf16 or fp32 from a bf16 or fp32 tensor; other dtypes only as stored).
++    /// Elements [lo, hi) of `t` flat as `to` (bf16 or fp32 from a bf16, fp16 or fp32 tensor; other dtypes only as
++    /// stored). An fp16 tensor (an EXL3 build's unquantized layers, exllamav3 stores them so) becomes bf16 rounded to
++    /// nearest even: its three low mantissa bits go, below the int8 or FP8 the dense layers are packed to anyway.
+     fn add(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
+         if (t.dtype == to) {
+             const size = t.bytes.len / t.numel();
+@@ -167,9 +169,16 @@ const Loader = struct {
+         for (lo..hi) |i| {
+             const v: f32 = switch (t.dtype) {
+                 .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16),
++                .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)))),
+                 .f32 => std.mem.bytesToValue(f32, t.bytes[4 * i ..][0..4]),
+                 else => return error.UnexpectedTensor,
+             };
++            if (t.dtype == .f16 and to == .bf16) {
++                const u: u32 = @bitCast(v);
++                const r: u16 = @intCast((u +% 0x7FFF +% ((u >> 16) & 1)) >> 16);
++                try L.host.appendSlice(L.gpa, std.mem.asBytes(&r));
++                continue;
++            }
+             switch (to) {
+                 .f32 => try L.host.appendSlice(L.gpa, std.mem.asBytes(&v)),
+                 .bf16 => try L.host.appendSlice(L.gpa, std.mem.asBytes(&(narrow(v) orelse {
+-- 
+2.43.0
+

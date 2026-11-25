@@ -1,0 +1,41 @@
+From 2aa51f651ac686fdc8a63767ffa94e1b1a5a3009 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:03:11 +0200
+Subject: [PATCH] glm_moe_dsa: absorb_q on tensor cores at the dsa's real head
+ strides
+
+tf_glm_latent_mma_kn places head h at x + h*K and out + h*N. The dsa's q
+rows are 256 a head (K is 192) and its out rows 576 (N is 512), so under
+TF_GLM_ABSORB_MMA=1 every prompt of 64 rows or more attended with scrambled
+queries. One launch a head, its bases moved by the real strides.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_latent.zig | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index e5c77e4..7d9b8bd 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -37,7 +37,15 @@ fn cdiv(a: usize, b: usize) u32 {
+ pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, qs: usize, lw: usize, os: usize) !void {
+     if (lw != 512 or os != lw and os != lw + 64) return error.LatentShape;
+     const f = if (d == 256 and qs == 256 and os == lw) set.glue.absorb_q else if (d == 192 and qs == 256 and os == lw + 64) set.glue.absorb_q_dsa else return error.LatentShape;
+-    if (mmaRows(set, rows, .{ q, wk, out })) return headsMma(set.glue.latent_mma_kn, glue.latent_mma_smem[0], stream, q, heads * qs, wk, out, heads * os, rows, heads, lw, d);
++    if (mmaRows(set, rows, .{ q, wk, out })) {
++        if (qs == d and os == lw) return headsMma(set.glue.latent_mma_kn, glue.latent_mma_smem[0], stream, q, heads * qs, wk, out, heads * os, rows, heads, lw, d);
++        // glm_moe_dsa: a head's q row is 256 wide (192 nope + 64 rope) and its out row 576, but tf_glm_latent_mma_kn
++        // places head h at x + h K and out + h N (192 and 512), which read the previous head's rope dims and wrote
++        // over the next head's row: every prompt of 64 rows or more attended with scrambled queries. One launch a
++        // head, its bases moved by the real strides (16-byte aligned: 512 and 1,152 bytes a head).
++        for (0..heads) |h| try headsMma(set.glue.latent_mma_kn, glue.latent_mma_smem[0], stream, q + h * qs * 2, heads * qs, wk + h * d * lw * 2, out + h * os * 2, heads * os, rows, 1, lw, d);
++        return;
++    }
+     try rowBlocks(f, stream, q, wk, out, rows, heads, lw / 32);
+ }
+ 
+-- 
+2.43.0
+

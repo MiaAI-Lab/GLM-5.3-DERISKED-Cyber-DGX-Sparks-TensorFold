@@ -1,0 +1,230 @@
+From 497f4167fbbeadc717b2c8b33de2582d68fdad1b Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:36:27 +0200
+Subject: [PATCH] glm: DSpark tap capture on glm_moe_dsa's one residual stream,
+ and TF_GLM_TAP_DUMP
+
+Taps gains a dsa mode (hidden size of the one bf16 stream): after 0-based layers 1, 19, 38, 57, 74 (the inputs of
+RedHatAI/GLM-5.3-speculator.dspark's aux_hidden_state_layer_ids 2, 20, 39, 58, 75) each row's whole residual is
+copied into its slot of [rows][5][hidden] (cuMemcpy2DAsync). wholeDsa taps after the layer's second reduce instead
+of refusing (DFlash2's 4-stream taps still refuse), and a tapped chunk runs whole (no two-halves path).
+
+TF_GLM_TAP_DUMP=<file> (glm_moe_dsa, no drafter): every rank taps its prompt chunks (the same collectives on all
+ranks); rank 0 appends a record a chunk ("TAPS", i64 start, i32 rows, i32 hidden, i32 ids, bf16 taps) for the
+NumPy twin (scripts/tests/dspark_twin.py).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_engine.zig  | 12 +++-
+ zig/src/families/glm/cuda_forward.zig |  7 ++-
+ zig/src/families/glm/cuda_taps.zig    | 82 ++++++++++++++++++++++++++-
+ 3 files changed, 94 insertions(+), 7 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 572f433..5736d51 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -23,6 +23,7 @@ const kv_shard = @import("cuda_kv_shard.zig");
+ const kv_attn = @import("cuda_kv_shard_attn.zig");
+ const kv_keep = @import("cuda_kv_shard_keep.zig");
+ const l2pf_mod = @import("cuda_l2pf.zig");
++const taps_mod = @import("cuda_taps.zig");
+ pub const Options = @import("cuda_engine_types.zig").Options;
+ 
+ /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
+@@ -151,6 +152,7 @@ pub const Engine = struct {
+     kv_room: ?cuda.DeviceBuffer = null, // TF_GLM_KV_SHARD: owner-computed attention's peer queries and outputs
+     kv_stage: ?cuda.DeviceBuffer = null, // ...and a resume's carry pieces (cuda_kv_shard_keep.piece_bytes)
+     kv_ctx: kv_attn.Ctx = undefined, // ...their place for the forward (read only with settings.kv_shard.on)
++    tap_dump: ?*taps_mod.Dump = null, // TF_GLM_TAP_DUMP (glm_moe_dsa, no drafter): prompt chunks' DSpark taps to a file
+     l2pf: ?l2pf_mod.L2pf = null, // TF_GLM_L2PF: the prefetch's side stream, kernels and table, made after the weights tile
+ 
+     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
+@@ -242,6 +244,8 @@ pub const Engine = struct {
+         }
+         if (e.settings.l2pf.on) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, e.settings.l2pf);
+         errdefer if (e.l2pf) |*p| p.deinit();
++        if (e.c.dsa and !o.drafter) e.tap_dump = try taps_mod.Dump.init(gpa, d, fw.prefill_rows, e.c.hidden, rank);
++        errdefer if (e.tap_dump) |x| x.deinit(gpa);
+         if (e.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
+         errdefer {
+             e.free(0);
+@@ -318,6 +322,7 @@ pub const Engine = struct {
+         for (0..e.seqs.items.len) |i| e.free(i);
+         e.seqs.deinit(e.gpa);
+         if (e.l2pf) |*p| p.deinit();
++        if (e.tap_dump) |x| x.deinit(e.gpa);
+         e.w.deinit();
+         e.pieces.deinit();
+         if (e.side) |*x| freeSide(x);
+@@ -401,7 +406,7 @@ pub const Engine = struct {
+         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
+         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
+         const twin = if (e.pair) |*p| (if (b == &p.bp) &p.pieces else null) else null;
+-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b.prefill) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null, .kv = e.kvCtx(), .l2pf = if (e.l2pf) |*p| p else null }; // prompt buffers (the pair's twin too) keep the shared expert on their stream; the twin's exchanges stay on NCCL (its rows are not registered)
++        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else if (e.tap_dump) |x| x.taps() else null, .side = if (b.prefill) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null, .kv = e.kvCtx(), .l2pf = if (e.l2pf) |*p| p else null }; // prompt buffers (the pair's twin too) keep the shared expert on their stream; the twin's exchanges stay on NCCL (its rows are not registered)
+     }
+ 
+     /// An on-by-default switch: off only when `name` is "0".
+@@ -538,7 +543,7 @@ pub const Engine = struct {
+             f.ce = null;
+             if (e.kv_ctx.counts) |c| c.owner_prompts += 1;
+         }
+-        if (e.c.dsa or start + rows <= len -| @as(usize, @intCast(dflash.WIN))) f.taps = null; // none read (dflash.promptRun); glm_moe_dsa can't tap its one stream
++        if (e.tap_dump == null and (e.c.dsa or start + rows <= len -| @as(usize, @intCast(dflash.WIN)))) f.taps = null; // none read (dflash.promptRun); glm_moe_dsa can't tap its one stream
+         const as_i32: []const i32 = @ptrCast(part);
+         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
+         f.prof = e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
+@@ -562,6 +567,7 @@ pub const Engine = struct {
+         stamp.end();
+         if (f.prof) |p| p.mark(e.stream, .gate);
+         try f.run(as_i32[0..rows]);
++        if (e.tap_dump) |x| try x.write(e.stream, start, as_i32[0..rows]);
+         e.index_splits += @intFromBool(split);
+         stamp = prof_mod.span(f.prof, e.stream, .prompt_score);
+         if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..]);
+@@ -700,7 +706,7 @@ pub const Engine = struct {
+             rows += p.ids.len;
+         }
+         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
+-        var f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side, .moe_fuse = e.moe_fuse, .kv = e.kvCtx(), .l2pf = if (e.l2pf) |*p| p else null };
++        var f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else if (e.tap_dump) |x| x.taps() else null, .side = e.side, .moe_fuse = e.moe_fuse, .kv = e.kvCtx(), .l2pf = if (e.l2pf) |*p| p else null };
+         f.prof = e.shared_profs[rows - 1];
+         if (f.prof) |p| try p.begin(e.stream, sharedLabel(rows));
+         defer if (f.prof) |p| p.end();
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 9f774be..4d15abb 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -710,8 +710,8 @@ pub const Forward = struct {
+         const c = &f.ranks[0].w.config;
+         const D = c.hidden;
+         const pf = f.prefetch();
+-        if (f.taps != null) return error.DsaTaps;
+-        if (f.dsaHalves(R)) return f.wholeDsaHalves(R);
++        if (f.taps != null and f.taps.?.dsa == 0) return error.DsaTaps; // DFlash2's 4-stream taps: not this stream
++        if (f.taps == null and f.dsaHalves(R)) return f.wholeDsaHalves(R); // tapped chunks run whole (taps after each layer)
+         var di: usize = 0;
+         for (f.ranks[0].w.layers, 0..) |_, j| {
+             prof_mod.context(f.prof, j, null, .mixer);
+@@ -735,6 +735,9 @@ pub const Forward = struct {
+             if (pf) |p| try p.fork(f.stream, j, .n);
+             try f.reduceDsa(R);
+             if (f.prof) |p| p.mark(f.stream, .gather_b);
++            // DSpark's taps: the layer's whole residual rows (decode never scatters; a prompt's scatter path gathers
++            // its rows back into hidden on this stream before the next layer reads them)
++            if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.hidden, 0, R);
+             switch (f.ranks[0].w.layers[j].mixer) {
+                 .kda => unreachable, // glm_moe_dsa's layers are all .mla (its config's kind says so)
+                 .mla => di += 1,
+diff --git a/zig/src/families/glm/cuda_taps.zig b/zig/src/families/glm/cuda_taps.zig
+index 01d0f4a..03ed574 100644
+--- a/zig/src/families/glm/cuda_taps.zig
++++ b/zig/src/families/glm/cuda_taps.zig
+@@ -1,4 +1,5 @@
+ //! DFlash2's taps on the target's forward: after each tapped layer, its rows' 4-stream mean into one tap slot.
++const std = @import("std");
+ const cuda = @import("cuda");
+ 
+ /// The target layers DFlash2 reads (incoai/GLM-5.3-Flash-DFlash2's target_layer_ids), in tap-slot order.
+@@ -13,13 +14,34 @@ pub fn slot(j: usize) ?i32 {
+     return null;
+ }
+ 
+-/// Where a forward's taps go: rows [R][5 * hidden] bf16 at `out`, through glm_dflash's df_tap.
++/// glm_moe_dsa's taps (DSpark, RedHatAI/GLM-5.3-speculator.dspark): its aux_hidden_state_layer_ids 2, 20, 39, 58, 75
++/// are layer INPUTS, so the residual after 0-based layers 1, 19, 38, 57, 74, in tap-slot order.
++pub const dsa_layers = [_]usize{ 1, 19, 38, 57, 74 };
++
++/// Layer `j`'s DSA tap slot, or null.
++pub fn dsaSlot(j: usize) ?usize {
++    for (dsa_layers, 0..) |l, i| if (l == j) return i;
++    return null;
++}
++
++/// Where a forward's taps go: rows [R][5 * hidden] bf16 at `out`, through glm_dflash's df_tap; or (`dsa` > 0, the
++/// hidden size of glm_moe_dsa's one residual stream) each tapped layer's whole rows copied into their slot of
++/// [R][5 * dsa] bf16 (a strided device copy: no mean, no norm).
+ pub const Taps = struct {
+     f: cuda.Function,
+     out: u64,
++    dsa: usize = 0,
+ 
+-    /// After layer `j` (nothing off the tapped layers): rows lo..lo + n of residual `x` (bf16 [rows][4][hidden]).
++    /// After layer `j` (nothing off the tapped layers): rows lo..lo + n of residual `x` (bf16 [rows][4][hidden], or
++    /// on the dsa [rows][dsa]).
+     pub fn at(t: Taps, s: cuda.Stream, j: usize, x: u64, lo: usize, n: usize) !void {
++        if (t.dsa != 0) {
++            const k = dsaSlot(j) orelse return;
++            if (n == 0) return;
++            const row = t.dsa * 2;
++            const p: cuda.abi.Memcpy2D = .{ .src = x + lo * row, .src_pitch = row, .dst = t.out + lo * dsa_layers.len * row + k * row, .dst_pitch = dsa_layers.len * row, .width = row, .height = n };
++            return s.d.check(s.d.api.cuMemcpy2DAsync_v2(&p, s.handle), "cuMemcpy2DAsync");
++        }
+         const k = slot(j) orelse return;
+         if (n == 0) return;
+         var a: cuda.Args = .{};
+@@ -30,3 +52,59 @@ pub const Taps = struct {
+         try cuda.launch.launch(t.f, .{ .grid = .{ .x = @intCast(n), .y = hidden / 1024 }, .block = .{ .x = 256 } }, s, &a);
+     }
+ };
++
++/// TF_GLM_TAP_DUMP=<file> (glm_moe_dsa, no drafter): every prompt chunk's DSpark taps, for the NumPy twin
++/// (scripts/tests/dspark_twin.py). Every rank taps (so every rank runs tapped chunks whole, the same collectives);
++/// rank 0 appends one record a chunk: "TAPS" u32 magic, i64 start, i32 rows, i32 hidden, i32 ids [rows],
++/// bf16 taps [rows][5][hidden].
++pub const Dump = struct {
++    d: *const cuda.Driver,
++    buf: cuda.DeviceBuffer,
++    host: []u8,
++    rows: usize,
++    hidden: usize,
++    path: ?[*:0]const u8, // rank 0's file (records appended, the file closed after each)
++
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, rows: usize, width: usize, rank: usize) !?*Dump {
++        const path = std.c.getenv("TF_GLM_TAP_DUMP") orelse return null;
++        const x = try gpa.create(Dump);
++        errdefer gpa.destroy(x);
++        const bytes = rows * dsa_layers.len * width * 2;
++        x.* = .{ .d = d, .buf = try cuda.DeviceBuffer.alloc(d, bytes), .host = try gpa.alloc(u8, if (rank == 0) bytes else 0), .rows = rows, .hidden = width, .path = null };
++        if (rank == 0) {
++            const f = std.c.fopen(path, "wb") orelse return error.DumpOpen;
++            _ = std.c.fclose(f);
++            x.path = path;
++        }
++        return x;
++    }
++
++    pub fn deinit(x: *Dump, gpa: std.mem.Allocator) void {
++        gpa.free(x.host);
++        x.buf.free();
++        gpa.destroy(x);
++    }
++
++    pub fn taps(x: *const Dump) Taps {
++        return .{ .f = undefined, .out = x.buf.ptr, .dsa = x.hidden };
++    }
++
++    /// After a chunk's forward on `s`: its rows' taps to the file (rank 0).
++    pub fn write(x: *Dump, s: cuda.Stream, start: usize, ids: []const i32) !void {
++        const path = x.path orelse return;
++        const n = @min(ids.len, x.rows);
++        const bytes = n * dsa_layers.len * x.hidden * 2;
++        try s.synchronize();
++        try x.d.check(x.d.api.cuMemcpyDtoH_v2(@ptrCast(x.host.ptr), x.buf.ptr, bytes), "cuMemcpyDtoH");
++        var head: [20]u8 = undefined;
++        @memcpy(head[0..4], "TAPS");
++        std.mem.writeInt(i64, head[4..12], @intCast(start), .little);
++        std.mem.writeInt(i32, head[12..16], @intCast(n), .little);
++        std.mem.writeInt(i32, head[16..20], @intCast(x.hidden), .little);
++        const idb = std.mem.sliceAsBytes(ids[0..n]);
++        const f = std.c.fopen(path, "ab") orelse return error.DumpOpen;
++        defer _ = std.c.fclose(f);
++        if (std.c.fwrite(&head, 1, head.len, f) != head.len or std.c.fwrite(idb.ptr, 1, idb.len, f) != idb.len or
++            std.c.fwrite(x.host.ptr, 1, bytes, f) != bytes) return error.DumpWrite;
++    }
++};
+-- 
+2.43.0
+

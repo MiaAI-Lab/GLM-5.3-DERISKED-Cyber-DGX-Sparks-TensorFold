@@ -1,0 +1,55 @@
+From 47877cdf68e4097eb5fe3e3df60cab3e8b8a1528 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 11:37:26 +0200
+Subject: [PATCH] glm: TF_GLM_DUMP_LOGITS writes a prompt_logprobs pass's whole
+ logit rows
+
+Diagnosis for full-vocabulary KL against a reference model: with
+TF_GLM_DUMP_LOGITS=path, rank 0 appends each prompt_logprobs head pass's
+gathered bf16 logit rows ([rows][vocab], prompt order; row r scores the
+prompt's token r + 1) to `path`. The API's prompt_logprobs stop at the
+top 20, which biases a KL; the rows let it be computed offline over the
+whole vocabulary. Unset, nothing changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_prompt_logprobs.zig | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/zig/src/families/glm/cuda_prompt_logprobs.zig b/zig/src/families/glm/cuda_prompt_logprobs.zig
+index 3694a14..0b3701b 100644
+--- a/zig/src/families/glm/cuda_prompt_logprobs.zig
++++ b/zig/src/families/glm/cuda_prompt_logprobs.zig
+@@ -79,6 +79,7 @@ pub fn run(e: *Engine, want: Want, next: []const u32) !void {
+         // as the head's last-row pass (Forward.finish); its column count takes no K slices (the test below)
+         try projection.matmul(projectionSet(e), e.stream, e.w.head, e.bp.fnormed + r * D * 2, D, columns, e.bp.kda.mm_part, n, e.share.vocab.len(), D, false);
+         try e.smp.gather(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = columns }}, n, full);
++        if (e.share.rank == 0) try dumpRows(e, full, n);
+         const reader = want.reader orelse continue;
+         @memcpy(picks[0..n], next[r..][0..n]);
+         try e.smp.logprobRows(e.stream, full, n, out + batch_rows * row_words * 4, want.k, out);
+@@ -87,6 +88,20 @@ pub fn run(e: *Engine, want: Want, next: []const u32) !void {
+     }
+ }
+ 
++/// TF_GLM_DUMP_LOGITS=path (diagnosis, rank 0): the whole bf16 logit rows of every prompt_logprobs pass appended to
++/// `path`, [rows][vocab] in prompt order (row r scores the prompt's token r + 1), for full-vocabulary KL offline.
++fn dumpRows(e: *Engine, full: u64, n: usize) !void {
++    const path = std.c.getenv("TF_GLM_DUMP_LOGITS") orelse return;
++    const bytes = n * e.c.vocab * 2;
++    const host = try std.heap.page_allocator.alloc(u8, bytes);
++    defer std.heap.page_allocator.free(host);
++    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(host.ptr, full, bytes, e.stream.handle), "cuMemcpyDtoH");
++    try e.stream.synchronize();
++    const f = std.c.fopen(path, "ab") orelse return error.DumpOpen;
++    defer _ = std.c.fclose(f);
++    if (std.c.fwrite(host.ptr, 1, bytes, f) != bytes) return error.DumpWrite;
++}
++
+ /// The passes' own buffers from the first that asks; if a rank has no room, every rank takes the window's (8 rows).
+ fn buffers(e: *Engine) !?*Buffers {
+     if (!e.prompt_tried) {
+-- 
+2.43.0
+

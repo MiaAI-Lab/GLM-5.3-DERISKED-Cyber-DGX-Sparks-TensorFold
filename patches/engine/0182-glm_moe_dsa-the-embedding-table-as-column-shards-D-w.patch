@@ -1,0 +1,215 @@
+From b191802dd5408507533f17a5b51a09757bfa3080 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:17:44 +0200
+Subject: [PATCH] glm_moe_dsa: the embedding table as column shards (D / world
+ columns a rank), rows gathered and unblocked (TF_GLM_EMBED_SHARD=0: whole
+ table)
+
+Frees 1.43 GB a rank at TP4 (154,880 x 6144 bf16 / 4 x 3). A window's or prompt chunk's rows: each rank embeds its
+columns into its slot of the gathered room, the slots are gathered (decode mesh / group / main communicator), and
+tf_glm_unblock puts them back into rows: the same bf16 values. DSpark's and DFlash2's block passes gather through
+their own route into the first norm's buffer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_forward.zig      | 52 +++++++++++++++++++---
+ zig/src/families/glm/cuda_forward_pair.zig |  1 +
+ zig/src/families/glm/cuda_weights.zig      | 17 ++++++-
+ zig/src/families/glm/dflash_block.zig      | 17 ++++++-
+ zig/src/families/glm/dspark.zig            |  2 +-
+ 5 files changed, 79 insertions(+), 10 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index ba7fee4e..ae3e5c37 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -253,8 +253,11 @@ pub const Forward = struct {
+     fn gather(f: *const Forward, rows: usize) !void {
+         const stamp = prof_mod.span(f.prof, f.stream, .all_gather);
+         defer stamp.end();
+-        const c = &f.ranks[0].w.config;
+-        const bytes = rows * c.hidden * 4;
++        try f.gatherBytes(rows * f.ranks[0].w.config.hidden * 4);
++    }
++
++    /// Every rank's `bytes` at gathered + rank x bytes into every rank's gathered buffer, rank order (on f.stream).
++    fn gatherBytes(f: *const Forward, bytes: usize) !void {
+         switch (f.exchange) {
+             .local => for (f.ranks) |to| for (f.ranks) |from| {
+                 if (to.w.share.rank == from.w.share.rank) continue;
+@@ -266,12 +269,42 @@ pub const Forward = struct {
+                 // a decode window's gathers (not a prompt chunk's) go by the mesh's RoCE writes when they fit its slot
+                 if (n.mesh) |m| if (!r.b.prefill and m.fits(bytes)) return m.allGatherBytes(r.b.gathered + r.w.share.rank * bytes, r.b.gathered, bytes, f.stream.handle);
+                 if (n.group) |g| return g.allGather(f.stream, r.b.gathered + r.w.share.rank * bytes, r.b.gathered, bytes);
+-                const count = rows * c.hidden;
+-                try n.lib.check(n.lib.api.ncclAllGather(r.b.gathered + r.w.share.rank * bytes, r.b.gathered, count, .f32, n.comm, f.stream.handle), "ncclAllGather");
++                if (bytes % 4 == 0) {
++                    try n.lib.check(n.lib.api.ncclAllGather(r.b.gathered + r.w.share.rank * bytes, r.b.gathered, bytes / 4, .f32, n.comm, f.stream.handle), "ncclAllGather");
++                } else try n.lib.check(n.lib.api.ncclAllGather(r.b.gathered + r.w.share.rank * bytes, r.b.gathered, bytes, .u8, n.comm, f.stream.handle), "ncclAllGather");
+             },
+         }
+     }
+ 
++    const max_embed_ranks = 16; // in-process ranks of a local check
++
++    /// The embeddings of the R ids in r.b.ids into `out` [R][copies x D]. A column-sharded table (TF_GLM_EMBED_SHARD,
++    /// w.embed_cols): every rank embeds its columns into its slot of the gathered room, the slots are gathered (the
++    /// decode mesh for a window, the main communicator for a prompt chunk), and unblock puts them back into rows: the
++    /// same bf16 values a whole table gives.
++    pub fn embedRows(f: *const Forward, R: usize, copies: usize, outs: []const u64) !void {
++        const c = &f.ranks[0].w.config;
++        const cw = f.ranks[0].w.embed_cols;
++        if (cw == 0) {
++            for (f.ranks, outs) |r, out| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, out, R, c.hidden, copies);
++            return;
++        }
++        if (copies != 1) return error.EmbedShard;
++        const sbytes = R * cw * 2;
++        for (f.ranks, outs) |r, out| {
++            _ = out;
++            if (r.w.embed_cols != cw or r.w.share.world * cw != c.hidden) return error.EmbedShard;
++            if (r.w.share.world * sbytes > r.w.share.world * r.b.rows * c.hidden * 4) return error.EmbedShard;
++            try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.gathered + r.w.share.rank * sbytes, R, cw, 1);
++        }
++        try f.gatherBytes(sbytes);
++        for (f.ranks, outs) |r, out| {
++            var u: cuda.Args = .{};
++            inline for (.{ r.b.gathered, out, @as(c_int, @intCast(R)), @as(c_int, @intCast(cw)), @as(c_int, @intCast(c.hidden)), @as(i64, @intCast(c.hidden)) }) |v| u.add(v);
++            try cuda.launch.launch(f.m.glue.unblock, .{ .grid = .{ .x = @intCast(R) }, .block = .{ .x = 256 } }, f.stream, &u);
++        }
++    }
++
+     fn slot(r: Rank, rows: usize) u64 {
+         return r.b.gathered + r.w.share.rank * rows * r.w.config.hidden * 4;
+     }
+@@ -503,7 +536,12 @@ pub const Forward = struct {
+         const c = &f.ranks[0].w.config;
+         const embed_stamp = prof_mod.span(f.prof, f.stream, .embed);
+         // glm_moe_dsa keeps one residual stream (no mHC): its embedding lands in b.hidden, not the s x d x
+-        for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, if (c.dsa) r.b.hidden else r.b.x, R, c.hidden, if (c.dsa) 1 else c.hc);
++        {
++            var outs: [max_embed_ranks]u64 = undefined;
++            if (f.ranks.len > max_embed_ranks) return error.BadWindow;
++            for (f.ranks, 0..) |r, i| outs[i] = if (c.dsa) r.b.hidden else r.b.x;
++            try f.embedRows(R, if (c.dsa) 1 else c.hc, outs[0..f.ranks.len]);
++        }
+         if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, if (c.dsa) r.b.hidden else r.b.x, if (c.dsa) 1 else c.hc);
+         embed_stamp.end();
+         if (f.prof) |p| p.mark(f.stream, .embed);
+@@ -817,7 +855,9 @@ pub const Forward = struct {
+             if (h != r.b.hin) try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(r.b.hin, h, n * D * 2, f.stream.handle), "cuMemcpyDtoDAsync");
+             const m = r.w.mtp.?;
+             const b = r.b;
+-            try glue.embedB16(f.set(), f.stream, b.ids, r.w.embed, b.me, n, D, 1);
++            if (r.w.embed_cols == 0) {
++                try glue.embedB16(f.set(), f.stream, b.ids, r.w.embed, b.me, n, D, 1);
++            } else if (f.ranks.len == 1) try f.embedRows(n, 1, &.{b.me}) else return error.EmbedShard; // (embedRows gathers every rank's at once)
+             // the head reads each row's next token: an image's rows one place on
+             if (f.images) |im| try im.v.splice(f.stream, im.slot, r.st.mtp_len + 1, r.st.mtp_len + 1 + n, b.me, 1);
+             if (r.st.mtp_len == 0) try f.d.check(f.d.api.cuMemsetD8Async(b.me, 0, D * 2, f.stream.handle), "cuMemsetD8Async"); // position 0's embedding is zeroed
+diff --git a/zig/src/families/glm/cuda_forward_pair.zig b/zig/src/families/glm/cuda_forward_pair.zig
+index c660ad37..e75bd8db 100644
+--- a/zig/src/families/glm/cuda_forward_pair.zig
++++ b/zig/src/families/glm/cuda_forward_pair.zig
+@@ -29,6 +29,7 @@ pub fn pairBody(a: *const Forward, b: *const Forward, ra: usize, rb: usize) !voi
+         if (one_room) for (cuts[i][0..n[i]]) |p| if (!f.splits(p[1] - p[0])) return error.BadPair;
+         for (f.ranks) |r| {
+             if (r.segs.len > 0 or !r.b.prefill or R == 0 or R > r.b.rows) return error.BadPair;
++            if (r.w.embed_cols != 0) return error.BadPair; // a column-sharded table (glm_moe_dsa only) gathers: Forward.embedRows
+             try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
+         }
+         if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index d1a205d8..26053321 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -43,7 +43,8 @@ pub const Weights = struct {
+     gpa: std.mem.Allocator,
+     config: cfg.Config,
+     share: shard.Share,
+-    embed: u64 = 0, // bf16 [vocab][dims]
++    embed: u64 = 0, // bf16 [vocab][dims], or [vocab][embed_cols] (this rank's columns, embedShard)
++    embed_cols: usize = 0, // 0: the whole table; else the width of this rank's column slice (columns rank x embed_cols ..)
+     layers: []Layer = &.{},
+     norm: glue.Norm = .{ .bf16 = 0 },
+     head: projection.Proj = .{ .bf16 = 0 }, // [share.vocab][dims]: bf16, or MXFP8 for the lane
+@@ -797,6 +798,15 @@ fn modelPrefix(ck: *core.Checkpoint) ![]const u8 {
+     return error.NoModelPrefix;
+ }
+ 
++/// TF_GLM_EMBED_SHARD (default on; =0 keeps the whole table on every rank): glm_moe_dsa's embedding table held as
++/// column shards, D / world columns a rank, when that is a whole number of 16-byte pieces. Returns the slice width.
++/// Every rank decides alike (the recipe passes TF_* to all ranks), so every rank gathers or none does.
++pub fn embedShard(c: cfg.Config, world: usize) ?usize {
++    if (!c.dsa or world < 2 or c.hidden % world != 0 or (c.hidden / world) % 8 != 0) return null;
++    if (std.c.getenv("TF_GLM_EMBED_SHARD")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return null;
++    return c.hidden / world;
++}
++
+ /// weights.load without the MTP head: embedding, layers, final norm, the rank's head rows (bf16, MXFP8); `pack_dense`.
+ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layers: []const u32, heads: Heads) !Weights {
+     var w: Weights = .{ .gpa = gpa, .config = c, .share = share };
+@@ -819,7 +829,10 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
+         L.inv = try L.put("glm.dsa.inv", .{});
+     }
+     try @import("cuda_load_ahead.zig").layers(&L, L.pfx, layers, w.layers);
+-    try L.whole(try L.get("embed_tokens.weight", .{}), .bf16);
++    if (embedShard(c, share.world)) |cw| { // each rank holds its columns of the table; embeddings gathered (cuda_forward.embedRows)
++        try L.cols(try L.get("embed_tokens.weight", .{}), share.rank * cw, (share.rank + 1) * cw, .bf16);
++        w.embed_cols = cw;
++    } else try L.whole(try L.get("embed_tokens.weight", .{}), .bf16);
+     w.embed = try L.put("embed", .{});
+     w.norm = try L.norm("norm.weight", .{}, "norm");
+     const vocab: formats.Part = .{ .rel = "lm_head", .rows = .{ share.vocab.lo, share.vocab.hi } };
+diff --git a/zig/src/families/glm/dflash_block.zig b/zig/src/families/glm/dflash_block.zig
+index 69e70fed..107d02b0 100644
+--- a/zig/src/families/glm/dflash_block.zig
++++ b/zig/src/families/glm/dflash_block.zig
+@@ -80,6 +80,21 @@ fn gather(e: anytype, buf: u64, bytes: usize) !void {
+     try e.lib.check(e.lib.api.ncclAllGather(buf + e.share.rank * bytes, buf, bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
+ }
+ 
++/// The block rows' embeddings of `ids` into out [M][d]. A column-sharded table (e.w.embed_cols, TF_GLM_EMBED_SHARD):
++/// this rank's columns into its slot of `tmp` (M x d bf16, free until the pass's first norm writes it), every rank's
++/// slots gathered, then unblocked into rows: the same values the whole table gives.
++pub fn embed(e: anytype, ids: u64, out: u64, tmp: u64, M: usize, d: usize) !void {
++    const cw = e.w.embed_cols;
++    if (cw == 0) return glue.embedB16(set(e), e.stream, ids, e.w.embed, out, M, d, 1);
++    if (cw * e.share.world != d) return error.EmbedShard;
++    const sbytes = M * cw * 2;
++    try glue.embedB16(set(e), e.stream, ids, e.w.embed, tmp + e.share.rank * sbytes, M, cw, 1);
++    try gather(e, tmp, sbytes);
++    var u: cuda.Args = .{};
++    inline for (.{ tmp, out, @as(c_int, @intCast(M)), @as(c_int, @intCast(cw)), @as(c_int, @intCast(d)), @as(i64, @intCast(d)) }) |v| u.add(v);
++    try go(e.m.glue.unblock, .{ .x = @intCast(M) }, 256, e, &u);
++}
++
+ /// `N` context rows (cin, cpos, crings uploaded) through fc, the hidden norm and each layer's k, v into the rings.
+ pub fn ingestPass(dr: *Drafter, e: anytype, N: usize) !void {
+     try lin(dr, e, dr.cin, dr.fc, dr.c1, N, false);
+@@ -112,7 +127,7 @@ fn conv(dr: *const Drafter, e: anytype, z: u64, which: i32, base: u64, out: u64,
+ /// The block pass for `S` streams (tables uploaded): embed, 5 layers, norm, each rank's 16 best a row, gathered.
+ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+     const M = S * BLOCK;
+-    try glue.embedB16(set(e), e.stream, dr.ids, e.w.embed, dr.x, M, D, 1);
++    try embed(e, dr.ids, dr.x, dr.y, M, D); // (dr.y: the first norm's output, written next)
+     for (dr.layers, 0..) |l, li| {
+         // attention, wrapped in the attention conv
+         try glue.rmsnorm(set(e), e.stream, dr.x, D, l.in_norm, dr.y, D, null, df.EPS, M, D);
+diff --git a/zig/src/families/glm/dspark.zig b/zig/src/families/glm/dspark.zig
+index 7641690e..fe2b27dd 100644
+--- a/zig/src/families/glm/dspark.zig
++++ b/zig/src/families/glm/dspark.zig
+@@ -396,7 +396,7 @@ fn gather(e: anytype, buf: u64, bytes: usize) !void {
+ pub fn pass(dr: *df.Drafter, e: anytype, S: usize) !void {
+     const sp = dr.spark.?;
+     const M = S * df.BLOCK;
+-    try glue.embedB16(set(e), e.stream, dr.ids, e.w.embed, sp.x, M, D, 1);
++    try @import("dflash_block.zig").embed(e, dr.ids, sp.x, sp.y, M, D); // (sp.y: the first norm's output, written next)
+     for (sp.layers, 0..) |l, li| {
+         try glue.rmsnorm(set(e), e.stream, sp.x, D, l.in_norm, sp.y, D, null, EPS, M, D);
+         try lin(dr, e, sp.y, l.qkv, sp.qkv, M);
+-- 
+2.43.0
+

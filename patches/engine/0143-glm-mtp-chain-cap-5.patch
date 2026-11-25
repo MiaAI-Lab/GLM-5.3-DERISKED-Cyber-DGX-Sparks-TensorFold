@@ -1,0 +1,31 @@
+From 3a6778007f813bf91070c2d1090709804cffb723 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:38:18 +0200
+Subject: [PATCH] glm: MTP chains up to 5 drafts (was 3)
+
+At TP6 a 4-row verify window costs ~10% more than a 2-row one; the lanes
+depth rule still picks each round's depth from measured costs and
+acceptance.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_engine.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 6b12b06..040748a 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -29,7 +29,7 @@ pub const Options = @import("cuda_engine_types.zig").Options;
+ pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
+ 
+ /// The most drafts a chain holds (decode.DepthPolicy's top depth).
+-pub const max_drafts = 3;
++pub const max_drafts = 5; // glm_moe_dsa at TP6: windows of up to 6 rows cost little more than 2 (the lanes rule still picks the depth)
+ /// A greedy pick as it crosses ranks: (value, id) and padding, so the RoCE gather (16-byte packs) can carry it.
+ const pair_bytes = 16;
+ /// The rows one gather of greedy picks holds (cuda_engine_pick.greedyRows): a shared window's.
+-- 
+2.43.0
+

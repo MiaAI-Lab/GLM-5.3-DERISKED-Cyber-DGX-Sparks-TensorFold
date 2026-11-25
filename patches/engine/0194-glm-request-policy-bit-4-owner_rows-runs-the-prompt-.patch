@@ -1,0 +1,82 @@
+From 72fe81f112da42f38001518eaac558d8182dd742 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 17:25:04 +0200
+Subject: [PATCH 194/194] glm: request policy bit 4 (owner_rows) runs the
+ prompt owner projections
+
+A request whose tf_policy has bit 4 runs TF_GLM_PROMPT_OWNER_PROJ's mode, or fused with qb (5) when the switch is
+off (dsa_block.ownerFor); a clear bit keeps the boot's setting. Offered at three ranks or more when a layer's
+[q_a | kv_a] is a lane projection; the rooms are the gathered buffer's, held from startup. Exact (glm-owner-proj),
+so a forward that mixes masks cannot change a byte. test-glm-policy-host: 20/20 (the new table test fails when
+broken: 19 pass 1 fail).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_dsa_block.zig | 16 ++++++++++++++++
+ zig/src/families/glm/cuda_forward.zig   |  2 +-
+ zig/src/families/glm/cuda_native.zig    |  8 ++++++++
+ 3 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index 5b9959fcc..7d19db239 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -193,6 +193,22 @@ pub fn ownerPolicy() Owner {
+     return parseOwner(if (std.c.getenv("TF_GLM_PROMPT_OWNER_PROJ")) |e| std.mem.span(e) else null);
+ }
+ 
++/// The request policy's bit 4 (owner_rows, night/swift/POLICY.md) over the boot's switch: a request with the bit
++/// runs the switch's mode, or fused with qb (5) when the switch is off; without it, the boot's own setting.
++pub fn ownerFor(boot: Owner, wanted: bool) Owner {
++    if (!wanted or boot.publish != .off or boot.qb) return boot;
++    return .{ .publish = .fused, .qb = true };
++}
++
++test "GLM policy: bit 4 (owner_rows) runs TF_GLM_PROMPT_OWNER_PROJ's mode, fused + qb when it is off; clear, the boot's" {
++    for ([_]?[]const u8{ null, "0", "1", "2", "4", "5", "6" }) |env| {
++        const boot = parseOwner(env);
++        try std.testing.expectEqual(boot, ownerFor(boot, false));
++        const want: Owner = if (boot.publish == .off and !boot.qb) .{ .publish = .fused, .qb = true } else boot;
++        try std.testing.expectEqual(want, ownerFor(boot, true));
++    }
++}
++
+ pub fn parseOwner(text: ?[]const u8) Owner {
+     const t = text orelse return .{};
+     const m = std.fmt.parseInt(u32, t, 10) catch return .{};
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 2f970155c..a2463d089 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -1031,7 +1031,7 @@ const OwnHalves = struct {
+     ready: [2]bool = .{ false, false },
+ 
+     fn init(f: *const Forward, R: usize) OwnHalves {
+-        const pol = dsa_block.ownerPolicy();
++        const pol = dsa_block.ownerFor(dsa_block.ownerPolicy(), f.wants(.owner_rows));
+         var o: OwnHalves = .{ .f = f, .pol = pol };
+         if (pol.publish == .off) return o;
+         const r = f.ranks[0];
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index c8208b8dd..5bd95bee8 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -475,6 +475,14 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+         },
+         else => {},
+     };
++    // owner rows (prompt chunks' [q_a | kv_a] and indexer queries): lane projections, the two-halves path's three
++    // ranks or more; its rooms are the gathered buffer's (fw.ownRoom), held at startup
++    if (e.w.share.world >= 3) for (e.w.layers) |l| switch (l.mixer) {
++        .mla => |a| if (@import("cuda_dsa_block.zig").ownerProjects(a)) {
++            b.offered |= policy.bit(.owner_rows);
++        },
++        else => {},
++    };
+     std.log.info("request policies on (TF_GLM_POLICY_REQUESTS=1): default 0x{x}, offered 0x{x}", .{ b.default & b.offered, b.offered });
+     return b;
+ }
+-- 
+2.43.0
+

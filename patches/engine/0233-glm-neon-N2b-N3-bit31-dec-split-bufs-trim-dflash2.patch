@@ -1,0 +1,1225 @@
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Subject: [PATCH] glm: neon bit 31 (dense decode split), TF_GLM_NEON_BUFS=1 (prompt buffers -453 MiB), DFlash2 bit 30 + TF_GLM_NEON_DF_DOWN / _FC
+
+Squash of neon commits 676d2ea89 (bit 31), bf9624cbc (rank #10 buffers), 4b5b60031 (N3 drafter) over ecd89cfea.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj5qARY3iLJfisqfnh
+---
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 4019d541b..53727175f 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -10,6 +10,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     b.step("test-glm-tp3-host", "Uneven KDA head shares through actual projection and load planning, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM TP3:"} })).step);
+     b.step("test-glm-halves-host", "A prompt chunk's two halves and their exchange rooms (TF_GLM_DSA_HALVES), without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM halves room:"} })).step);
+     b.step("test-glm-owner-proj-host", "TF_GLM_PROMPT_OWNER_PROJ's switch, split rows and rooms, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM owner proj:"} })).step);
++    b.step("test-glm-neon-bufs-host", "TF_GLM_NEON_BUFS: a GLM-5.3 TP4 prompt buffer's trimmed sizes, decode and shared buffers unchanged, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM neon bufs:"} })).step);
+     b.step("test-glm-exl3-host", "GLM EXL3 admission, mixed-width expert loading and scratch sizing, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM EXL3:"} })).step);
+     b.step("test-glm-x8-host", "GLM EXLR8 trellis projections as stored (0205b): cuts, markers, scratch, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM X8:"} })).step);
+     // TF_GLM_INDEX_CUDA: the launch rules, and (its own slower step) glm_index_*.cuh as host C++ against plain models
+diff --git a/zig/kernels/cuda/glm_dec_split.cuh b/zig/kernels/cuda/glm_dec_split.cuh
+new file mode 100644
+index 000000000..238d4e086
+--- /dev/null
++++ b/zig/kernels/cuda/glm_dec_split.cuh
+@@ -0,0 +1,228 @@
++// neon rank #3 (GLM policy bit 31): a dense decode window's int8 dsa attention (pos + rows <= 2,048 keys: one to four
++// 512-key chunks) in two launches with the chunk kernel's exact tile walk. tf_glm_chunks_16_w576_i8(_skip) runs one
++// block a (row, chunk) over its 16 tiles of 32 keys in turn: 2-16 blocks on 48 SMs. Here
++//   tf_glm_dec_split_qk: a block a (row, chunk, tile): the tile's 16 heads x 32 keys scores (the same MMA chain over
++//     the 576 dims, the same scale) and their per-head max into scratch sc [chunk][row][tile][16][32] / tm [..][16];
++//   tf_glm_dec_split_pv: a block a (row, 64 value columns, chunk) walks the chunk's tiles in order with the chunk
++//     kernel's online softmax (exp_approx, quad_sum, alpha, l = fma(l, alpha, sum)) and P.V MMAs on its 64 columns,
++//     writing po / pm / pl as the chunk kernel does; merge is unchanged.
++// The int8 rows dequantize as bf16 pairs (exact: power-of-two scales, see glm_glue_msa.cuh Raw8IF). Byte-exact on
++// po, pm, pl and the merged rows (night/neon/gputest t6_dec.out). Heads a rank: 16 (one 16-head block).
++#pragma once
++namespace glm_dec_split {
++__device__ __forceinline__ __nv_bfloat162 deq2_i8(uint16_t bits, uint32_t sc_bf2) {
++  uint32_t t = __byte_perm((uint32_t)(bits ^ 0x8080u), 0u, 0x4140);
++  uint32_t a, c;
++  asm("lop3.b32 %0, %1, 0x007f007f, 0x43004300, 0xea;" : "=r"(a) : "r"(t));
++  asm("lop3.b32 %0, %1, 0x00800080, 0x43804380, 0x6a;" : "=r"(c) : "r"(t));
++  __nv_bfloat162 d = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&a), *reinterpret_cast<const __nv_bfloat162*>(&c));
++  return __hmul2(d, *reinterpret_cast<const __nv_bfloat162*>(&sc_bf2));
++}
++}  // namespace glm_dec_split
++
++// phase 1: grid (rows, chunks, 16 tiles), 128 threads (a warp 8 of the tile's 32 keys); 16x64 / 32x64 staging.
++extern "C" __global__ void __launch_bounds__(128, 4)
++tf_glm_dec_split_qk(const __nv_bfloat16* __restrict__ qa, const unsigned char* __restrict__ codes8,
++                    const float* __restrict__ scales8, const int* __restrict__ pos,
++                    float* __restrict__ sc_out, float* __restrict__ tm_out,
++                    int rows, int heads, int nch, float scale) {
++    constexpr int HB = 16, LW = 512, LWV = 576, KT = 32, CH = 512;
++    constexpr int KD = 64; // 9 k-blocks of 64 dims (= 576)
++    __shared__ __align__(16) __nv_bfloat16 qs[HB * KD];   // 2048 B
++    __shared__ __align__(16) __nv_bfloat16 ks[KT * KD];   // 4096 B
++    __shared__ float red[HB * 4];
++    auto at64 = [](int row, int u) { return row * KD + ((u ^ (row & 7)) << 3); };
++
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
++    const int r = blockIdx.x, c = blockIdx.y, tile = blockIdx.z;
++    const int limit = pos[0] + r;
++    const int start = c * CH;
++    const int first = start + tile * KT;
++    if (first > limit) return; // SKIP tile!
++
++    // Load 32 keys' scales once into registers (warp-broadcast or per-thread)
++    // Pre-fetch keys' scales into smem: 32 * 2 floats = 256 B
++    __shared__ uint32_t sc_lat_bf2[KT], sc_rope_bf2[KT];
++    if (tid < KT) {
++        const int ki = first + tid;
++        const bool ok = ki <= limit;
++        const float sl = ok ? __ldg(scales8 + ki * 2) : 1.0f;
++        const float sr = ok ? __ldg(scales8 + ki * 2 + 1) : 1.0f;
++        const uint32_t bl = __float_as_uint(sl) >> 16, br = __float_as_uint(sr) >> 16;
++        sc_lat_bf2[tid] = bl | (bl << 16);
++        sc_rope_bf2[tid] = br | (br << 16);
++    }
++    __syncthreads();
++
++    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++    for (int k0 = 0; k0 < LWV; k0 += KD) {
++        // 128 threads load qs[16][64] (16*8 = 128 uint4 = 1 per thread!)
++        {
++            const int hd = tid >> 3, u = tid & 7;
++            *reinterpret_cast<uint4*>(qs + at64(hd, u)) =
++                __ldg(reinterpret_cast<const uint4*>(qa + ((int64_t)r * heads + hd) * LWV + k0 + u * 8));
++        }
++        // 128 threads load ks[32][64] (32*8 = 256 uint2 = 2 per thread!)
++        const bool is_rope = (k0 >= LW);
++#pragma unroll
++        for (int rep = 0; rep < 2; ++rep) {
++            const int idx = tid + rep * 128, key = idx >> 3, u = idx & 7;
++            const int ki = first + key;
++            const bool ok = ki <= limit;
++            const uint2 raw = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + (int64_t)ki * LWV + k0 + u * 8)) : make_uint2(0u, 0u);
++            const uint32_t sc2 = is_rope ? sc_rope_bf2[key] : sc_lat_bf2[key];
++            __nv_bfloat162* dst = reinterpret_cast<__nv_bfloat162*>(ks + at64(key, u));
++            dst[0] = glm_dec_split::deq2_i8((uint16_t)(raw.x & 0xffffu), sc2);
++            dst[1] = glm_dec_split::deq2_i8((uint16_t)(raw.x >> 16), sc2);
++            dst[2] = glm_dec_split::deq2_i8((uint16_t)(raw.y & 0xffffu), sc2);
++            dst[3] = glm_dec_split::deq2_i8((uint16_t)(raw.y >> 16), sc2);
++        }
++        __syncthreads();
++#pragma unroll
++        for (int kk = 0; kk < KD; kk += 32) {
++            uint32_t a0[4], a1[4], b[4];
++            glm_attn::ldm4<false>(a0, qs + at64(lane & 15, (kk >> 3) + (lane >> 4)));
++            glm_attn::ldm4<false>(a1, qs + at64(lane & 15, ((kk + 16) >> 3) + (lane >> 4)));
++            glm_attn::ldm4<false>(b, ks + at64(warp * 8 + (lane & 7), (kk >> 3) + (lane >> 3)));
++            glm_router::mma16816(acc, a0, b);
++            glm_router::mma16816(acc, a1, b + 2);
++        }
++        __syncthreads();
++    }
++    float sc[4];
++#pragma unroll
++    for (int e = 0; e < 2; ++e) {
++        const int ki = first + warp * 8 + q * 2 + e;
++        const bool ok = ki <= limit;
++        sc[e] = ok ? __fmul_rn(acc[e], scale) : -INFINITY;
++        sc[e + 2] = ok ? __fmul_rn(acc[e + 2], scale) : -INFINITY;
++    }
++    // Store sc[c][r][tile][h][k]
++    const int64_t tbase = ((int64_t)(c * rows + r) * 16 + tile);
++    float* sco = sc_out + tbase * (HB * KT);
++#pragma unroll
++    for (int hf = 0; hf < 2; ++hf) {
++        const int hr = hf * 8 + g, col = warp * 8 + q * 2;
++        sco[hr * KT + col] = sc[hf * 2];
++        sco[hr * KT + col + 1] = sc[hf * 2 + 1];
++        const float mx = glm_attn::quad_max(fmaxf(sc[hf * 2], sc[hf * 2 + 1]));
++        if (q == 0) red[hr * 4 + warp] = mx;
++    }
++    __syncthreads();
++    if (tid < HB * 4) {
++        float v = red[tid];
++        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 2));
++        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
++        if ((tid & 3) == 0) tm_out[tbase * HB + tid / 4] = v;
++    }
++}
++
++// phase 2: grid (rows, 8 column blocks of 64, chunks), 128 threads; a warp 16 of the block's 64 value columns.
++extern "C" __global__ void __launch_bounds__(128, 4)
++tf_glm_dec_split_pv(const float* __restrict__ sc_in, const float* __restrict__ tm_in,
++                    const unsigned char* __restrict__ codes8, const float* __restrict__ scales8,
++                    const int* __restrict__ pos, float* __restrict__ po, float* __restrict__ pm, float* __restrict__ pl,
++                    int rows, int heads) {
++    constexpr int HB = 16, LW = 512, LWV = 576, KT = 32, CH = 512, DC = 64;
++    __shared__ __align__(16) __nv_bfloat16 vs[KT * DC];   // 4096 B
++    __shared__ __align__(16) __nv_bfloat16 ps[HB * KT];   // 1024 B
++    __shared__ float red[HB * 4];
++    __shared__ float stat[HB];
++    auto at64 = [](int row, int u) { return row * DC + ((u ^ (row & 7)) << 3); };
++
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
++    const int r = blockIdx.x, dblk = blockIdx.y, c = blockIdx.z;
++    const int d0 = dblk * DC;
++    const int limit = pos[0] + r;
++    const int start = c * CH;
++    const bool live = start <= limit;
++    const int nt = live ? min(16, (limit - start) / KT + 1) : 0;
++
++    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
++    float o[2][4] = {}; // 2 tiles of 8 cols per warp (4 warps x 16 = 64 cols!)
++
++    for (int tile = 0; tile < nt; ++tile) {
++        const int first = start + tile * KT;
++        const int64_t tbase = ((int64_t)(c * rows + r) * 16 + tile);
++        const float* sci = sc_in + tbase * (HB * KT);
++        const float* tmi = tm_in + tbase * HB;
++
++        // 1. Load 32x64 V slice into vs (32*8 = 256 uint2 = 2 per thread)
++#pragma unroll
++        for (int rep = 0; rep < 2; ++rep) {
++            const int idx = tid + rep * 128, key = idx >> 3, u = idx & 7;
++            const int ki = first + key;
++            const bool ok = ki <= limit;
++            const uint2 raw = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + (int64_t)ki * LWV + d0 + u * 8)) : make_uint2(0u, 0u);
++            const float sl = ok ? __ldg(scales8 + ki * 2) : 1.0f;
++            const uint32_t bl = __float_as_uint(sl) >> 16, sc2 = bl | (bl << 16);
++            __nv_bfloat162* dst = reinterpret_cast<__nv_bfloat162*>(vs + at64(key, u));
++            dst[0] = glm_dec_split::deq2_i8((uint16_t)(raw.x & 0xffffu), sc2);
++            dst[1] = glm_dec_split::deq2_i8((uint16_t)(raw.x >> 16), sc2);
++            dst[2] = glm_dec_split::deq2_i8((uint16_t)(raw.y & 0xffffu), sc2);
++            dst[3] = glm_dec_split::deq2_i8((uint16_t)(raw.y >> 16), sc2);
++        }
++
++        // 2. Exact online softmax update + P -> ps (4 warps cover kg=0..3!)
++        float alpha[2];
++#pragma unroll
++        for (int hf = 0; hf < 2; ++hf) {
++            const int hr = hf * 8 + g;
++            const float tm = tmi[hr];
++            const bool active = tm != -INFINITY;
++            const float nm = active ? fmaxf(m[hf], tm) : m[hf];
++            alpha[hf] = active ? (m[hf] == -INFINITY ? 0.0f : glm_triton::exp_approx(m[hf] - nm)) : 1.0f;
++            const int col = warp * 8 + q * 2;
++            float p[2];
++#pragma unroll
++            for (int e = 0; e < 2; ++e) {
++                const int ki = first + col + e;
++                const bool ok = ki <= limit;
++                const float sv = sci[hr * KT + col + e];
++                p[e] = active && ok ? glm_triton::exp_approx(sv - nm) : 0.0f;
++            }
++            *reinterpret_cast<__nv_bfloat162*>(ps + glm_attn::narrow(hr, col >> 3) + (col & 7)) = __floats2bfloat162_rn(p[0], p[1]);
++            if (dblk == 0) {
++                const float s = glm_attn::quad_sum(p[0] + p[1]);
++                if (q == 0) red[hr * 4 + warp] = s;
++            }
++            m[hf] = nm;
++        }
++        __syncthreads();
++        if (dblk == 0 && tid < HB * 4) {
++            float v = red[tid];
++            v = v + __shfl_xor_sync(0xffffffffu, v, 2);
++            v = v + __shfl_xor_sync(0xffffffffu, v, 1);
++            if ((tid & 3) == 0) stat[tid / 4] = v;
++        }
++#pragma unroll
++        for (int j = 0; j < 2; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) o[j][e] = __fmul_rn(o[j][e], alpha[e / 2]);
++#pragma unroll
++        for (int k16 = 0; k16 < KT; k16 += 16) {
++            uint32_t a[4], b[4];
++            glm_attn::ldm4<false>(a, ps + glm_attn::narrow(lane & 15, (k16 >> 3) + (lane >> 4)));
++            glm_attn::ldm4<true>(b, vs + at64(k16 + (lane & 15), ((warp * 16) >> 3) + (lane >> 4)));
++            glm_router::mma16816(o[0], a, b);
++            glm_router::mma16816(o[1], a, b + 2);
++        }
++        __syncthreads();
++        if (dblk == 0) {
++#pragma unroll
++            for (int hf = 0; hf < 2; ++hf) l[hf] = __fmaf_rn(l[hf], alpha[hf], stat[hf * 8 + g]);
++        }
++    }
++#pragma unroll
++    for (int e = 0; e < 4; ++e) {
++        const int hd = g + (e / 2) * 8;
++        if (hd >= heads) continue;
++        const int64_t base = ((int64_t)c * rows + r) * heads + hd;
++        po[base * LW + d0 + warp * 16 + 0 * 8 + q * 2 + (e & 1)] = o[0][e];
++        po[base * LW + d0 + warp * 16 + 1 * 8 + q * 2 + (e & 1)] = o[1][e];
++        if (dblk == 0 && warp == 0 && q == 0 && (e & 1) == 0) {
++            pm[base] = m[e / 2];
++            pl[base] = l[e / 2];
++        }
++    }
++}
+diff --git a/zig/kernels/cuda/glm_dflash.cu b/zig/kernels/cuda/glm_dflash.cu
+index db1169fec..d64ec82db 100644
+--- a/zig/kernels/cuda/glm_dflash.cu
++++ b/zig/kernels/cuda/glm_dflash.cu
+@@ -4,6 +4,7 @@
+ 
+ #include <cuda_bf16.h>
+ #include <stdint.h>
++#include <climits>
+ 
+ namespace {
+ constexpr int D = 4096;
+@@ -259,6 +260,206 @@ extern "C" __global__ void __launch_bounds__(256) dg_attn_part(const __nv_bfloat
+         const long long* __restrict__ froms, int layer, float scale, float* __restrict__ pm, float* __restrict__ pl,
+         float* __restrict__ pacc) { attn_part_t<6144, 64>(q, kb, vb, rings, starts, froms, layer, scale, pm, pl, pacc); }
+ 
++// Policy bit 30 (neon N3 #1): dg_attn_part on tensor cores. The same chunks, partials and layout as dg_attn_part (so
++// dg_attn_merge takes them unchanged); the scores and P.V on mma.m16n8k16 (bf16 in, fp32 accumulate), the softmax's
++// weights rounded to bf16 before P.V. Not bit-identical to the scalar kernel (a bf16 ULP or so on the merged output):
++// drafts only, the target verifies them. Grid (S, KVH, CH) as dg_attn_part, 128 threads: a block's 8 rows x a KV head's
++// 8 query heads = 64 queries (4 m16 tiles, one a warp: 2 rows x 8 heads), sharing 32-key tiles of K and V staged in
++// shared memory. A row's chunk c covers the keys dg_attn_part's does; the block walks their union and masks each row's.
++namespace dgmma {
++__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++}
++template <bool TRANS>
++__device__ __forceinline__ void ldm4(uint32_t* r, const void* p) {
++    const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
++    if constexpr (TRANS)
++        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
++    else
++        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
++}
++__device__ __forceinline__ int at128(int row, int u) { return row * HD + ((u ^ (row & 7)) << 3); }  // swizzled 16-byte pieces
++__device__ __forceinline__ int at32(int row, int u) { return row * 32 + ((u ^ ((row >> 1) & 3)) << 3); }
++}  // namespace dgmma
++
++extern "C" __global__ void __launch_bounds__(128, 3) dg_attn_part_mma(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kb,
++        const __nv_bfloat16* __restrict__ vb, const uint64_t* __restrict__ rings, const long long* __restrict__ starts,
++        const long long* __restrict__ froms, int layer, float scale, float* __restrict__ pm, float* __restrict__ pl,
++        float* __restrict__ pacc) {
++    using namespace dgmma;
++    constexpr int TQH = 64, GQA = TQH / KVH, TK = 32;
++    static_assert(GQA == 8 && BLOCK == 8, "a warp: 2 rows x 8 query heads");
++    __shared__ __align__(16) __nv_bfloat16 ks[TK * HD];
++    __shared__ __align__(16) __nv_bfloat16 vs[TK * HD];
++    __shared__ __align__(16) __nv_bfloat16 ps[4 * 16 * TK];
++    const int s = blockIdx.x, kh = blockIdx.y, c = blockIdx.z;
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, lq = lane & 3;
++    const long long start = starts[s], from = froms[s];
++    // key n of a row is position lo + n: the ring's below kbase, the block's rows from it (dg_attn_part's n_ctx split;
++    // a context starting past the block, from > start, puts every lo at from and every key in the block)
++    const long long kbase = from > start ? from : start;
++    long long gmin = LLONG_MAX, gmax = LLONG_MIN, my0[2] = {0, 0}, my1[2] = {0, 0};
++#pragma unroll
++    for (int j = 0; j < BLOCK; ++j) {
++        const long long p = start + j;
++        long long lo = p - (WIN - 1);
++        if (lo < from) lo = from;
++        if (lo < 0) lo = 0;
++        const long long n_ctx = start > lo ? start - lo : 0;
++        const long long T = n_ctx + BLOCK, L = (T + CH - 1) / CH;
++        const long long n0 = (long long)c * L, n1 = n0 + L < T ? n0 + L : T;
++        const long long g0 = n0 < n1 ? lo + n0 : 0, g1 = n0 < n1 ? lo + n1 : 0;  // empty: [0, 0)
++        if (n0 < n1) {
++            gmin = g0 < gmin ? g0 : gmin;
++            gmax = g1 > gmax ? g1 : gmax;
++        }
++        if (j >> 1 == warp) {
++            my0[j & 1] = g0;
++            my1[j & 1] = g1;
++        }
++    }
++    // the 64 queries (row j, head h at j * 8 + h) through ks and vs into each warp's registers
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const int idx = tid + i * 128, qrow = idx >> 4, u = idx & 15;
++        const int r = s * BLOCK + (qrow >> 3);
++        const uint4 v = __ldg(reinterpret_cast<const uint4*>(q + ((long long)r * TQH + kh * GQA + (qrow & 7)) * HD) + u);
++        *reinterpret_cast<uint4*>(qrow < 32 ? ks + at128(qrow, u) : vs + at128(qrow - 32, u)) = v;
++    }
++    __syncthreads();
++    uint32_t aq[8][4];
++    {
++        const __nv_bfloat16* qbase = warp < 2 ? ks + warp * 16 * HD : vs + (warp - 2) * 16 * HD;
++#pragma unroll
++        for (int kq = 0; kq < 8; ++kq) ldm4<false>(aq[kq], qbase + at128(lane & 15, kq * 2 + (lane >> 4)));
++    }
++    __syncthreads();
++    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
++    float o[16][4];
++#pragma unroll
++    for (int j = 0; j < 16; ++j)
++#pragma unroll
++        for (int e = 0; e < 4; ++e) o[j][e] = 0.f;
++    const __nv_bfloat16* K = ringK(rings[s], layer);
++    const __nv_bfloat16* V = ringV(rings[s], layer);
++    __nv_bfloat16* my_ps = ps + warp * 16 * TK;
++    for (long long gt = gmin; gt < gmax; gt += TK) {
++        const long long left = gmax - gt;
++        const int nkeys = left < TK ? (int)left : TK;
++        uint4 kr[4], vr[4];
++#pragma unroll
++        for (int u = 0; u < 4; ++u) {
++            const int idx = tid + u * 128, row = idx >> 4, vec = idx & 15;
++            kr[u] = vr[u] = make_uint4(0u, 0u, 0u, 0u);
++            if (row < nkeys) {
++                const long long gp = gt + row;
++                const __nv_bfloat16 *kp, *vp;
++                if (gp < kbase) {
++                    const long long slot = gp % WIN;
++                    kp = K + slot * KVW + kh * HD;
++                    vp = V + slot * KVW + kh * HD;
++                } else {
++                    const long long rb = (long long)s * BLOCK + (gp - kbase);
++                    kp = kb + rb * KVW + kh * HD;
++                    vp = vb + rb * KVW + kh * HD;
++                }
++                kr[u] = __ldg(reinterpret_cast<const uint4*>(kp) + vec);
++                vr[u] = __ldg(reinterpret_cast<const uint4*>(vp) + vec);
++            }
++        }
++#pragma unroll
++        for (int u = 0; u < 4; ++u) {
++            const int idx = tid + u * 128, row = idx >> 4, vec = idx & 15;
++            *reinterpret_cast<uint4*>(ks + at128(row, vec)) = kr[u];
++            *reinterpret_cast<uint4*>(vs + at128(row, vec)) = vr[u];
++        }
++        __syncthreads();
++        float sc[4][4];
++#pragma unroll
++        for (int nt = 0; nt < 4; ++nt)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) sc[nt][e] = 0.f;
++#pragma unroll
++        for (int kq = 0; kq < 8; ++kq) {
++            uint32_t b0[4], b1[4];
++            ldm4<false>(b0, ks + at128((lane >> 4) * 8 + (lane & 7), kq * 2 + ((lane >> 3) & 1)));
++            ldm4<false>(b1, ks + at128(16 + (lane >> 4) * 8 + (lane & 7), kq * 2 + ((lane >> 3) & 1)));
++            mma16816(sc[0], aq[kq], b0);
++            mma16816(sc[1], aq[kq], b0 + 2);
++            mma16816(sc[2], aq[kq], b1);
++            mma16816(sc[3], aq[kq], b1 + 2);
++        }
++        float alpha[2];
++#pragma unroll
++        for (int hf = 0; hf < 2; ++hf) {  // fragment rows g (hf 0: the warp's first block row) and g + 8 (its second)
++            float tmax = -INFINITY;
++#pragma unroll
++            for (int nt = 0; nt < 4; ++nt)
++#pragma unroll
++                for (int e = 0; e < 2; ++e) {
++                    const long long gp = gt + nt * 8 + lq * 2 + e;
++                    const float v = gp >= my0[hf] && gp < my1[hf] ? sc[nt][hf * 2 + e] * scale : -INFINITY;
++                    sc[nt][hf * 2 + e] = v;
++                    tmax = fmaxf(tmax, v);
++                }
++            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 2));
++            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
++            const bool active = tmax != -INFINITY;
++            const float nm = active ? fmaxf(m[hf], tmax) : m[hf];
++            alpha[hf] = active ? (m[hf] == -INFINITY ? 0.f : __expf(m[hf] - nm)) : 1.f;
++            float lsum = 0.f;
++#pragma unroll
++            for (int nt = 0; nt < 4; ++nt) {
++                const float p0 = active && sc[nt][hf * 2] != -INFINITY ? __expf(sc[nt][hf * 2] - nm) : 0.f;
++                const float p1 = active && sc[nt][hf * 2 + 1] != -INFINITY ? __expf(sc[nt][hf * 2 + 1] - nm) : 0.f;
++                lsum += p0 + p1;
++                const int col = nt * 8 + lq * 2;
++                *reinterpret_cast<__nv_bfloat162*>(my_ps + at32(hf * 8 + g, col >> 3) + (col & 7)) = __floats2bfloat162_rn(p0, p1);
++            }
++            lsum += __shfl_xor_sync(0xffffffffu, lsum, 2);
++            lsum += __shfl_xor_sync(0xffffffffu, lsum, 1);
++            l[hf] = l[hf] * alpha[hf] + lsum;
++            m[hf] = nm;
++        }
++        __syncwarp();
++#pragma unroll
++        for (int j = 0; j < 16; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) o[j][e] *= alpha[e >> 1];
++#pragma unroll
++        for (int k16 = 0; k16 < TK; k16 += 16) {
++            uint32_t pa[4];
++            ldm4<false>(pa, my_ps + at32(lane & 15, (k16 >> 3) + (lane >> 4)));
++#pragma unroll
++            for (int j = 0; j < 16; j += 2) {
++                uint32_t vf[4];
++                ldm4<true>(vf, vs + at128(k16 + (lane & 15), j + (lane >> 4)));
++                mma16816(o[j], pa, vf);
++                mma16816(o[j + 1], pa, vf + 2);
++            }
++        }
++        __syncthreads();
++    }
++    // dg_attn_part's layout: at = (r * TQH + kh * 8 + h) * CH + c; a chunk past the row's keys keeps m -inf, l 0
++#pragma unroll
++    for (int hf = 0; hf < 2; ++hf) {
++        const int r = s * BLOCK + 2 * warp + hf;
++        const long long at = ((long long)r * TQH + kh * GQA + g) * CH + c;
++        float* pa = pacc + at * HD;
++#pragma unroll
++        for (int j = 0; j < 16; ++j) {
++            pa[j * 8 + lq * 2] = o[j][hf * 2];
++            pa[j * 8 + lq * 2 + 1] = o[j][hf * 2 + 1];
++        }
++        if (lq == 0) {
++            pm[at] = m[hf];
++            pl[at] = l[hf];
++        }
++    }
++}
++
+ // The chunks' partials of row r, head h into o[r][h] (bf16). grid (R, QH), 128 threads (a thread a dim).
+ template <int TD, int TQH>
+ __device__ __forceinline__ void attn_merge_t(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
+diff --git a/zig/kernels/cuda/glm_glue.cu b/zig/kernels/cuda/glm_glue.cu
+index 46afecd23..6572f09ab 100644
+--- a/zig/kernels/cuda/glm_glue.cu
++++ b/zig/kernels/cuda/glm_glue.cu
+@@ -16,3 +16,4 @@
+ #include "glm_kvsplit_index.cuh"
+ #include "glm_glue_l2.cuh"
+ #include "glm_dsa_scores_rows.cuh"
++#include "glm_dec_split.cuh"
+diff --git a/zig/kernels/cuda/qmm_group.cu b/zig/kernels/cuda/qmm_group.cu
+index 3301d2ab6..6b6b10bfa 100644
+--- a/zig/kernels/cuda/qmm_group.cu
++++ b/zig/kernels/cuda/qmm_group.cu
+@@ -353,3 +353,7 @@ template __global__ void tf_qmm_group::group_kernel<64, 128, 64, 1, 4, 3, false,
+ // The 32-group instantiation (TF_GLM_DFLASH2_Q32): the drafter's linears at the reference engine's granularity.
+ template __global__ void tf_qmm_group::group_kernel<32, 16, 64, 1, 4, 8, false, false, false, false>(
+     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
++
++// The tile-2 form with fp32 out (F32): DFlash2's 4-bit down at TF_GLM_NEON_DF_DOWN=1, its split's partials summed later.
++template __global__ void tf_qmm_group::group_kernel<64, 16, 64, 1, 4, 8, true, false, false, false>(
++    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index 61e93a7b1..aeb2b86e8 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -287,7 +287,7 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
+     if (host_pos < l.dense_limit) {
+         const stamp = prof.span(k.prof, stream, .mla);
+         // msa: only the rows below the dense limit (the rest take their sparse lists next)
+-        if (msa) try msaDense(set, stream, l, c, v, pos, @min(rows, l.dense_limit - host_pos), scale) else try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
++        if (msa) try msaDense(set, stream, l, c, v, pos, @min(rows, l.dense_limit - host_pos), scale) else try denseAttention(k, stream, l, c, v, pos, host_pos, rows, nch, part_rows, scale);
+         stamp.end();
+     }
+     if (sparseRows(l, host_pos, rows)) {
+@@ -331,7 +331,7 @@ pub fn attendOnly(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scrat
+     const scale = attnScale(l);
+     if (host_pos < l.dense_limit) {
+         const stamp = prof.span(k.prof, stream, .mla);
+-        try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
++        try denseAttention(k, stream, l, c, v, pos, host_pos, rows, nch, part_rows, scale);
+         stamp.end();
+     }
+     if (sparseRows(l, host_pos, rows)) {
+@@ -355,7 +355,16 @@ fn latTable(l: Layer, c: Caches) latent.Table {
+ /// TF_GLM_MSA (default on; 0: the chunk kernels): a glm_moe_dsa prompt pass (64 rows or more, at most 16 heads, BF16
+ /// or E4M3 rows in order) attends through glm_glue_msa.cuh, one block a row, straight to the output (no partials, no merge).
+ fn msaRows(l: Layer, c: Caches, rows: usize) bool {
+-    if (l.rope == 0 or rows < 64 or l.heads > 16 or c.latPt() != 0) return false;
++    if (l.rope == 0 or rows < msa_min_rows or l.heads > msa_max_heads or c.latPt() != 0) return false;
++    return msaOn();
++}
++
++/// msaRows' row floor and head ceiling: a prompt call under msa_min_rows rows takes the chunk kernels and their partials.
++pub const msa_min_rows = 64;
++pub const msa_max_heads = 16;
++
++/// TF_GLM_MSA's switch alone (msaRows' last test): on unless set to "0".
++pub fn msaOn() bool {
+     const v = std.c.getenv("TF_GLM_MSA") orelse return true;
+     return !std.mem.eql(u8, std.mem.span(v), "0");
+ }
+@@ -523,7 +532,11 @@ pub fn attendSegs(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, t: *con
+ }
+ 
+ /// forward.dense_attention: latent.attention in `part_rows`-row blocks, each at its first row's position.
+-fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, pos: u64, rows: usize, nch: usize, part_rows: usize, scale: f32) !void {
++fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, pos: u64, host_pos: usize, rows: usize, nch: usize, part_rows: usize, scale: f32) !void {
++    // policy bit 31 (neon #3): a decode window past 64 keys on the split tiles (the chunk kernels' bytes); the select
++    // scores are free here (a window's select runs after its dense rows' attention, on this stream)
++    if (l.rope != 0 and !k.set.prompt and host_pos >= 64 and rows <= part_rows and c.latPt() == 0 and policy.on(k.set.policy, .dec_split))
++        if (try latent.denseSplit(k.set, stream, s.qa, c.lc, c.ls, pos, s.partials, s.ol, s.dummy, rows, l.heads, nch, scale, s.select.scores, s.select.scores_bytes)) return;
+     const hb = if (l.rope != 0) latent.heads_tile else latent.headBlock(rows); // the dsa rides 16-head blocks only (smem)
+     var r0: usize = 0;
+     while (r0 < rows) : (r0 += part_rows) {
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index f8c5be345..f6cc918b6 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -998,6 +998,7 @@ pub const Forward = struct {
+         const D: usize = c.hidden;
+         for (f.ranks, hidden) |r, h| {
+             if (r.w.mtp == null) return error.NoMtpHead;
++            if (r.b.mtp_dead) return error.NeonDeadBuffer; // TF_GLM_NEON_BUFS sized hin, me, mcat and mx out
+             if (n == 0 or n > r.b.rows) return error.BadWindow;
+             try r.st.readyMtp(f.stream, n);
+             try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 9bba266fe..1c948e716 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -126,6 +126,8 @@ pub const Kernels = struct {
+     chunks_16_w576_i8_skip: cuda.Function, // policy bit 26 (U5x): the dense chunks without their keyless tiles
+     chunks_16_w576_s4_i8: cuda.Function,
+     chunks_16_fused_w576_i8: cuda.Function,
++    dec_split_qk: cuda.Function, // policy bit 31 (neon #3): a dense decode window's tiles' scores (glm_dec_split.cuh)
++    dec_split_pv: cuda.Function, // and their P.V a 64-column block at a time, the chunk kernel's walk
+     router_fused: cuda.Function, // policy bit 14 (neon #13): a prompt's router slices summed in one launch (glm_glue_bmm.cuh)
+     dsa_scores_w8: cuda.Function, // policy bit 11 (neon #1): 8 warps a CTA, a prompt row a warp, 64-key blocks shared (glm_dsa_scores_rows.cuh)
+     dsa_scores_r8: cuda.Function, // policy bit 25 (U6.2): 8 prompt rows a CTA on shared key blocks (glm_dsa_scores_rows.cuh)
+diff --git a/zig/src/families/glm/cuda_kv8_test.zig b/zig/src/families/glm/cuda_kv8_test.zig
+index 878ecbd5c..70c497ebe 100644
+--- a/zig/src/families/glm/cuda_kv8_test.zig
++++ b/zig/src/families/glm/cuda_kv8_test.zig
+@@ -353,8 +353,8 @@ test "GLM FP8 KV: the glue resolves the paged symbols and opts their chunks into
+         // room for every glue kernel and opt-in (the integrated stack: 66 kernels, 17 opt-ins)
+         var names: [128][]const u8 = undefined;
+         var n: usize = 0;
+-        var set_on: [32]usize = undefined;
+-        var set_bytes: [32]c_int = undefined;
++        var set_on: [64]usize = undefined;
++        var set_bytes: [64]c_int = undefined;
+         var sets: usize = 0;
+         fn function(out: *cuda.abi.Function, _: cuda.abi.Module, name: [*:0]const u8) callconv(.c) c_int {
+             names[n] = std.mem.span(name);
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index aa941b3b9..a1b046afb 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -143,7 +143,10 @@ pub fn latentWrite(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usi
+ 
+ /// The chunk partials of one attention call: po fp32 [nch][rows][heads][lw], pm and pl fp32 [nch][rows][heads].
+ /// `rows`: the nch x rows they hold (0: unknown, every call fits); a sparse call past them merges in the kernel.
+-pub const Partials = struct { po: u64, pm: u64, pl: u64, rows: usize = 0 };
++/// `trimmed` (TF_GLM_NEON_BUFS=1, cuda_state.Buffers): a prompt buffer's partials sized for the chunk calls under
++/// dsa_block.msa_min_rows rows only; a call they would not hold fails (error.PartialsTrimmed) rather than fusing or
++/// overrunning them.
++pub const Partials = struct { po: u64, pm: u64, pl: u64, rows: usize = 0, trimmed: bool = false };
+ 
+ /// latent.attention: causal qa over the cache in `nch` 512-key chunks into out bf16; `dummy`: the merge's count i32.
+ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, t: Table, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
+@@ -155,10 +158,29 @@ pub fn attentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64,
+     try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
+ }
+ 
++/// Policy bit 31 (neon #3): a dense decode window of int8 dsa rows (16 heads, unpaged, at most 4 chunks) through
++/// tf_glm_dec_split_qk / _pv into p, then the merge: the chunk kernels' bytes (night/neon/gputest t6_dec.out).
++/// `scratch` (`bytes`): the tiles' scores and maxima, free for the call. False: not taken (nothing launched).
++pub fn denseSplit(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, nch: usize, scale: f32, scratch: u64, bytes: usize) !bool {
++    if (heads != heads_tile or nch == 0 or nch > 4 or scales == 0 or !int8() or scratch == 0) return false;
++    const tiles = nch * rows * 16;
++    const sc_bytes = tiles * heads_tile * 32 * 4;
++    if (sc_bytes + tiles * heads_tile * 4 > bytes) return false;
++    var a: cuda.Args = .{};
++    inline for (.{ qa, cache, scales, pos, scratch, scratch + sc_bytes, @as(c_int, @intCast(rows)), @as(c_int, @intCast(heads)), @as(c_int, @intCast(nch)), scale }) |v| a.add(v);
++    try cuda.launch.launch(set.glue.dec_split_qk, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(nch), .z = 16 }, .block = .{ .x = 128 } }, stream, &a);
++    var b: cuda.Args = .{};
++    inline for (.{ scratch, scratch + sc_bytes, cache, scales, pos, p.po, p.pm, p.pl, @as(c_int, @intCast(rows)), @as(c_int, @intCast(heads)) }) |v| b.add(v);
++    try cuda.launch.launch(set.glue.dec_split_pv, .{ .grid = .{ .x = @intCast(rows), .y = 8, .z = @intCast(nch) }, .block = .{ .x = 128 } }, stream, &b);
++    try merge(set, stream, p, out, dummy, rows, heads, glue.dsa_row, nch, false);
++    return true;
++}
++
+ /// latent._dense_chunks (sparse false: keys through pos + r) and _sparse_chunks (row r's `counts` tokens of `tokens`).
+ /// BF16 takes the table always (pt 0: in order); E4M3 on pages its _paged kernels, the window's arguments then the table.
+ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
+     if (lw != 512 and lw != glue.dsa_row) return error.LatentShape;
++    if (p.trimmed and nch * rows > p.rows) return error.PartialsTrimmed; // TF_GLM_NEON_BUFS: the proof failed
+     const kv8 = scales != 0;
+     if (lw == glue.dsa_row and t.pt != 0) return error.LatentShape; // the dsa's rows (BF16 or E4M3) are unpaged
+     if (lw == glue.dsa_row and hb != heads_tile) return error.DsaHeadBlock; // its 32-head block's 113 KB passes no GB10
+@@ -191,6 +213,7 @@ pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64,
+ pub fn sparseAttentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
+     const nch = chunksFor(w);
+     const hb = if (lw == glue.dsa_row) heads_tile else headBlock(rows); // the dsa rides 16-head blocks only (smem)
++    if (p.trimmed and fuses(p, nch, rows)) return error.PartialsTrimmed; // TF_GLM_NEON_BUFS: the proof failed
+     if (fuses(p, nch, rows)) return fused(set, stream, qa, cache, scales, t, tokens, counts, w, out, rows, heads, lw, nch, scale, hb);
+     try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, hb, true);
+     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
+diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.zig
+index 4eb1f4961..6992f34fc 100644
+--- a/zig/src/families/glm/cuda_moe.zig
++++ b/zig/src/families/glm/cuda_moe.zig
+@@ -32,6 +32,7 @@ pub const Scratch = struct {
+     wts: u64, // fp32 [rows][top_k + 1]
+     plan: cuda.grouped.Plan,
+     eact: u64, // bf16 [rows (top_k + 1)][width]
++    eact_dead: bool = false, // TF_GLM_NEON_BUFS: a 4-byte stand-in (every MoE layer EXL3, whose path never reads it)
+     ey: u64, // [rows][top_k + 1][dims]: fp32, bf16 in a prompt chunk
+     sgu: u64, // bf16 [rows][2 shared]
+     sact: u64, // bf16 [rows][shared]
+@@ -169,6 +170,7 @@ fn bodyWith(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
+         return exl3.runFused(k.exl3, k.experts, stream, w, s.x3, s.plan, x, x_stride, s.pick, slots, rows, l.count, d, l.routed.width, l.routed.limit, prompt, s.ey, s.eact, fuse);
+     }
+     if (fuse != null) return error.BadFill;
++    if (s.eact_dead) return error.NeonDeadBuffer; // TF_GLM_NEON_BUFS sized eact out: this layer is not EXL3
+     const plan: experts.Plan = .{ .route = s.plan, .slots = slots, .experts = l.count + 1, .prompt = prompt };
+     try experts.route(k.experts, stream, s.pick, rows * slots, plan);
+     try experts.run(k.experts, stream, .gate_up, l.routed, plan, x, x_stride, rows, s.eact, shared_id);
+diff --git a/zig/src/families/glm/cuda_mtp_load_test.zig b/zig/src/families/glm/cuda_mtp_load_test.zig
+index 95185fb35..3ae0a4f9d 100644
+--- a/zig/src/families/glm/cuda_mtp_load_test.zig
++++ b/zig/src/families/glm/cuda_mtp_load_test.zig
+@@ -93,7 +93,7 @@ test "MTP widened head and quantizer scratch drain before free on launch, wait,
+         var d = Fake.driver();
+         const f: cuda.Function = .{ .d = &d, .handle = null };
+         const qk: quant.Kernels = .{ .amax = f, .nvfp4 = f, .q4 = f, .q4g32 = f };
+-        const tk: q4.Kernels = .{ .group = f, .group32 = f, .pack_dense = f, .pack_dense32 = f, .transpose = f, .gb10 = false };
++        const tk: q4.Kernels = .{ .group = f, .group32 = f, .group_f32 = f, .pack_dense = f, .pack_dense32 = f, .transpose = f, .gb10 = false };
+         var fail = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 1 });
+         const allocator = if (phase == 3) fail.allocator() else gpa;
+         var share: @import("cuda_shard.zig").Share = undefined;
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index cc2871476..a5dcce65e 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -563,7 +563,11 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+     b.offered |= policy.bit(.router_fused); // 14 (neon #13): tf_glm_router_fused
+     b.offered |= policy.bit(.exl3_uo); // 28 (neon #11): falls back to the unchanged forms where the kernels are absent
+     if (b.offered & policy.bit(.l2pf_v2) != 0) b.offered |= policy.bit(.l2pf_v3); // 29 (neon #5): with bit 16's table
++    b.offered |= policy.bit(.dec_split); // 31 (neon #3): tf_glm_dec_split_qk / _pv
+     b.offered |= policy.bit(.scores_w8); // 11 (neon #1): tf_glm_dsa_scores_w8 (with bit 24)
++    if (e.drafter) |dr| if (dr.spark == null and dr.k.attn_mma != null) {
++        b.offered |= policy.bit(.dg_mma); // 30 (neon N3 #1): DFlash2 at the full shape loaded dg_attn_part_mma
++    };
+     std.log.info("request policies on (TF_GLM_POLICY_REQUESTS=1): default 0x{x}, offered 0x{x}", .{ b.default & b.offered, b.offered });
+     return b;
+ }
+diff --git a/zig/src/families/glm/cuda_q4.zig b/zig/src/families/glm/cuda_q4.zig
+index 35bcd88e1..c8cac2f6c 100644
+--- a/zig/src/families/glm/cuda_q4.zig
++++ b/zig/src/families/glm/cuda_q4.zig
+@@ -7,6 +7,9 @@ const cuda = @import("cuda");
+ const group_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+ const group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM
+ 
++/// The same tile-2 form with fp32 out (F32 true): DFlash2's 4-bit down (TF_GLM_NEON_DF_DOWN=1), same shared memory.
++const group_f32_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
++
+ /// The 32-group instantiation (TF_GLM_DFLASH2_Q32): the same template at GS 32, the tiles 64 rows x 32 cols.
+ const group32_symbol = "_ZN12tf_qmm_group12group_kernelILi32ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+ const group32_smem: u32 = 18944; // LaneTile<32, 16, 64, 1, 4, 8>::SMEM
+@@ -25,6 +28,7 @@ pub const Q4 = struct { w: u64, s: u64, b: u64, n: usize, k: usize, npad: usize
+ pub const Kernels = struct {
+     group: cuda.Function,
+     group32: cuda.Function,
++    group_f32: cuda.Function,
+     pack_dense: cuda.Function,
+     pack_dense32: cuda.Function,
+     transpose: cuda.Function,
+@@ -35,6 +39,7 @@ pub const Kernels = struct {
+         const k: Kernels = .{
+             .group = try group.function(group_symbol),
+             .group32 = try group.function(group32_symbol),
++            .group_f32 = try group.function(group_f32_symbol),
+             .pack_dense = try ops.function("tf_pack_dense"),
+             .pack_dense32 = try ops.function("tf_pack_dense_g32"),
+             .transpose = try ops.function("tf_transpose_pad16"),
+@@ -42,6 +47,7 @@ pub const Kernels = struct {
+         };
+         try k.group.allowDynamicShared(group_smem);
+         try k.group32.allowDynamicShared(group32_smem);
++        try k.group_f32.allowDynamicShared(group_smem);
+         return k;
+     }
+ };
+@@ -140,6 +146,11 @@ pub fn matmulG32(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs
+ 
+ /// qmm.matmul of a Q4 (tile 2, up to 16 rows): x bf16 (`ldx` apart), group sums xs fp32 [rows][k/64] -> out bf16.
+ pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
++    return matmulTo(ks, stream, x, ldx, xs, q, out, rows, false);
++}
++
++/// matmul, out fp32 when `wide` (the F32 instantiation: the same tiles, K slices and sums, stored unrounded).
++pub fn matmulTo(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize, wide: bool) !void {
+     if (rows == 0 or rows > 16) return error.WindowTooWide;
+     const sk = splitK(q.n, q.k);
+     const tiles = (q.n + 63) / 64;
+@@ -160,7 +171,7 @@ pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u
+         .cluster = if (sk > 1) .{ .x = @intCast(sk) } else null,
+         .pdl = ks.gb10,
+     };
+-    try cuda.launch.launch(ks.group, cfg, stream, &a);
++    try cuda.launch.launch(if (wide) ks.group_f32 else ks.group, cfg, stream, &a);
+ }
+ 
+ test "the draft head's shape takes one K slice; npad rounds to 128s" {
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index bf0a3eed7..725e0b4bc 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -443,7 +443,7 @@ pub fn headScale(heads: usize) f32 {
+ /// `ls` also holds a decode select's bit words (bitsBytes) for up to `bits_rows` rows; 0: none (the wide select).
+ /// `qr`: a decode window's roped index queries (bf16 [rows][heads][d], policy bit 2 rope_hoist; 0: none, no hoist).
+ /// `cand`: the ranks' scan candidates (policy bit 10: world x candBytes(cand_rows)); 0: none, no split scan.
+-pub const Scratch = struct { scores: u64, ls: u64, li: u64, pools: u64, at: u64, bits_rows: usize = 0, qr: u64 = 0, cand: u64 = 0, cand_rows: usize = 0 };
++pub const Scratch = struct { scores: u64, ls: u64, li: u64, pools: u64, at: u64, bits_rows: usize = 0, qr: u64 = 0, cand: u64 = 0, cand_rows: usize = 0, scores_bytes: usize = 0 }; // scores_bytes: its size (neon bit 31 borrows it)
+ 
+ /// A prompt chunk's indexer rows split across the ranks (TF_GLM_INDEX_SPLIT): a block each, the picks all-gathered.
+ pub const Split = struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize };
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 7a68d1621..0e6c5d4cb 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -43,9 +43,7 @@ const Arena = struct {
+ 
+ /// Allocates `sizes` (bytes) in one zeroed device buffer and hands out each field's address in order.
+ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
+-    var total: usize = 0;
+-    for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
+-    const bytes = @max(total, 256);
++    const bytes = @max(arenaBytes(sizes), 256);
+     var a: Arena = .{ .buf = try @import("cuda_start_floor.zig").alloc(d, bytes) };
+     errdefer a.buf.free();
+     try a.buf.fill8(0, null);
+@@ -53,6 +51,25 @@ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
+     return a;
+ }
+ 
++/// The bytes `arena` takes for `sizes` (each 256-byte aligned).
++fn arenaBytes(sizes: []const usize) usize {
++    var total: usize = 0;
++    for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
++    return total;
++}
++
++/// TF_GLM_NEON_BUFS=1 (neon #10; boot-time, off by default): a prompt buffer leaves out the scratch its configuration
++/// never reads (Buffers.trimsFor says which, and why); off, every Buffers is as before, byte for byte.
++pub fn neonBufs() bool {
++    const S = struct {
++        var once: ?bool = null;
++    };
++    if (S.once) |v| return v;
++    const v = if (std.c.getenv("TF_GLM_NEON_BUFS")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
++    S.once = v;
++    return v;
++}
++
+ /// TF_GLM_KV_SPLIT: the ranks a sequence's latent rows are split over (cuda_kv_split; 1: every row on every rank).
+ /// Set once at engine start, before the first sequence; every State made after holds ceil(capacity / n) + 1 rows.
+ pub var lat_split: usize = 1;
+@@ -231,6 +248,51 @@ test "GLM TP3: existing scratch covers raw projections through the 127-row split
+     }
+ }
+ 
++test "GLM neon bufs: TF_GLM_NEON_BUFS trims a GLM-5.3 TP4 prompt buffer only, by the dead fields' bytes" {
++    var c = @import("config.zig").dsaWant();
++    c.exl3 = true; // the live checkpoint's EXL3 experts (128-column expert shares)
++    const Share = @import("cuda_shard.zig").Share;
++    const capacity = 196_608;
++    const changed = [_]usize{ 31, 32, 33, 56, 66, 67, 68, 69 }; // po, pm, pl, eact, hin, me, mcat, mx
++    for (0..4) |rank| {
++        // no layers and no MTP layer: every MoE layer is (vacuously) EXL3, no MTP head (DFlash2 borrows the draft head)
++        const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try Share.of(&c, rank, 4) };
++        try std.testing.expectEqual(Buffers.Trims{}, Buffers.trimsFor(&w, true, false, false));
++        const trims = Buffers.trimsFor(&w, true, false, true);
++        try std.testing.expectEqual(Buffers.Trims{ .partials = dsa_block.msaOn(), .mtp = true, .eact = true }, trims);
++        if (!trims.partials) return error.SkipZigTest; // TF_GLM_MSA=0 in the test's environment
++        const off = Buffers.plan(&w, prefill_rows, true, capacity, prefill_rows, false, .{});
++        const on = Buffers.plan(&w, prefill_rows, true, capacity, prefill_rows, false, trims);
++        try std.testing.expectEqual(@as(usize, 13 * 512), off.partial_rows);
++        try std.testing.expectEqual(@as(usize, 16 * 63), on.partial_rows);
++        for (off.sizes, on.sizes, 0..) |a, b, i| {
++            if (std.mem.indexOfScalar(usize, &changed, i) != null) try std.testing.expect(b < a) else try std.testing.expectEqual(a, b);
++        }
++        // every chunk-kernel call under 64 rows still fits (dense at nch chunks a row, sparseDsaSplit 16, 512-key 4):
++        // the same launches as before; a 64-row chunk call (no MSA) would not, and is refused
++        const p: latent.Partials = .{ .po = 1, .pm = 2, .pl = 3, .rows = on.partial_rows, .trimmed = true };
++        for (1..dsa_block.msa_min_rows) |n| {
++            try std.testing.expect(on.nch * n <= on.partial_rows and 16 * n <= on.partial_rows);
++            try std.testing.expect(!latent.fuses(p, latent.chunksFor(sparse.dsa_width), n));
++        }
++        try std.testing.expect(16 * dsa_block.msa_min_rows > on.partial_rows);
++        const HL = w.share.mla.len();
++        const pairs = prefill_rows * (c.topk + 1);
++        const D: usize = c.hidden;
++        const dead = (off.partial_rows - on.partial_rows) * HL * (c.kv_lora + 2) * 4 + (pairs * w.share.moe.len() * 2 - 256) + (5 * prefill_rows * D * 2 - 4 * 256);
++        try std.testing.expectEqual(dead, arenaBytes(&off.sizes) - arenaBytes(&on.sizes));
++        try std.testing.expectEqual(@as(usize, 475_202_304), dead); // 453.2 MiB a rank
++        // decode and shared windows: never trimmed, the same sizes
++        for ([_]struct { rows: usize, seg: usize, shared: bool }{ .{ .rows = window_rows, .seg = window_rows, .shared = false }, .{ .rows = 32, .seg = window_rows, .shared = true } }) |k| {
++            try std.testing.expectEqual(Buffers.Trims{}, Buffers.trimsFor(&w, false, k.shared, true));
++            const d0 = Buffers.plan(&w, k.rows, false, capacity, k.seg, k.shared, .{});
++            const d1 = Buffers.plan(&w, k.rows, false, capacity, k.seg, k.shared, Buffers.trimsFor(&w, false, k.shared, true));
++            try std.testing.expectEqualSlices(usize, &d0.sizes, &d1.sizes);
++        }
++        try std.testing.expectEqual(Buffers.Trims{}, Buffers.trimsFor(&w, true, true, true));
++    }
++}
++
+ /// Scratch for windows of up to `rows` rows (the Python family's Buffers): a prompt buffer (`prefill`) or a decode's.
+ pub const Buffers = struct {
+     arena: Arena,
+@@ -262,6 +324,7 @@ pub const Buffers = struct {
+     mcat: u64, // bf16 [rows][2 dims]: [enorm(me) | hnorm(hin)]
+     mx: u64, // bf16 [rows][dims]: its stream
+     part: u64, // fp32 [rows][dims]: this rank's partial rows a split exchange sends from
++    mtp_dead: bool = false, // TF_GLM_NEON_BUFS: hin, me, mcat and mx are 4-byte stand-ins (no MTP layer loaded)
+ 
+     pub fn init(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize) !Buffers {
+         return make(d, w, rows, prefill, capacity, rows, false, null);
+@@ -299,9 +362,43 @@ pub const Buffers = struct {
+         return if (prefill or !dsa or world < 2) 0 else @min(seg, sparse.swift_rows);
+     }
+ 
++    /// TF_GLM_NEON_BUFS' cuts on one Buffers (all false: as before). Each holds only where its proof does:
++    /// - partials: on glm_moe_dsa at most msa_max_heads heads a rank with TF_GLM_MSA on, a prompt call of
++    ///   msa_min_rows rows or more attends through the MSA kernels (dsa_block.msaRows; the dsa's latent rows are never
++    ///   paged, latent.chunks refuses them), which take no partials. Only a call under msa_min_rows rows (a prompt's
++    ///   tail chunk, a short prompt) takes the chunk kernels: dense at most nch chunks a row, sparse 16 (sparseDsaSplit)
++    ///   or 4 (512-key chunks) a row. The partials keep that many rows; latent.chunks and sparseAttentionFormat refuse
++    ///   any call past them (error.PartialsTrimmed) instead of overrunning or fusing.
++    /// - mtp: with no MTP layer loaded (DFlash2 borrows only the draft head) Forward.mtp, the only reader of hin, me,
++    ///   mcat and mx, refuses first (error.NoMtpHead).
++    /// - eact: when every MoE layer (and the MTP layer's, if loaded) holds EXL3 experts, moe's only eact readers are
++    ///   the non-EXL3 experts.run calls; exl3.runFused discards it. moe refuses a non-EXL3 layer (error.NeonDeadBuffer).
++    /// Decode and shared buffers never change (`prefill` false or `shared`).
++    pub const Trims = struct { partials: bool = false, mtp: bool = false, eact: bool = false };
++
++    fn trimsFor(w: *const weights.Weights, prefill: bool, shared: bool, on: bool) Trims {
++        if (!on or !prefill or shared) return .{};
++        const c = &w.config;
++        var eact = true;
++        for (w.layers) |l| if (l.ffn == .moe) {
++            eact = eact and l.ffn.moe.exl3 != null;
++        };
++        if (w.mtp) |m| eact = eact and (m.layer.ffn != .moe or m.layer.ffn.moe.exl3 != null);
++        return .{ .partials = c.dsa and w.share.mla.len() <= dsa_block.msa_max_heads and dsa_block.msaOn(), .mtp = w.mtp == null, .eact = eact };
++    }
++
++    /// make's sizes and the shapes it records, for `trims`.
++    const Plan = struct { sizes: [twin_checked]usize, part_rows: usize, nch: usize, part_chunks: usize, partial_rows: usize, mm: usize, shared_decode: bool };
++
++    /// The partial rows a trimmed prompt buffer keeps: every chunk-kernel call under msa_min_rows rows, dense
++    /// (nch chunks a row) or sparse (sparseDsaSplit's 16, or 4 512-key chunks, a row).
++    fn trimmedPartialRows(nch: usize) usize {
++        return @max(nch, 4 * latent.chunksFor(sparse.dsa_width)) * (dsa_block.msa_min_rows - 1);
++    }
++
+     /// `seg`: the most rows one stream's attention takes (a decode window's rows, or a shared window's segment);
+     /// `shared`: a shared window's scratch, said outright (a segment as wide as the window no longer tells it apart).
+-    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, shared: bool, twin: ?Twin) !Buffers {
++    fn plan(w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, shared: bool, trims: Trims) Plan {
+         const c = &w.config;
+         const s = &w.share;
+         const D: usize = c.hidden;
+@@ -327,7 +424,8 @@ pub const Buffers = struct {
+         // row it can take, so every window (1 row or a verify window) attends in the same 128-key chunks; without it a
+         // window past 5 x seg / 16 rows fell back to 512-key chunks: other merge boundaries, other bits than 1 row's
+         const split_all = if (!prefill and latent.ksplitAll()) 4 * latent.chunksFor(2048) * @max(rows, seg) else 0;
+-        const partial_rows = if (prefill) nch * part_rows else if (shared_decode) @max(part_chunks * rows, split_all) else @max(nch * part_rows, latent.chunksFor(sparse.width) * seg, split_all);
++        const full_rows = if (prefill) nch * part_rows else if (shared_decode) @max(part_chunks * rows, split_all) else @max(nch * part_rows, latent.chunksFor(sparse.width) * seg, split_all);
++        const partial_rows = if (trims.partials) @min(full_rows, trimmedPartialRows(nch)) else full_rows;
+         // a Flash select's scores are one fp32 a pool; glm_moe_dsa's dsa_scores writes one a visible key
+         const np_max = if (c.dsa) capacity else capacity / sparse.pool;
+         var mm: usize = 4;
+@@ -372,18 +470,31 @@ pub const Buffers = struct {
+             rows * count * 4, pairs * 4, pairs * 4, pairs * 4, // mlog, pick, wts, members
+             experts.maxItems(pairs, count + 1, experts.tile) * 3 * 4, // items (the decode tile's count bounds the prompt's)
+             8,              @max(1, pairs) * 4, hist_len * 4, // counts, rank, hist
+-            pairs * ew * 2, pairs * D * @as(usize, if (prefill and @import("cuda_exl3.zig").eySmall()) 2 else 4), rows * 2 * sh * 2, // eact, ey (U3e: bf16 prompt slot rows), sgu
++            if (trims.eact) 4 else pairs * ew * 2, pairs * D * @as(usize, if (prefill and @import("cuda_exl3.zig").eySmall()) 2 else 4), rows * 2 * sh * 2, // eact, ey (U3e: bf16 prompt slot rows), sgu
+             rows * sh * 2,
+             rows * (sh / 64) * 4, rows * D * 4, // sxs, sy
+             rows * D * 2,         rows * D * 2,
+             rows * (D / 64) * 4,  (if (prefill) prompt_heads else rows) * s.vocab.len() * 2,
+-            rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, // hin, me, mcat, mx
++            if (trims.mtp) 4 else rows * D * 2, if (trims.mtp) 4 else rows * D * 2, if (trims.mtp) 4 else rows * 2 * D * 2, if (trims.mtp) 4 else rows * D * 2, // hin, me, mcat, mx
+             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
+             x3[0], x3[1], x3[2], x3[3], // EXL3 experts: 8-slot picks, rotated inputs, a decode window's partials
+             if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // a split KDA stack's part rows
+             if (!c.dsa) 4 else if (prefill) @min(rows, sparse.select_rows) * c.i_heads * c.i_dim * 2 else rows * c.i_heads * c.i_dim * 2, // roped index queries: a decode window's (TF_GLM_DSA_ROPE_HOIST), a prompt select block's (policy bit 24)
+             if (scanRows(prefill, c.dsa, s.world, seg) == 0) 4 else s.world * sparse.candBytes(scanRows(prefill, c.dsa, s.world, seg)), // the ranks' scan candidates (policy bit 10)
+         };
++        return .{ .sizes = sizes, .part_rows = part_rows, .nch = nch, .part_chunks = part_chunks, .partial_rows = partial_rows, .mm = mm, .shared_decode = shared_decode };
++    }
++
++    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, shared: bool, twin: ?Twin) !Buffers {
++        const c = &w.config;
++        const s = &w.share;
++        const trims = trimsFor(w, prefill, shared, neonBufs());
++        if (trims.partials or trims.mtp or trims.eact) std.log.info("TF_GLM_NEON_BUFS=1: a prompt buffer without{s}{s}{s}", .{ if (trims.partials) " most dsa partials" else "", if (trims.mtp) " the MTP scratch" else "", if (trims.eact) " eact" else "" });
++        const pl = plan(w, rows, prefill, capacity, seg, shared, trims);
++        const sizes = pl.sizes;
++        const part_rows = pl.part_rows;
++        const nch = pl.nch;
++        const partial_rows = pl.partial_rows;
+         var held = sizes;
+         if (twin) |tw| for (&held, 0..) |*bytes, i| { // a twin allocates its own rows only
+             if (!twinHolds(i, tw.own_room)) bytes.* = 0;
+@@ -396,7 +507,7 @@ pub const Buffers = struct {
+             .prefill = prefill,
+             .part_rows = part_rows,
+             .nch = nch,
+-            .part_chunks = if (shared_decode) part_chunks else 0,
++            .part_chunks = if (pl.shared_decode) pl.part_chunks else 0,
+             .ids = p[twin_at.ids],
+             .x = p[twin_at.x],
+             .normed = p[twin_at.normed],
+@@ -421,17 +532,17 @@ pub const Buffers = struct {
+                 .ol = p[28],
+                 .vn = p[29],
+                 .qi = p[30],
+-                .partials = .{ .po = p[31], .pm = p[32], .pl = p[33], .rows = partial_rows },
++                .partials = .{ .po = p[31], .pm = p[32], .pl = p[33], .rows = partial_rows, .trimmed = trims.partials },
+                 .dummy = p[34],
+-                .select = .{ .scores = p[35], .ls = p[36], .li = p[37], .pools = p[38], .at = p[39], .bits_rows = if (prefill) 0 else @min(seg, sparse.wide_rows), .qr = if (!c.dsa) 0 else p[76], .cand = if (scanRows(prefill, c.dsa, s.world, seg) == 0) 0 else p[77], .cand_rows = scanRows(prefill, c.dsa, s.world, seg) },
++                .select = .{ .scores = p[35], .ls = p[36], .li = p[37], .pools = p[38], .at = p[39], .bits_rows = if (prefill) 0 else @min(seg, sparse.wide_rows), .qr = if (!c.dsa) 0 else p[76], .cand = if (scanRows(prefill, c.dsa, s.world, seg) == 0) 0 else p[77], .cand_rows = scanRows(prefill, c.dsa, s.world, seg), .scores_bytes = held[35] },
+                 .tokens = p[40],
+                 .counts = p[41],
+                 .mm_part = p[42],
+                 .at = p[43],
+-                .mm_part_bytes = mm,
++                .mm_part_bytes = pl.mm,
+             },
+             .dense = .{ .tmp = p[44], .gu = p[45], .act = p[46], .xs_act = p[47], .mm_part = p[42] },
+-            .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42] },
++            .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .eact_dead = trims.eact, .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42] },
+             .hidden = p[twin_at.hidden],
+             .fnormed = p[twin_at.fnormed],
+             .fxs = p[twin_at.fxs],
+@@ -441,6 +552,7 @@ pub const Buffers = struct {
+             .mcat = p[68],
+             .mx = p[69],
+             .part = p[twin_at.part],
++            .mtp_dead = trims.mtp,
+         };
+         out.moe.x3 = .{ .picks = p[71], .xg = p[72], .xu = p[73], .z = p[74] };
+         out.kda.tmp = p[75];
+diff --git a/zig/src/families/glm/dflash.zig b/zig/src/families/glm/dflash.zig
+index 99a030b59..0d36023b9 100644
+--- a/zig/src/families/glm/dflash.zig
++++ b/zig/src/families/glm/dflash.zig
+@@ -109,6 +109,7 @@ pub const Kernels = struct {
+     top16_merge: cuda.Function,
+     gsum: cuda.Function,
+     gsum32: cuda.Function, // the 32-group sums (TF_GLM_DFLASH2_Q32's linears)
++    attn_mma: ?cuda.Function = null, // policy bit 30: dg_attn_part on tensor cores (the full shape only)
+ 
+     /// The kernels at `s`: the width-dependent ones (block_qkv, conv, attn_part, attn_merge, sumn) are dg_* at the
+     /// full shape (glm_dflash.cu's templates at D 6144, 64 query heads), df_* otherwise.
+@@ -118,10 +119,12 @@ pub const Kernels = struct {
+     pub fn loadAt(m: cuda.Module, wide: bool) !Kernels {
+         var k: Kernels = undefined;
+         inline for (@typeInfo(Kernels).@"struct".field_names) |n| {
++            if (comptime std.mem.eql(u8, n, "attn_mma")) continue;
+             const g = comptime std.mem.eql(u8, n, "block_qkv") or std.mem.eql(u8, n, "conv") or std.mem.eql(u8, n, "attn_part") or
+                 std.mem.eql(u8, n, "attn_merge") or std.mem.eql(u8, n, "sumn");
+             @field(k, n) = try m.function(if (g and wide) "dg_" ++ n else "df_" ++ n);
+         }
++        k.attn_mma = if (wide) try m.function("dg_attn_part_mma") else null;
+         return k;
+     }
+ };
+@@ -130,8 +133,9 @@ pub const Kernels = struct {
+ /// (TF_GLM_DFLASH2_Q32: the reference engine's granularity), or bf16 tiled for glm_mm.
+ pub const Lin = union(enum) { q4: q4.Q4, q4g32: q4.Q4, bf16: mm.Tiled };
+ 
+-/// down and the selector's projection stay bf16 (their fp32 outputs are gathered or read on the host).
+-pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: mm.Tiled, a_proj: Lin, m_proj: Lin };
++/// down and the selector's projection stay bf16 (their fp32 outputs are gathered or read on the host); down at 4 bits
++/// with TF_GLM_NEON_DF_DOWN=1 (neon N3 #2: the 4-bit kernel's fp32-out form for the split's partials).
++pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: Lin, a_proj: Lin, m_proj: Lin };
+ 
+ /// A ring's `first` before any row of its sequence is in it.
+ pub const no_rows: i64 = std.math.maxInt(i64);
+@@ -165,6 +169,7 @@ pub const Drafter = struct {
+     layers: [MAX_LAYERS]LayerW = undefined, // the first shape.layers
+     shape: Shape = flash,
+     fc: Lin = undefined,
++    fc_cols: usize = 0, // TF_GLM_NEON_DF_FC=1 (neon N3 #3): this rank's fc output columns (D / world), gathered; 0: whole
+     hproj: mm.Tiled = undefined,
+     hnorm: u64 = 0,
+     norm: u64 = 0,
+diff --git a/zig/src/families/glm/dflash_block.zig b/zig/src/families/glm/dflash_block.zig
+index 80ce6ec9f..1fa1b07c6 100644
+--- a/zig/src/families/glm/dflash_block.zig
++++ b/zig/src/families/glm/dflash_block.zig
+@@ -16,7 +16,8 @@ fn set(e: anytype) glue.Set {
+     return .{ .glue = &e.m.glue, .mm = &e.m.mm };
+ }
+ 
+-/// out[m, n] = x[m, k] . w^T, bf16 out (`wide`: fp32, glm_mm only): 4 bits 16 rows a launch, or glm_mm.
++/// out[m, n] = x[m, k] . w^T, bf16 out (`wide`: fp32; at 4 bits the 64-group kernel's fp32 form, TF_GLM_NEON_DF_DOWN's
++/// down): 4 bits 16 rows a launch, or glm_mm.
+ fn lin(dr: *const Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize, wide: bool) !void {
+     switch (w) {
+         .bf16 => |t| try mm.matmul(&e.m.mm, e.stream, x, t.k, t, out, dr.part, m, wide, false),
+@@ -35,7 +36,6 @@ fn lin(dr: *const Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize, wi
+             }
+         },
+         .q4 => |q| {
+-            if (wide) return error.WideFromFourBits;
+             var a: cuda.Args = .{};
+             a.add(x);
+             a.add(@as(i32, @intCast(q.k)));
+@@ -45,7 +45,8 @@ fn lin(dr: *const Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize, wi
+             var r0: usize = 0;
+             while (r0 < m) : (r0 += 16) {
+                 const rows = @min(16, m - r0);
+-                try q4.matmul(&e.m.q4, e.stream, x + r0 * q.k * 2, q.k, dr.gs + r0 * (q.k / 64) * 4, q, out + r0 * q.n * 2, rows);
++                const ob: usize = if (wide) 4 else 2;
++                try q4.matmulTo(&e.m.q4, e.stream, x + r0 * q.k * 2, q.k, dr.gs + r0 * (q.k / 64) * 4, q, out + r0 * q.n * ob, rows, wide);
+             }
+         },
+     }
+@@ -101,7 +102,15 @@ pub fn embed(e: anytype, ids: u64, out: u64, tmp: u64, M: usize, d: usize) !void
+ /// `N` context rows (cin, cpos, crings uploaded) through fc, the hidden norm and each layer's k, v into the rings.
+ pub fn ingestPass(dr: *Drafter, e: anytype, N: usize) !void {
+     const D = dr.shape.d;
+-    try lin(dr, e, dr.cin, dr.fc, dr.c1, N, false);
++    if (dr.fc_cols != 0) { // TF_GLM_NEON_DF_FC=1: this rank's columns into its block of ctx, every rank's gathered, unblocked
++        const cw = dr.fc_cols;
++        const bytes = N * cw * 2;
++        try lin(dr, e, dr.cin, dr.fc, dr.ctx + e.share.rank * bytes, N, false);
++        try gather(e, dr.ctx, bytes);
++        var u: cuda.Args = .{};
++        inline for (.{ dr.ctx, dr.c1, @as(c_int, @intCast(N)), @as(c_int, @intCast(cw)), @as(c_int, @intCast(D)), @as(i64, @intCast(D)) }) |v| u.add(v);
++        try go(e.m.glue.unblock, .{ .x = @intCast(N) }, 256, e, &u);
++    } else try lin(dr, e, dr.cin, dr.fc, dr.c1, N, false);
+     try glue.rmsnorm(set(e), e.stream, dr.c1, D, dr.hnorm, dr.ctx, D, null, df.EPS, N, D);
+     for (dr.layers[0..dr.shape.layers], 0..) |l, li| {
+         try lin(dr, e, dr.ctx, l.kv, dr.ckv, N, false);
+@@ -159,7 +168,14 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+             a.add(@as(i32, @intCast(li)));
+             a.add(df.SCALE);
+             for ([_]u64{ dr.pm, dr.pl, dr.pacc }) |p| a.add(p);
+-            try go(dr.k.attn_part, .{ .x = @intCast(S), .y = 8, .z = df.CH }, 256, e, &a);
++            // policy bit 30 (neon N3 #1): the tensor-core partials, same layout for attn_merge (drafts only); with fewer
++            // than 256 context keys in every stream the scalar kernel is the faster one (0.19 vs 0.14 ms / 6 layers at 5)
++            var long = false;
++            for (dr.h_starts[0..S], dr.h_froms[0..S]) |st, fr| long = long or st - @max(fr, 0) >= 256;
++            const mma: ?cuda.Function = if (long and @import("policy.zig").on(e.cur.policy, .dg_mma)) dr.k.attn_mma else null;
++            if (mma) |f| {
++                try go(f, .{ .x = @intCast(S), .y = 8, .z = df.CH }, 128, e, &a);
++            } else try go(dr.k.attn_part, .{ .x = @intCast(S), .y = 8, .z = df.CH }, 256, e, &a);
+             var b: cuda.Args = .{};
+             for ([_]u64{ dr.pm, dr.pl, dr.pacc, dr.att }) |p| b.add(p);
+             try go(dr.k.attn_merge, .{ .x = @intCast(M), .y = @intCast(dr.shape.qh) }, df.HD, e, &b);
+@@ -180,7 +196,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+         }
+         if (dr.split) { // each rank's share of down's K as fp32 partials, gathered and summed in rank order
+             const bytes = M * D * 4;
+-            try linB(dr, e, dr.act, l.down, dr.sums + e.share.rank * bytes, M, true);
++            try lin(dr, e, dr.act, l.down, dr.sums + e.share.rank * bytes, M, true);
+             try gather(e, dr.sums, bytes);
+             var a: cuda.Args = .{};
+             a.add(dr.sums);
+@@ -188,7 +204,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+             a.add(@as(i32, @intCast(M)));
+             a.add(@as(i32, @intCast(dr.world)));
+             try go(dr.k.sumn, .{ .x = @intCast(M), .y = @intCast(D / 1024) }, 256, e, &a);
+-        } else try linB(dr, e, dr.act, l.down, dr.a, M, false);
++        } else try lin(dr, e, dr.act, l.down, dr.a, M, false);
+         try conv(dr, e, dr.a, 1, l.m_base + 2 * D * 2, dr.x, true, M);
+     }
+     // every row through the drafts' 4-bit head (this rank's vocabulary), its 16 best, gathered; rank 0's projections
+diff --git a/zig/src/families/glm/dflash_load.zig b/zig/src/families/glm/dflash_load.zig
+index 9c8553c45..742566916 100644
+--- a/zig/src/families/glm/dflash_load.zig
++++ b/zig/src/families/glm/dflash_load.zig
+@@ -121,6 +121,11 @@ pub const Loader = struct {
+     }
+ };
+ 
++fn envOn(name: [*:0]const u8) bool {
++    const v = std.c.getenv(name) orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
+ fn q32env() bool {
+     const v = std.c.getenv("TF_GLM_DFLASH2_Q32") orelse return false;
+     return !std.mem.eql(u8, std.mem.span(v), "0");
+@@ -169,12 +174,17 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     const mlp = df.mlpSplit(world);
+     const split = mlp.split;
+     const ff = mlp.ff;
++    // neon N3 (each off unless its switch is 1, read here once): down at 4 bits (#2, the 4-bit drafter's 64 groups only)
++    // and fc's output columns split over the ranks and gathered (#3, where the world divides D into 64-column shares)
++    const down4 = bits == 4 and !q32env() and envOn("TF_GLM_NEON_DF_DOWN");
++    const fc_cols: usize = if (world >= 2 and D % world == 0 and (D / world) % 64 == 0 and envOn("TF_GLM_NEON_DF_FC")) D / world else 0;
++    const fc_rows: usize = if (fc_cols != 0) fc_cols else D;
+     const small: u64 = 6 * D * 2 + 2 * 128 * 2 + 2 * 2 * 2 * D * 2 + 16 * 256;
+     const per: u64 = if (bits == 4) 1 else 4; // quarter-bytes a weight: 4 bits (plus scales and biases below) or bf16
+-    const lin_elems: u64 = shape.qkv() * D + 2 * KVW * D + D * QW + 2 * ff * D + 2 * DYN * D + NT * D * D / shape.layers;
++    const lin_elems: u64 = shape.qkv() * D + 2 * KVW * D + D * QW + 2 * ff * D + 2 * DYN * D + (NT * D * fc_rows + shape.layers - 1) / shape.layers + (if (down4) D * ff else 0);
+     const q32 = q32env();
+     const gextra: u64 = if (q32) lin_elems / 16 else 0; // the 32 groups' second half of scales and biases
+-    const total: u64 = shape.layers * (lin_elems * per / 2 + lin_elems / 16 + gextra + D * ff * 2 + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
++    const total: u64 = shape.layers * (lin_elems * per / 2 + lin_elems / 16 + gextra + (if (down4) 0 else D * ff * 2) + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
+     var wbuf = try start_floor.alloc(d, total);
+     errdefer wbuf.free();
+     var tmp = try start_floor.alloc(d, @max(@max(2 * FF * D, NT * D * D), shape.qkv() * D) * 2); // the largest linear as stored
+@@ -211,15 +221,16 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+         const down = try layerName(&nb[3], i, "mlp.down_proj.weight");
+         if (split) { // this rank's share of the MLP width: gate and up rows, down columns, at rank * ff
+             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, .{ rank * ff, ff, 0, D });
+-            lw.down = try l.linearB(&.{down}, &.{D}, FF, .{ 0, 0, rank * ff, ff });
++            lw.down = if (down4) try l.linear(&.{down}, &.{D}, FF, .{ 0, 0, rank * ff, ff }) else .{ .bf16 = try l.linearB(&.{down}, &.{D}, FF, .{ 0, 0, rank * ff, ff }) };
+         } else {
+             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, null);
+-            lw.down = try l.linearB(&.{down}, &.{D}, FF, null);
++            lw.down = if (down4) try l.linear(&.{down}, &.{D}, FF, null) else .{ .bf16 = try l.linearB(&.{down}, &.{D}, FF, null) };
+         }
+         lw.a_proj = try l.linear(&.{try layerName(&nb[1], i, "attention_conv.kernel_projection.weight")}, &.{DYN}, D, null);
+         lw.m_proj = try l.linear(&.{try layerName(&nb[1], i, "mlp_conv.kernel_projection.weight")}, &.{DYN}, D, null);
+     }
+-    dr.fc = try l.linear(&.{"fc.weight"}, &.{D}, NT * D, null);
++    dr.fc = try l.linear(&.{"fc.weight"}, &.{D}, NT * D, if (fc_cols != 0) .{ rank * fc_cols, fc_cols, 0, NT * D } else null);
++    dr.fc_cols = fc_cols;
+     dr.hproj = try l.linearB(&.{"candidate_selector.hidden_projection.weight"}, &.{df.RANK}, D, null);
+     dr.hnorm = try l.raw("hidden_norm.weight", D * 2);
+     dr.norm = try l.raw("norm.weight", D * 2);
+@@ -229,6 +240,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
+     try @import("dflash_load_owner.zig").acquire(gpa, dr, &tail, Tail, .{ .book = df.VOCAB * df.RANK, .ctx = df.MAX_CTX, .cand = candidates.host, .hidden = df.MAX_M * df.RANK });
+     if (std.c.getenv("TF_GLM_DFLASH2_LOG")) |v| dr.log = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
+     if (std.c.getenv("TF_GLM_DFLASH2_PROF") != null) dr.prof = io;
++    if (down4 or fc_cols != 0) std.log.info("dflash2: neon N3: down at {s}, fc {s} ({d} columns a rank)", .{ if (down4) "4 bits (TF_GLM_NEON_DF_DOWN=1)" else "bf16", if (fc_cols != 0) "split over the ranks (TF_GLM_NEON_DF_FC=1)" else "whole", if (fc_cols != 0) fc_cols else D });
+     std.log.info("dflash2: drafter from {s} ({s}), linears at {d} bits, {d:.2} GiB on the device", .{ dir, if (shape.dsa) "incoai/GLM-5.3-DFlash2 at full GLM-5.3's shape: D 6144, 6 layers, taps after 5/19/33/47/61/75" else "CC BY-NC-ND 4.0: non-commercial use only", if (bits == 0) 16 else bits, @as(f64, @floatFromInt(l.at)) / (1 << 30) });
+     return dr;
+ }
+@@ -262,10 +274,9 @@ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
+     const chunks: u64 = (head_n + 4095) / 4096;
+     var part: u64 = 16;
+     for (dr.layers[0..sh.layers]) |l| {
+-        for ([_]df.Lin{ l.qkv, l.kv, l.o, l.gu, l.a_proj, l.m_proj }) |w| if (w == .bf16) {
++        for ([_]df.Lin{ l.qkv, l.kv, l.o, l.gu, l.down, l.a_proj, l.m_proj }) |w| if (w == .bf16) {
+             part = @max(part, mm.partBytes(64, w.bf16));
+         };
+-        part = @max(part, mm.partBytes(64, l.down));
+     }
+     if (dr.fc == .bf16) part = @max(part, mm.partBytes(64, dr.fc.bf16));
+     part = @max(part, mm.partBytes(64, dr.hproj));
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+index d712d801b..400c1a2b3 100644
+--- a/zig/src/families/glm/policy.zig
++++ b/zig/src/families/glm/policy.zig
+@@ -22,6 +22,8 @@ pub const Bit = enum(u5) {
+     msg_cuts = 9, // prompt chunks also cut at the server's message starts (TF_GLM_MSG_CUTS=1); slot resume may stand there
+     index_scan_split = 10, // with bits 2 and 3: a long decode window's index scan and top-2048 split over the ranks' key blocks
+     // the neon run's candidates (night/neon): bits 11-15 and 28-31, each off unless a request (or the default) asks
++    dec_split = 31, // neon #3: a dense decode window's int8 dsa attention on tf_glm_dec_split_qk / _pv (the chunk kernels' bytes)
++    dg_mma = 30, // neon N3 #1: DFlash2's block attention partials on tensor cores (dg_attn_part_mma; drafts only)
+     l2pf_v3 = 29, // neon #5: with bit 16, site o paced and stopped before expand_v; the stops as a dependent launch
+     exl3_uo = 28, // neon #11: mul1 decode experts on the u-outer grid forms + the dependent combine (with bit 19)
+     router_fused = 14, // neon #13: a prompt's router on tf_glm_router_fused (slices summed in registers, no slice partials)
+@@ -188,3 +190,16 @@ test "GLM policy: the neon bits (11-15, 28-31) are offered and taken like the un
+     b.offered = bit(.scores_w8) | bit(.mm8_tiles) | bit(.msa_f3) | bit(.router_fused) | bit(.prompt_hoist);
+     try t.expectEqual(@as(?Mask, 0x0100_7800), b.effective(0xffff_ffff));
+ }
++
++test "GLM policy: neon N3's bit 30 (dg_mma) lies in the neon bits, apart from 28 and 29, and is taken where offered" {
++    const t = std.testing;
++    try t.expectEqual(@as(Mask, 0x4000_0000), bit(.dg_mma));
++    try t.expect(bit(.dg_mma) & neon != 0);
++    try t.expectEqual(@as(Mask, 0), bit(.dg_mma) & (reserved | unified | bit(.exl3_uo) | bit(.l2pf_v3)));
++    var b = Boot.read(envOf(.{.{ "TF_GLM_POLICY_REQUESTS", "1" }}));
++    b.offered = bit(.dg_mma) | bit(.exl3_uo);
++    try t.expectEqual(@as(?Mask, 0x5000_0000), b.effective(0xffff_ffff));
++    try t.expectEqual(@as(?Mask, 0x1000_0000), b.effective(0x1000_0000));
++    b.offered = bit(.exl3_uo); // a boot without DFlash2 at the full shape drops it
++    try t.expectEqual(@as(?Mask, 0), b.effective(bit(.dg_mma)));
++}

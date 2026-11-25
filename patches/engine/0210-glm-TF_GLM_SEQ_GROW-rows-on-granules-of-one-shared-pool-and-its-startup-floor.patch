@@ -1,0 +1,1242 @@
+From a1a30b3740158dac2e8b226d9b889796705b43f2 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:10:42 +0200
+Subject: [PATCH] glm: TF_GLM_SEQ_GROW, every stream's rows on granules of one
+ shared pool (default off), TF_GLM_SEQ_GROW_FLOOR_MIB
+
+TF_GLM_SEQ_GROW=1 (default off): each stream's State reserves virtual addresses for the whole window but backs its
+row-sized fields (MLA latent rows and int8 scale planes, indexer index keys) with VMM granules only up to the rows its passes
+reach (State.ready), plus a 4,096-row margin. The granules come from one pool made at startup with exactly the granules one
+whole-window State needs, so a lone stream still reaches the full window and several streams decode together while their rows
+fit the pool together. Kernels and layouts are unchanged (same contiguous addresses; mapped granules are zeroed as the whole-window
+arena was), so the bytes are the same with the switch on or off. Admission (rank 0 lanes) charges granules (LaneMemory requeues);
+TF_GLM_SEQ_GROW_STREAMS (1..16, default 4) caps the streams and every rank checks at startup that its MemAvailable holds the
+further streams' fixed parts above a floor (one startup all-gather: the ranks agree on the switch, the cap and the floor, and every one must fit, or all refuse).
+
+TF_GLM_SEQ_GROW_FLOOR_MIB (new here, 2304..65535, default 3072 = the floor as before): the floor of that check. EXLR8 up1 on TP4
+leaves a rank 2.7-3.1 GiB of MemAvailable at idle (spark1 min 2.74 GiB), under the default 3 GiB + (streams - 1) x ~48 MiB; the
+variable lowers the check (never below MEMGUARD's 2 GiB + 256 MiB). The floor travels in the agreement word, so ranks that read different floors refuse. Memory admission only, no kernel or byte changes.
+
+Tests: test-glm-seq-grow-host (granules follow rows, trims, shared pool, refusal, the stream cap, the floor) and
+test-glm-seq-grow-gpu (TF_SEQ_GROW_GPU=1, a device: mapped zeroed, kept across trims, refused when spent).
+Rebased from x6-conc 0203 (K4, passed x6g/x7) onto 0001-0195 + 0205-0209.
+---
+ zig/build/glm_family_host.zig                 |   2 +
+ zig/src/families/glm/cuda.zig                 |   2 +
+ zig/src/families/glm/cuda_engine.zig          |  22 +
+ zig/src/families/glm/cuda_lanes.zig           |  43 +
+ zig/src/families/glm/cuda_native.zig          |  34 +-
+ zig/src/families/glm/cuda_seq_grow.zig        | 735 ++++++++++++++++++
+ .../families/glm/cuda_seq_grow_gpu_test.zig   |  91 +++
+ zig/src/families/glm/cuda_snapshots.zig       |   2 +
+ zig/src/families/glm/cuda_state.zig           |  77 +-
+ 9 files changed, 1006 insertions(+), 2 deletions(-)
+ create mode 100644 zig/src/families/glm/cuda_seq_grow.zig
+ create mode 100644 zig/src/families/glm/cuda_seq_grow_gpu_test.zig
+
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 1a6bd2be4..86a9a135d 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -26,6 +26,8 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     b.step("test-glm-swift-krn-gpu", "Policy bits 2 and 3: the decode select through dsaSelect with the bits set and clear, bit for bit (TF_KRN_GPU: the fatbins' directory; skipped without)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM swift KRN GPU:"} })).step);
+     b.step("test-glm-kv-split-host", "TF_GLM_KV_SPLIT's ownership, head tables and switch, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"KV split:"} })).step);
+     b.step("test-glm-slot-resume-host", "TF_GLM_SLOT_RESUME: where a later prompt resumes on its slot's own rows (prefix, grid, stamps, drafter window), without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM slot resume:"} })).step);
++    b.step("test-glm-seq-grow-host", "TF_GLM_SEQ_GROW: granules follow the rows, trims, a shared pool and its refusal, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM seq grow:"} })).step);
++    b.step("test-glm-seq-grow-gpu", "TF_GLM_SEQ_GROW on a device (TF_SEQ_GROW_GPU=1; skipped without): granules mapped zeroed, kept across trims, refused when spent").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM seq grow GPU:"} })).step);
+     b.step("test-glm-policy-host", "Request policies: the begin step's mask on every rank, the off state as before, bit 5's projection, DFlash2 coupled exactness, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM policy:"} })).step);
+     b.step("test-glm-dspark-host", "DSpark's host chain (candidate merge, Markov alignment, confidence) without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM DSpark:"} })).step);
+     b.step("test-glm-fp8-kv-host", "GLM latent cache layout, mode agreement and recorded CUDA launches without devices").dependOn(&kv8_run.step);
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index 6ca2be7b7..b778c033c 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -50,6 +50,8 @@ test {
+     _ = @import("cuda_kv8_test.zig");
+     _ = @import("cuda_kv8_snapshot_test.zig");
+     _ = @import("slot_resume.zig");
++    _ = @import("cuda_seq_grow.zig");
++    _ = @import("cuda_seq_grow_gpu_test.zig");
+     _ = kv8_ref;
+     _ = @import("cuda_prof.zig");
+     _ = @import("cuda_load_owner.zig");
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 8f80e885e..b2499e323 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -5,6 +5,7 @@ const lanes = @import("lanes");
+ const config = @import("config.zig");
+ const shard = @import("cuda_shard.zig");
+ const weights = @import("cuda_weights.zig");
++const seq_grow = @import("cuda_seq_grow.zig");
+ const fw = @import("cuda_forward.zig");
+ const ranks = @import("cuda_ranks.zig");
+ const sampler = @import("cuda_sampler.zig");
+@@ -262,11 +263,28 @@ pub const Engine = struct {
+             @import("cuda_state.zig").lat_split = 1;
+             @import("cuda_state.zig").ik_split = false;
+         }
++        // TF_GLM_SEQ_GROW (cuda_seq_grow): every stream's rows on granules of one pool, made below with exactly the
++        // granules one whole-window sequence needs; streams share it, so --parallel adds no window of its own
++        const grows = try seq_grow.asked();
++        if (grows) {
++            if (e.settings.pages or o.settings.kv_split != 0 or e.settings.kv_shard.on or !c.dsa) return error.SeqGrowRefused;
++            seq_grow.pool = try seq_grow.Pool.open(gpa, d);
++        }
++        errdefer if (seq_grow.pool) |p| {
++            p.close();
++            seq_grow.pool = null;
++        };
+         if (e.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
+         errdefer {
+             e.free(0);
+             e.seqs.deinit(gpa);
+         }
++        if (seq_grow.pool) |p| {
++            const r = e.seqs.items[0].?.st.grow orelse return error.SeqGrowRefused;
++            const n = r.need(o.capacity);
++            try p.grow(n);
++            if (rank == 0) std.log.info("seq grow: one pool of {d} granules of {d} MiB ({d:.2} GiB), a whole window's rows; every stream's rows map from it as they grow (TF_GLM_SEQ_GROW=1)", .{ n, p.granularity >> 20, @as(f64, @floatFromInt(n * p.granularity)) / (1 << 30) });
++        }
+         e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
+         errdefer e.bp.deinit();
+         if (o.settings.chunk != 0 and rank == 0) std.log.info("glm: prompt steps of {d} rows while another stream decodes, {d} alone (TF_GLM_CHUNK_SOLO); kept states stay on the {d}-row grid", .{ o.settings.chunk, fw.prefill_rows, fw.prefill_rows });
+@@ -352,6 +370,10 @@ pub const Engine = struct {
+         if (e.pages) |p| p.deinit();
+         for (0..e.seqs.items.len) |i| e.free(i);
+         e.seqs.deinit(e.gpa);
++        if (seq_grow.pool) |p| { // after every sequence gave its granules back
++            p.close();
++            seq_grow.pool = null;
++        }
+         if (e.l2pf) |*p| p.deinit();
+         if (e.tap_dump) |x| x.deinit(e.gpa);
+         e.w.deinit();
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 9c1ebd41e..73f2d0353 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -13,6 +13,7 @@ const tool_draft = @import("tool_draft.zig");
+ const tool_carrier = @import("tool_carrier.zig");
+ const policy_mod = @import("policy.zig");
+ const slot_resume = @import("slot_resume.zig");
++const seq_grow = @import("cuda_seq_grow.zig");
+ 
+ const be = lanes.backend;
+ 
+@@ -53,6 +54,7 @@ pub const Lane = struct {
+     draft_ms: f64 = 0, // the drafter's last pass for this stream (shared passes: the whole pass)
+     policy: ?policy_mod.Mask = null, // the request's experiment mask (TF_GLM_POLICY_REQUESTS=1), fixed at its opening
+     rewound: usize = 0, // TF_GLM_SLOT_RESUME: where its prompt pass resumed on the slot's own rows (0: none)
++    grow_need: usize = 0, // TF_GLM_SEQ_GROW: the pool granules it was admitted with (its prompt, reply and margin)
+ };
+ 
+ pub const Lanes = struct {
+@@ -399,7 +401,12 @@ pub const Lanes = struct {
+ 
+     /// The stream's slot, its pages, then its sequence: a slot past the paged ones waits before binding makes a window.
+     pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize) ![]const u32 {
++        // TF_GLM_SEQ_GROW: the pool must hold this stream's rows beside the other slots' (LaneMemory: the lane host
++        // requeues the request until a stream ends; alone, the slot it takes holds at most the pool)
++        const grow_need = if (self.lanes.getPtr(s) == null) self.growNeed(prompt, max_new) else 0;
++        if (!self.growFits(grow_need)) return error.LaneMemory;
+         const l = try self.claim(s);
++        l.grow_need = grow_need;
+         l.pending_rows = null;
+         l.held_n = 0;
+         l.fill = null;
+@@ -431,6 +438,42 @@ pub const Lanes = struct {
+         return snap.home;
+     }
+ 
++    /// TF_GLM_SEQ_GROW (rank 0): the pool granules a stream of `prompt` + `max_new` rows needs, with a last window
++    /// and the margin State.ready maps past a pass (0: off). Every slot's sequence has the same fields as slot 0's.
++    fn growNeed(self: *const Lanes, prompt: usize, max_new: usize) usize {
++        if (seq_grow.pool == null) return 0;
++        const q = self.x.e.seqs.items[0] orelse return 0;
++        const r = q.st.grow orelse return 0;
++        return r.need(@min(self.x.e.capacity, prompt + max_new + max_rows + seq_grow.margin_rows));
++    }
++
++    /// Whether the pool holds `need` more granules on the slot freeSlot gives, beside every other slot's: a live
++    /// stream's charge is the most of what it maps and what it was admitted with; an idle slot's, what it maps (slot
++    /// 0 keeps its last rows for slot resume until its next pass trims them).
++    fn growFits(self: *const Lanes, need: usize) bool {
++        const pool = seq_grow.pool orelse return true;
++        var slots: [64]?seq_grow.Slot = undefined;
++        const seqs = self.x.e.seqs.items;
++        if (seqs.len > slots.len) return false; // more slots than the check holds: refuse rather than guess
++        for (seqs, slots[0..seqs.len], 0..) |q, *x, slot| {
++            const r = (q orelse {
++                x.* = null;
++                continue;
++            }).st.grow orelse {
++                x.* = null;
++                continue;
++            };
++            x.* = .{ .mapped = r.mapped };
++            var it = self.lanes.valueIterator();
++            while (it.next()) |l| if (l.slot == slot) {
++                x.*.?.granted = @max(x.*.?.granted, l.grow_need);
++            };
++        }
++        const f = self.freeSlot();
++        if (f >= seq_grow.max_streams) return false; // TF_GLM_SEQ_GROW_STREAMS: no slot past the cap (the request waits)
++        return seq_grow.admits(pool.total, slots[0..seqs.len], f, need);
++    }
++
+     /// The lane host's admission: with a pool, a paged sequence and the request's pages are free.
+     pub fn fits(self: *const Lanes, prompt: usize, max_tokens: usize) bool {
+         const p = self.x.e.pages orelse return true; // its wait note is rank 0's, on the engine thread
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 53f4e99ca..9041219f7 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -13,6 +13,7 @@ const config = @import("config.zig");
+ const shard = @import("cuda_shard.zig");
+ const dflash = @import("dflash.zig");
+ const dflash_load = @import("dflash_load.zig");
++const seq_grow = @import("cuda_seq_grow.zig");
+ const pages_mod = @import("cuda_pages.zig");
+ const policy = @import("policy.zig");
+ const kv = @import("core").kv_pool;
+@@ -308,6 +309,35 @@ fn finishRank(a: OpenArgs) !Loaded {
+     errdefer own.link.deinit();
+     if (p.rank == 0 and p.world > 1) own.e.link = &own.link; // its disk steps (cuda_disk_ranks) cross on the link
+     own.e.snap_setup = .{ .ptr = own, .run = readySnapshots };
++    // TF_GLM_SEQ_GROW: every rank's real headroom must hold the further streams' fixed parts (cuda_seq_grow.headroomOk).
++    // One all-gather on every rank, switch on or off (a startup word, no step changes), before a follower leaves for
++    // follow.follow: the ranks must agree on the switch and the stream cap, and every one must fit, else all refuse.
++    {
++        var word: u64 = 0; // seq_grow.Verdict.encode: off, or on with its cap (0: unreadable) and whether it fits
++        if (seq_grow.pool != null) {
++            const streams = seq_grow.streamsAsked() catch 0;
++            const per: u64 = own.e.seqBytes() + (if (own.e.drafter) |dr| dr.ringBytes() else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
++            const avail = seq_grow.memAvailable() orelse 0;
++            const floor = seq_grow.floorAsked() catch 0; // 0: a bad TF_GLM_SEQ_GROW_FLOOR_MIB refuses on this rank
++            const ok = streams != 0 and floor != 0 and seq_grow.headroomAt(floor, avail, streams, per);
++            word = seq_grow.Verdict.encode(.{ .on = true, .cap = streams, .fits = ok, .floor_mib = floor >> 20 });
++            std.log.info("seq grow: rank {d}: at most {d} streams (TF_GLM_SEQ_GROW_STREAMS); each past the first takes {d:.1} MiB of fixed parts (its arena and DFlash2 ring) when it binds; MemAvailable {d:.2} GiB, floor {d} MiB (TF_GLM_SEQ_GROW_FLOOR_MIB): {s}", .{ p.rank, streams, @as(f64, @floatFromInt(per)) / (1 << 20), @as(f64, @floatFromInt(avail)) / (1 << 30), floor >> 20, if (ok) "fits" else "SHORT" });
++        }
++        const words = try gpa.alloc(u64, p.world);
++        defer gpa.free(words);
++        try ranks.gather(u64, ctx.d, &own.group.lib, own.group.comm, own.e.stream, p.rank, word, words);
++        switch (seq_grow.Verdict.agree(words)) {
++            .off => {},
++            .on => |n| {
++                seq_grow.max_streams = n;
++                if (p.rank == 0) std.log.info("seq grow: every rank holds {d} streams' fixed parts above the floor", .{n});
++            },
++            .refuse => |why| {
++                std.log.err("seq grow: the ranks refuse the pool: {s} (TF_GLM_SEQ_GROW and TF_GLM_SEQ_GROW_STREAMS the same on every rank; lower the streams or --context)", .{why});
++                return error.SeqGrowNoRoom;
++            },
++        }
++    }
+     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
+     const rooms = try gpa.alloc(u64, p.world);
+     defer gpa.free(rooms);
+@@ -352,7 +382,9 @@ fn finishRank(a: OpenArgs) !Loaded {
+         .backend = own.lanes.backend(),
+         .facts = own.lanes.facts(),
+         .rows = glm_lanes.max_rows,
+-        .stream_bytes = own.e.seqBytes() + extra, // each stream past the first makes its own sequence on every rank
++        // each stream past the first makes its own sequence on every rank; TF_GLM_SEQ_GROW: none is charged to the startup
++        // budget (seq_grow.admittedStreamBytes); the bound is TF_GLM_SEQ_GROW_STREAMS, checked against MemAvailable above
++        .stream_bytes = seq_grow.admittedStreamBytes(seq_grow.pool != null, own.e.seqBytes() + extra),
+         .free_streams = 1, // the first is the sequence the engine made
+         .ctx = own,
+         .deinit = close,
+diff --git a/zig/src/families/glm/cuda_seq_grow.zig b/zig/src/families/glm/cuda_seq_grow.zig
+new file mode 100644
+index 000000000..8a60338ec
+--- /dev/null
++++ b/zig/src/families/glm/cuda_seq_grow.zig
+@@ -0,0 +1,735 @@
++//! TF_GLM_SEQ_GROW=1: a sequence's rows take device memory as they grow, from one pool every stream shares.
++//!
++//! Without it each stream's State is one allocation sized for the whole window (--context), so --parallel N needs N
++//! whole windows and a TP4 K4 rank fits one. With it every State reserves virtual addresses for the whole window, as
++//! before, but its row-sized fields (each MLA layer's latent rows and their int8 scale planes, the indexer layers'
++//! index keys) are backed by physical granules only up to the rows its passes reach (State.ready), plus a margin. The
++//! granules come from a pool made at startup with exactly the granules one whole-window State needs, so a lone stream
++//! still reaches the full window, and several streams decode together while their rows fit the pool together.
++//!
++//! The addresses a kernel sees are the same kind as before (one contiguous range a field, the same offsets inside
++//! it), and no kernel reads a row past the rows its pass covers (State.reset: "the caches past it are never read"), so
++//! the bytes every kernel reads and writes are the same with the switch on or off. Newly mapped granules are zeroed, as
++//! the whole-window arena was at its allocation.
++//!
++//! Admission (rank 0, cuda_lanes): a request is admitted only if the pool holds the granules of its prompt + its
++//! max_tokens + a window + the margin beside what the other slots hold (a live stream: the most of what it maps and
++//! what it was admitted with; an idle slot: what it maps). Otherwise LaneMemory: the lane host requeues it until a
++//! stream ends. Every rank maps the same granules in the same order (the same passes on the same layouts), so the
++//! followers' pools, the same size, never run out where rank 0's does not.
++
++const std = @import("std");
++const cuda = @import("cuda");
++
++/// Rows mapped past a pass's last row: kernels that tile rows read whole tiles (one prompt chunk is ample).
++pub const margin_rows = 4096;
++
++/// One row-sized plane of a field: it starts `off` bytes into the field, row r at off + r * row.
++pub const Plane = struct { off: usize, row: usize };
++
++/// A State field backed by granules: `off` bytes into the region (granule aligned), `len` bytes long, its planes.
++pub const Field = struct {
++    off: usize,
++    len: usize,
++    planes: [2]Plane = .{ .{ .off = 0, .row = 0 }, .{ .off = 0, .row = 0 } },
++    np: u8 = 1,
++};
++
++/// The granules [lo, hi) of the region that hold field f's first `rows` rows (each plane's prefix, merged).
++fn spans(f: Field, g: usize, rows: usize, out: *[2][2]usize) usize {
++    var n: usize = 0;
++    for (f.planes[0..f.np]) |p| {
++        if (rows == 0 or p.row == 0) continue;
++        const a = f.off + p.off;
++        const b = @min(f.off + f.len, a + rows * p.row);
++        if (b <= a) continue;
++        const lo = a / g;
++        const hi = (b + g - 1) / g;
++        if (n > 0 and lo <= out[n - 1][1]) { // the planes are in order: a span that touches the last merges into it
++            out[n - 1][1] = @max(out[n - 1][1], hi);
++        } else {
++            out[n] = .{ lo, hi };
++            n += 1;
++        }
++    }
++    return n;
++}
++
++/// Granules the fields' first `rows` rows need (the admission's measure; Region.ensure maps exactly these).
++pub fn granulesFor(fields: []const Field, g: usize, rows: usize) usize {
++    var total: usize = 0;
++    for (fields) |f| {
++        var s: [2][2]usize = undefined;
++        const n = spans(f, g, rows, &s);
++        for (s[0..n]) |x| total += x[1] - x[0];
++    }
++    return total;
++}
++
++/// Where granules come from and how they are placed: the device pool, or a test's fake.
++pub const Mapper = struct {
++    ctx: *anyopaque,
++    granularity: usize,
++    take: *const fn (ctx: *anyopaque) ?u64, // a free granule's handle, null: the pool is empty
++    give: *const fn (ctx: *anyopaque, h: u64) void,
++    map: *const fn (ctx: *anyopaque, va: u64, h: u64) Mapped, // map, set access, zero
++    unmap: *const fn (ctx: *anyopaque, va: u64) bool, // false: still mapped (the handle must not go back)
++    reserve: *const fn (ctx: *anyopaque, len: usize) ?u64, // a virtual range of `len` (granule multiple) bytes
++    unreserve: *const fn (ctx: *anyopaque, va: u64, len: usize) void,
++};
++
++/// A map's outcome: ok; failed (nothing mapped: the handle may go back); stuck (the mapping could not be undone: the
++/// handle never goes back, its addresses stay reserved).
++pub const Mapped = enum { ok, failed, stuck };
++
++pub const Error = error{ LaneMemory, SeqGrowMap, SeqGrowReserve, OutOfMemory };
++
++/// One State's growable fields: their virtual range and the handle mapped at each granule (0: none).
++pub const Region = struct {
++    gpa: std.mem.Allocator,
++    m: Mapper,
++    va: u64,
++    len: usize,
++    fields: []Field,
++    handles: []u64,
++    mapped: usize = 0, // granules mapped now
++    covered: usize = 0, // rows every field holds mapped (ensure's fast path)
++    unmap_failed: usize = 0, // granules the driver would not unmap (kept mapped, never given back)
++    broken: bool = false, // a granule is mapped but unusable (access or zeroing failed, unmap too): every ensure fails
++
++    /// Lays `sizes` out granule aligned (zero sizes take no room) and reserves their range; `out[i]` gets field i's
++    /// address. `planes_of(i)` gives field i's planes. Nothing is mapped yet.
++    pub fn init(gpa: std.mem.Allocator, m: Mapper, sizes: []const usize, planes: []const ?[2]Plane, nplanes: []const u8, out: []u64) Error!Region {
++        const g = m.granularity;
++        var fields: std.ArrayList(Field) = .empty;
++        errdefer fields.deinit(gpa);
++        var off: usize = 0;
++        const at = try gpa.alloc(usize, sizes.len);
++        defer gpa.free(at);
++        for (sizes, planes, nplanes, 0..) |n, p, np, i| {
++            at[i] = off;
++            if (n == 0) continue;
++            const pl: [2]Plane = p orelse .{ Plane{ .off = 0, .row = 0 }, Plane{ .off = 0, .row = 0 } };
++            try fields.append(gpa, .{ .off = off, .len = n, .planes = pl, .np = np });
++            off += std.mem.alignForward(usize, n, g);
++        }
++        const len = @max(off, g);
++        const va = m.reserve(m.ctx, len) orelse return error.SeqGrowReserve;
++        errdefer m.unreserve(m.ctx, va, len);
++        const handles = try gpa.alloc(u64, len / g);
++        @memset(handles, 0);
++        for (out, at, sizes) |*o, a, n| o.* = if (n == 0) 0 else va + a;
++        return .{ .gpa = gpa, .m = m, .va = va, .len = len, .fields = try fields.toOwnedSlice(gpa), .handles = handles };
++    }
++
++    pub fn deinit(r: *Region) void {
++        r.trim(0);
++        // a granule still mapped keeps its addresses reserved (freeing them under a mapping is undefined); its
++        // handle is leaked with them rather than reused
++        if (r.mapped == 0) r.m.unreserve(r.m.ctx, r.va, r.len) else std.log.err("seq grow: {d} granules would not unmap; their range stays reserved", .{r.mapped});
++        r.gpa.free(r.handles);
++        r.gpa.free(r.fields);
++        r.* = undefined;
++    }
++
++    /// Every field's first `rows` rows mapped (and zeroed when newly mapped). LaneMemory: the pool ran out (the
++    /// granules mapped so far stay; admission keeps this from happening).
++    pub fn ensure(r: *Region, rows: usize) Error!void {
++        if (r.broken) return error.SeqGrowMap; // a stuck granule may not be read as mapped and zeroed
++        if (rows <= r.covered) return;
++        const g = r.m.granularity;
++        for (r.fields) |f| {
++            var s: [2][2]usize = undefined;
++            const n = spans(f, g, rows, &s);
++            for (s[0..n]) |x| for (x[0]..x[1]) |k| {
++                if (r.handles[k] != 0) continue;
++                const h = r.m.take(r.m.ctx) orelse return error.LaneMemory;
++                switch (r.m.map(r.m.ctx, r.va + k * g, h)) {
++                    .ok => {},
++                    .failed => {
++                        r.m.give(r.m.ctx, h);
++                        return error.SeqGrowMap;
++                    },
++                    .stuck => { // mapped but unusable: counted as this region's so it is never handed out again, and
++                        // the region refuses every pass from here (its rows are not all accessible and zeroed)
++                        r.handles[k] = h;
++                        r.mapped += 1;
++                        r.unmap_failed += 1;
++                        r.broken = true;
++                        return error.SeqGrowMap;
++                    },
++                }
++                r.handles[k] = h;
++                r.mapped += 1;
++            };
++        }
++        r.covered = rows;
++    }
++
++    /// Unmaps every granule the first `rows` rows do not need (the caller has drained the work that read them).
++    pub fn trim(r: *Region, rows: usize) void {
++        const g = r.m.granularity;
++        var keep = std.bit_set.DynamicBitSetUnmanaged.initEmpty(r.gpa, r.handles.len) catch {
++            return; // no room for the mask: keep everything (a trim only gives memory back)
++        };
++        defer keep.deinit(r.gpa);
++        for (r.fields) |f| {
++            var s: [2][2]usize = undefined;
++            const n = spans(f, g, rows, &s);
++            for (s[0..n]) |x| keep.setRangeValue(.{ .start = x[0], .end = x[1] }, true);
++        }
++        for (r.handles, 0..) |*h, k| if (h.* != 0 and !keep.isSet(k)) {
++            // a granule the driver would not unmap stays this region's (mapped, counted): it never goes back to the
++            // pool while an address still maps it
++            if (!r.m.unmap(r.m.ctx, r.va + k * g)) {
++                r.unmap_failed += 1;
++                continue;
++            }
++            r.m.give(r.m.ctx, h.*);
++            h.* = 0;
++            r.mapped -= 1;
++        };
++        r.covered = @min(r.covered, rows);
++    }
++
++    /// Granules the first `rows` rows of these fields need.
++    pub fn need(r: *const Region, rows: usize) usize {
++        return granulesFor(r.fields, r.m.granularity, rows);
++    }
++};
++
++/// A slot's hold on the pool: the granules it maps now, and a live stream's grant (what it was admitted with; 0 for an
++/// idle slot, whose rows wait for slot resume until its next pass trims them).
++pub const Slot = struct { mapped: usize, granted: usize = 0 };
++
++/// Whether a stream needing `need` granules fits on slot `f` beside the other slots (null: no sequence there). A slot's
++/// charge is the most of what it maps and what it was granted; slot `f`'s, the most of what it maps and `need` (its
++/// next pass trims what it does not keep).
++pub fn admits(total: usize, slots: []const ?Slot, f: usize, need: usize) bool {
++    var used: usize = 0;
++    var taken = false;
++    for (slots, 0..) |q, i| {
++        const x = q orelse continue;
++        var charge = @max(x.mapped, x.granted);
++        if (i == f) {
++            charge = @max(x.mapped, need);
++            taken = true;
++        }
++        used += charge;
++    }
++    if (!taken) used += need;
++    return used <= total;
++}
++
++/// The bytes the server's startup admission charges each stream past the first (its "stream_bytes").
++///
++/// Off: a stream's whole arena, as before. On: 0 (the bound is TF_GLM_SEQ_GROW_STREAMS, checked on every rank against
++/// MemAvailable at startup: headroomOk). The startup budget is the rank's room above its reserve after the
++/// engine loaded, and on a TP4 K4 rank at the release window that room is already below zero (the first sequence, made
++/// before the room is read, runs ~4.5-5 GiB into the 8.5 GiB reserve; x6c2's P2/P4 refusals measure it), so any
++/// charge, however small, refuses every --parallel above 1. With the switch on the window's rows are in the pool, made
++/// before the room is read exactly as the first sequence was; each further stream adds only its fixed parts (its small
++/// arena and its DFlash2 ring, ~48 MiB), made when it binds, as every stream past the first always was. Startup logs
++/// that figure; MEMGUARD's floor still watches the box.
++pub fn admittedStreamBytes(on: bool, real: u64) u64 {
++    return if (on) 0 else real;
++}
++
++/// TF_GLM_SEQ_GROW_STREAMS: the most streams that may hold a sequence at once with the pool (1..16, default 4). The
++/// lanes never seat a slot at or past it (LaneMemory: the request waits), whatever --parallel says, and every rank checks
++/// at startup that its real headroom holds the further streams' fixed parts (`headroomOk`).
++pub var max_streams: usize = 4;
++
++pub fn streamsAsked() !usize {
++    return parseStreams(if (std.c.getenv("TF_GLM_SEQ_GROW_STREAMS")) |v| std.mem.span(v) else null);
++}
++
++fn parseStreams(v: ?[]const u8) !usize {
++    const s = v orelse return 4;
++    const n = std.fmt.parseInt(usize, s, 10) catch return error.BadSeqGrowStreams;
++    if (n < 1 or n > 16) return error.BadSeqGrowStreams;
++    return n;
++}
++
++/// The floor a rank's MemAvailable must keep above the further streams' fixed parts: the stages' load abort level,
++/// above MEMGUARD's 2 GiB. The startup reserve (8.5 GiB at TP4) is not the bound here: the release window already
++/// runs inside it (admittedStreamBytes).
++pub const hard_floor: u64 = 3 << 30;
++
++/// Whether `available` bytes (MemAvailable, with the pool made) hold `streams - 1` further streams of `per` bytes
++/// each above hard_floor.
++pub fn headroomOk(available: u64, streams: usize, per: u64) bool {
++    return headroomAt(hard_floor, available, streams, per);
++}
++
++pub fn headroomAt(floor: u64, available: u64, streams: usize, per: u64) bool {
++    const need = std.math.mul(u64, streams -| 1, per) catch return false;
++    return available >= floor +| need;
++}
++
++/// TF_GLM_SEQ_GROW_FLOOR_MIB: the floor `headroomAt` keeps, default hard_floor (3072). A rank whose weights leave less
++/// than 3 GiB beside the pool at startup (EXLR8 up1 on TP4: spark1 idles at 2.7-3.1 GiB) lowers it, to no less than
++/// MEMGUARD's 2 GiB plus the check's own 256 MiB. Memory only: no kernel, no byte of a reply changes with it; unset, the
++/// check is exactly as before. It must read the same on every rank (every rank's verdict counts).
++pub const floor_min_mib: u64 = 2304;
++
++pub fn floorAsked() !u64 {
++    return parseFloorMib(if (std.c.getenv("TF_GLM_SEQ_GROW_FLOOR_MIB")) |v| std.mem.span(v) else null);
++}
++
++fn parseFloorMib(v: ?[]const u8) !u64 {
++    const s = v orelse return hard_floor;
++    const n = std.fmt.parseInt(u64, s, 10) catch return error.BadSeqGrowFloor;
++    if (n < floor_min_mib or n > 65535) return error.BadSeqGrowFloor;
++    return n << 20;
++}
++
++/// MemAvailable in bytes (null: /proc/meminfo unreadable).
++pub fn memAvailable() ?u64 {
++    var buf: [8192]u8 = undefined;
++    const fd = std.c.open("/proc/meminfo", .{ .ACCMODE = .RDONLY });
++    if (fd < 0) return null;
++    defer _ = std.c.close(fd);
++    const n = std.c.read(fd, &buf, buf.len);
++    if (n <= 0) return null;
++    return memAvailableOf(buf[0..@intCast(n)]);
++}
++
++fn memAvailableOf(text: []const u8) ?u64 {
++    var it = std.mem.splitScalar(u8, text, '\n');
++    while (it.next()) |line| {
++        if (!std.mem.startsWith(u8, line, "MemAvailable:")) continue;
++        var f = std.mem.tokenizeScalar(u8, line["MemAvailable:".len..], ' ');
++        const kb = std.fmt.parseInt(u64, f.next() orelse return null, 10) catch return null;
++        if (!std.mem.eql(u8, f.next() orelse return null, "kB")) return null;
++        return std.math.mul(u64, kb, 1024) catch null;
++    }
++    return null;
++}
++
++/// One rank's startup word for the agreement over the ranks (cuda_native): off (0), or on with its stream cap (0: not
++/// readable) and whether its headroom fits.
++pub const Verdict = struct {
++    on: bool,
++    cap: usize = 0,
++    fits: bool = false,
++    floor_mib: u64 = 0, // TF_GLM_SEQ_GROW_FLOOR_MIB as this rank read it (0: unreadable): every rank must agree on it
++
++    pub fn encode(v: Verdict) u64 {
++        if (!v.on) return 0;
++        return (@as(u64, @min(v.floor_mib, 0xffff)) << 40) | (1 << 32) | (@as(u64, @intCast(@min(v.cap, 0xffff))) << 8) | @intFromBool(v.fits);
++    }
++
++    pub const Agreed = union(enum) { off, on: usize, refuse: []const u8 };
++
++    /// Every rank's word: all off -> off; all on with one readable cap and every one fitting -> on(cap); else refuse.
++    pub fn agree(words: []const u64) Agreed {
++        if (words.len == 0) return .{ .refuse = "no ranks" };
++        var on: usize = 0;
++        for (words) |w| on += @intFromBool(w != 0);
++        if (on == 0) return .off;
++        if (on != words.len) return .{ .refuse = "TF_GLM_SEQ_GROW differs between the ranks" };
++        const cap = (words[0] >> 8) & 0xffff;
++        const floor = (words[0] >> 40) & 0xffff;
++        for (words) |w| {
++            if ((w >> 32) & 0xff != 1) return .{ .refuse = "a malformed word" };
++            if ((w >> 8) & 0xffff != cap) return .{ .refuse = "TF_GLM_SEQ_GROW_STREAMS differs between the ranks" };
++            if ((w >> 40) & 0xffff != floor) return .{ .refuse = "TF_GLM_SEQ_GROW_FLOOR_MIB differs between the ranks" };
++        }
++        if (floor == 0) return .{ .refuse = "TF_GLM_SEQ_GROW_FLOOR_MIB is not 2304..65535" };
++        if (cap == 0) return .{ .refuse = "TF_GLM_SEQ_GROW_STREAMS is not 1..16" };
++        for (words) |w| if (w & 1 == 0) return .{ .refuse = "a rank's MemAvailable cannot hold the streams' fixed parts above the floor (or /proc/meminfo is unreadable)" };
++        return .{ .on = @intCast(cap) };
++    }
++};
++
++/// The device pool: `total` granule handles made at startup (cuMemCreate), mapped and unmapped as rows grow.
++pub const Pool = struct {
++    gpa: std.mem.Allocator,
++    d: *const cuda.Driver,
++    lib: std.DynLib,
++    api: Api,
++    prop: Prop,
++    device: c_int,
++    granularity: usize,
++    free: std.ArrayList(u64) = .empty,
++    total: usize = 0,
++
++    const R = c_int;
++    const Api = struct {
++        reserve: *const fn (*u64, usize, usize, u64, c_ulonglong) callconv(.c) R,
++        addressFree: *const fn (u64, usize) callconv(.c) R,
++        create: *const fn (*u64, usize, *const Prop, c_ulonglong) callconv(.c) R,
++        release: *const fn (u64) callconv(.c) R,
++        map: *const fn (u64, usize, usize, u64, c_ulonglong) callconv(.c) R,
++        unmap: *const fn (u64, usize) callconv(.c) R,
++        setAccess: *const fn (u64, usize, *const AccessDesc, usize) callconv(.c) R,
++        granularity: *const fn (*usize, *const Prop, c_int) callconv(.c) R,
++    };
++    const Prop = extern struct { // CUmemAllocationProp, as cuda/arena.zig's Vmm
++        type: c_int = 1,
++        handle_types: c_int = 0,
++        loc_type: c_int = 1,
++        loc_id: c_int = 0,
++        win32: ?*anyopaque = null,
++        compression: u8 = 0,
++        rdma: u8 = 0,
++        usage: u16 = 0,
++        reserved: [4]u8 = .{ 0, 0, 0, 0 },
++    };
++    const AccessDesc = extern struct { loc_type: c_int = 1, loc_id: c_int, flags: c_int = 3 };
++
++    comptime {
++        std.debug.assert(@sizeOf(Prop) == 32 and @offsetOf(Prop, "compression") == 24 and @sizeOf(AccessDesc) == 12);
++    }
++
++    /// The driver's VMM calls and its granularity (at least 2 MiB); no granules yet.
++    pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver) !*Pool {
++        var dev: c_int = 0;
++        try d.check(d.api.cuCtxGetDevice(&dev), "cuCtxGetDevice");
++        var ok: c_int = 0;
++        if (d.api.cuDeviceGetAttribute(&ok, .virtual_memory_management_supported, dev) != 0 or ok == 0) return error.SeqGrowUnsupported;
++        var lib = std.DynLib.open("libcuda.so.1") catch return error.SeqGrowUnsupported;
++        errdefer lib.close();
++        var api: Api = undefined;
++        const names = .{ .{ "reserve", "cuMemAddressReserve" }, .{ "addressFree", "cuMemAddressFree" }, .{ "create", "cuMemCreate" }, .{ "release", "cuMemRelease" }, .{ "map", "cuMemMap" }, .{ "unmap", "cuMemUnmap" }, .{ "setAccess", "cuMemSetAccess" }, .{ "granularity", "cuMemGetAllocationGranularity" } };
++        inline for (names) |n| @field(api, n[0]) = lib.lookup(@FieldType(Api, n[0]), n[1]) orelse return error.SeqGrowUnsupported;
++        const prop: Prop = .{ .loc_id = dev };
++        var g: usize = 0;
++        if (api.granularity(&g, &prop, 1) != 0 or g == 0) return error.SeqGrowUnsupported; // RECOMMENDED
++        g = std.mem.alignForward(usize, @max(g, 2 << 20), g);
++        const p = try gpa.create(Pool);
++        p.* = .{ .gpa = gpa, .d = d, .lib = lib, .api = api, .prop = prop, .device = dev, .granularity = g };
++        return p;
++    }
++
++    /// Makes `n` more granules (physical memory now: the pool's whole size is held from startup on).
++    pub fn grow(p: *Pool, n: usize) !void {
++        try p.free.ensureUnusedCapacity(p.gpa, n);
++        for (0..n) |_| {
++            var h: u64 = 0;
++            if (p.api.create(&h, p.granularity, &p.prop, 0) != 0) return error.OutOfMemory;
++            p.free.appendAssumeCapacity(h);
++            p.total += 1;
++        }
++    }
++
++    pub fn close(p: *Pool) void {
++        for (p.free.items) |h| _ = p.api.release(h);
++        p.free.deinit(p.gpa);
++        p.lib.close();
++        p.gpa.destroy(p);
++    }
++
++    pub fn mapper(p: *Pool) Mapper {
++        return .{ .ctx = p, .granularity = p.granularity, .take = take, .give = give, .map = map, .unmap = unmap, .reserve = reserve, .unreserve = unreserve };
++    }
++
++    pub fn available(p: *const Pool) usize {
++        return p.free.items.len;
++    }
++
++    fn of(ctx: *anyopaque) *Pool {
++        return @ptrCast(@alignCast(ctx));
++    }
++    fn take(ctx: *anyopaque) ?u64 {
++        return of(ctx).free.pop();
++    }
++    fn give(ctx: *anyopaque, h: u64) void {
++        of(ctx).free.appendAssumeCapacity(h); // its slot was reserved when the pool grew
++    }
++    fn map(ctx: *anyopaque, va: u64, h: u64) Mapped {
++        const p = of(ctx);
++        if (p.api.map(va, p.granularity, 0, h, 0) != 0) return .failed;
++        const desc: AccessDesc = .{ .loc_id = p.device };
++        if (p.api.setAccess(va, p.granularity, &desc, 1) != 0 or p.d.api.cuMemsetD8_v2(va, 0, p.granularity) != cuda.abi.success) {
++            return if (p.api.unmap(va, p.granularity) == 0) .failed else .stuck;
++        }
++        return .ok;
++    }
++    fn unmap(ctx: *anyopaque, va: u64) bool {
++        const p = of(ctx);
++        return p.api.unmap(va, p.granularity) == 0;
++    }
++    fn reserve(ctx: *anyopaque, len: usize) ?u64 {
++        const p = of(ctx);
++        var va: u64 = 0;
++        if (p.api.reserve(&va, len, p.granularity, 0, 0) != 0) return null;
++        return va;
++    }
++    fn unreserve(ctx: *anyopaque, va: u64, len: usize) void {
++        _ = of(ctx).api.addressFree(va, len);
++    }
++};
++
++/// TF_GLM_SEQ_GROW: "1" on, unset or "0" off; anything else refused by name.
++pub fn asked() !bool {
++    return parse(if (std.c.getenv("TF_GLM_SEQ_GROW")) |v| std.mem.span(v) else null);
++}
++
++fn parse(v: ?[]const u8) !bool {
++    const s = v orelse return false;
++    if (std.mem.eql(u8, s, "0")) return false;
++    if (std.mem.eql(u8, s, "1")) return true;
++    return error.BadSeqGrow;
++}
++
++/// The engine's pool (null: off). Set once at startup, before the first sequence; every State made after draws on it.
++pub var pool: ?*Pool = null;
++
++// -- tests: a fake mapper (addresses and handles only) ---------------------------------------------------------------
++
++const Fake = struct {
++    free: std.ArrayList(u64) = .empty,
++    live: std.AutoHashMapUnmanaged(u64, u64) = .empty, // va -> handle
++    zeroed: usize = 0,
++    refuse_unmap: bool = false, // a driver that will not unmap
++    stick_next: bool = false, // the next map is mapped but unusable (.stuck)
++    next_va: u64 = 1 << 40,
++    gpa: std.mem.Allocator,
++    g: usize,
++
++    fn init(gpa: std.mem.Allocator, g: usize, n: usize) !Fake {
++        var f: Fake = .{ .gpa = gpa, .g = g };
++        try f.free.ensureTotalCapacity(gpa, n);
++        for (0..n) |i| f.free.appendAssumeCapacity(i + 1);
++        return f;
++    }
++    fn deinit(f: *Fake) void {
++        f.free.deinit(f.gpa);
++        f.live.deinit(f.gpa);
++    }
++    fn mapper(f: *Fake) Mapper {
++        return .{ .ctx = f, .granularity = f.g, .take = ftake, .give = fgive, .map = fmap, .unmap = funmap, .reserve = freserve, .unreserve = funreserve };
++    }
++    fn of(ctx: *anyopaque) *Fake {
++        return @ptrCast(@alignCast(ctx));
++    }
++    fn ftake(ctx: *anyopaque) ?u64 {
++        return of(ctx).free.pop();
++    }
++    fn fgive(ctx: *anyopaque, h: u64) void {
++        of(ctx).free.appendAssumeCapacity(h);
++    }
++    fn fmap(ctx: *anyopaque, va: u64, h: u64) Mapped {
++        const f = of(ctx);
++        std.debug.assert(va % f.g == 0);
++        const gop = f.live.getOrPut(f.gpa, va) catch return .failed;
++        std.debug.assert(!gop.found_existing); // never mapped twice
++        gop.value_ptr.* = h;
++        if (f.stick_next) {
++            f.stick_next = false;
++            return .stuck;
++        }
++        f.zeroed += 1;
++        return .ok;
++    }
++    fn funmap(ctx: *anyopaque, va: u64) bool {
++        const f = of(ctx);
++        if (f.refuse_unmap) return false;
++        std.debug.assert(f.live.remove(va));
++        return true;
++    }
++    fn freserve(ctx: *anyopaque, len: usize) ?u64 {
++        const f = of(ctx);
++        const va = f.next_va;
++        f.next_va += std.mem.alignForward(usize, len, f.g) + f.g;
++        return va;
++    }
++    fn funreserve(_: *anyopaque, _: u64, _: usize) void {}
++};
++
++const T = std.testing;
++
++/// A kv8 latent field (codes then scales) of `cap` rows, then an index-key field, as cuda_state lays them out.
++fn testRegion(gpa: std.mem.Allocator, m: Mapper, cap: usize, out: *[3]u64) !Region {
++    const sizes = [_]usize{ 64, cap * (576 + 8), cap * 256 }; // a fixed field (no planes) is given 0 here by the caller
++    const planes = [_]?[2]Plane{ null, .{ .{ .off = 0, .row = 576 }, .{ .off = cap * 576, .row = 8 } }, .{ .{ .off = 0, .row = 256 }, .{ .off = 0, .row = 0 } } };
++    const np = [_]u8{ 0, 2, 1 };
++    var s = sizes;
++    s[0] = 0; // fixed fields live in the State's own arena
++    return Region.init(gpa, m, &s, &planes, &np, out);
++}
++
++test "GLM seq grow: granules follow the rows: each plane's prefix, merged where codes meet scales" {
++    const g: usize = 4096;
++    const cap: usize = 1000;
++    var f = try Fake.init(T.allocator, g, 1000);
++    defer f.deinit();
++    var out: [3]u64 = undefined;
++    var r = try testRegion(T.allocator, f.mapper(), cap, &out);
++    defer r.deinit();
++    try T.expectEqual(@as(u64, 0), out[0]);
++    try T.expect(out[1] % g == 0 and out[2] % g == 0 and out[2] > out[1]);
++    // 10 rows: codes 5,760 B (2 granules), scales at 576,000 .. 576,080 (1 granule), keys 2,560 B (1 granule)
++    try T.expectEqual(@as(usize, 4), r.need(10));
++    try r.ensure(10);
++    try T.expectEqual(@as(usize, 4), r.mapped);
++    try T.expectEqual(@as(usize, 4), f.live.count());
++    // the whole capacity: the field's granules, codes and scales sharing the one they meet in
++    const whole_lat = (cap * (576 + 8) + g - 1) / g;
++    const whole_ik = (cap * 256 + g - 1) / g;
++    try T.expectEqual(whole_lat + whole_ik, r.need(cap));
++    try r.ensure(cap);
++    try T.expectEqual(whole_lat + whole_ik, r.mapped);
++    try T.expectEqual(@as(usize, 1000 - whole_lat - whole_ik), f.free.items.len);
++}
++
++test "GLM seq grow: trim gives back exactly the granules past the kept rows, and maps them again on demand" {
++    const g: usize = 4096;
++    var f = try Fake.init(T.allocator, g, 1000);
++    defer f.deinit();
++    var out: [3]u64 = undefined;
++    var r = try testRegion(T.allocator, f.mapper(), 1000, &out);
++    defer r.deinit();
++    try r.ensure(1000);
++    const full = r.mapped;
++    r.trim(10);
++    try T.expectEqual(r.need(10), r.mapped);
++    try T.expectEqual(@as(usize, 1000 - r.need(10)), f.free.items.len);
++    try T.expectEqual(r.need(10), f.live.count());
++    try r.ensure(500);
++    try T.expectEqual(r.need(500), r.mapped);
++    try r.ensure(1000);
++    try T.expectEqual(full, r.mapped);
++    r.trim(0);
++    try T.expectEqual(@as(usize, 0), r.mapped);
++    try T.expectEqual(@as(usize, 1000), f.free.items.len);
++}
++
++test "GLM seq grow: an empty pool refuses with LaneMemory and keeps what it mapped; two regions share one pool" {
++    const g: usize = 4096;
++    var out: [3]u64 = undefined;
++    var probe = try Fake.init(T.allocator, g, 0);
++    defer probe.deinit();
++    var p0 = try testRegion(T.allocator, probe.mapper(), 1000, &out);
++    const one = p0.need(1000);
++    p0.deinit();
++    var f = try Fake.init(T.allocator, g, one); // the pool of exactly one whole-window region
++    defer f.deinit();
++    var a = try testRegion(T.allocator, f.mapper(), 1000, &out);
++    defer a.deinit();
++    var b = try testRegion(T.allocator, f.mapper(), 1000, &out);
++    defer b.deinit();
++    try a.ensure(400);
++    try b.ensure(400);
++    try T.expectEqual(one - a.need(400) - b.need(400), f.free.items.len);
++    try T.expectError(error.LaneMemory, a.ensure(1000)); // both cannot have the whole window
++    try T.expect(a.mapped >= a.need(400));
++    b.trim(0);
++    a.trim(400);
++    try a.ensure(1000); // alone again: the whole window fits
++    try T.expectEqual(one, a.mapped);
++}
++
++test "GLM seq grow: a granule the driver will not unmap stays mapped and is never given back" {
++    const g: usize = 4096;
++    var f = try Fake.init(T.allocator, g, 1000);
++    defer f.deinit();
++    var out: [3]u64 = undefined;
++    var r = try testRegion(T.allocator, f.mapper(), 1000, &out);
++    try r.ensure(1000);
++    const held = r.mapped;
++    f.refuse_unmap = true;
++    r.trim(10);
++    try T.expectEqual(held, r.mapped); // nothing given back
++    try T.expectEqual(@as(usize, 1000 - held), f.free.items.len);
++    try T.expect(r.unmap_failed > 0);
++    f.refuse_unmap = false;
++    r.trim(0);
++    try T.expectEqual(@as(usize, 0), r.mapped);
++    try T.expectEqual(@as(usize, 1000), f.free.items.len);
++    r.deinit();
++}
++
++test "GLM seq grow: a stuck mapping breaks the region: no later ensure passes over it" {
++    const g: usize = 4096;
++    var f = try Fake.init(T.allocator, g, 1000);
++    defer f.deinit();
++    var out: [3]u64 = undefined;
++    var r = try testRegion(T.allocator, f.mapper(), 1000, &out);
++    defer r.deinit();
++    try r.ensure(10);
++    f.stick_next = true;
++    try T.expectError(error.SeqGrowMap, r.ensure(1000));
++    try T.expect(r.broken);
++    try T.expectError(error.SeqGrowMap, r.ensure(1000)); // not skipped as mapped
++    try T.expectError(error.SeqGrowMap, r.ensure(5)); // nor any pass at all
++    const held = r.mapped;
++    r.trim(0); // the stuck one unmaps here in the fake; the pool gets back every granule that unmapped
++    try T.expect(f.free.items.len >= 1000 - held);
++}
++
++test "GLM seq grow: the startup admission charges no stream bytes with the switch on, the whole arena off" {
++    try T.expectEqual(@as(u64, 0), admittedStreamBytes(true, 48 << 20));
++    try T.expectEqual(@as(u64, 10 << 30), admittedStreamBytes(false, 10 << 30));
++}
++
++test "GLM seq grow: the stream cap reads 1..16 (default 4) and the headroom check keeps the floor" {
++    try T.expectEqual(@as(usize, 4), try parseStreams(null));
++    try T.expectEqual(@as(usize, 2), try parseStreams("2"));
++    try T.expectError(error.BadSeqGrowStreams, parseStreams("0"));
++    try T.expectError(error.BadSeqGrowStreams, parseStreams("17"));
++    try T.expectError(error.BadSeqGrowStreams, parseStreams("x"));
++    const mib: u64 = 1 << 20;
++    try T.expect(headroomOk(hard_floor + 3 * 48 * mib, 4, 48 * mib));
++    try T.expect(!headroomOk(hard_floor + 3 * 48 * mib - 1, 4, 48 * mib));
++    try T.expect(headroomOk(hard_floor, 1, 48 * mib)); // one stream: no further fixed parts
++    try T.expect(!headroomOk(hard_floor - 1, 1, 0));
++    // TF_GLM_SEQ_GROW_FLOOR_MIB: unset keeps the 3 GiB floor; 2304..65535 MiB move it; anything else is refused
++    try T.expectEqual(hard_floor, try parseFloorMib(null));
++    try T.expectEqual(@as(u64, 2560) << 20, try parseFloorMib("2560"));
++    try T.expectError(error.BadSeqGrowFloor, parseFloorMib("2303"));
++    try T.expectError(error.BadSeqGrowFloor, parseFloorMib("65536"));
++    try T.expectError(error.BadSeqGrowFloor, parseFloorMib("3g"));
++    const f: u64 = 2560 * mib;
++    try T.expect(headroomAt(f, f + 3 * 48 * mib, 4, 48 * mib));
++    try T.expect(!headroomAt(f, f + 3 * 48 * mib - 1, 4, 48 * mib));
++    try T.expect(!headroomOk(f + 3 * 48 * mib, 4, 48 * mib)); // the default floor still refuses what 2560 accepts
++    try T.expectEqual(@as(?u64, 65536 * 1024), memAvailableOf("MemTotal: 131072 kB\nMemFree: 1 kB\nMemAvailable:   65536 kB\n"));
++    try T.expectEqual(@as(?u64, null), memAvailableOf("MemAvailable: 65536 MB\n"));
++    try T.expectEqual(@as(?u64, null), memAvailableOf("MemTotal: 1 kB\n"));
++}
++
++test "GLM seq grow: the ranks agree on the switch, the cap and the headroom, or all refuse" {
++    const on4 = Verdict.encode(.{ .on = true, .cap = 4, .fits = true, .floor_mib = 3072 });
++    const on4short = Verdict.encode(.{ .on = true, .cap = 4, .fits = false, .floor_mib = 3072 });
++    const on1 = Verdict.encode(.{ .on = true, .cap = 1, .fits = true, .floor_mib = 3072 });
++    const bad = Verdict.encode(.{ .on = true, .cap = 0, .fits = false });
++    const off = Verdict.encode(.{ .on = false });
++    try T.expect(Verdict.agree(&.{ off, off, off, off }) == .off);
++    try T.expectEqual(@as(usize, 4), Verdict.agree(&.{ on4, on4, on4, on4 }).on);
++    try T.expect(Verdict.agree(&.{ on4, on4, off, on4 }) == .refuse); // the switch on some ranks only
++    try T.expect(Verdict.agree(&.{ on4, on1, on4, on4 }) == .refuse); // caps differ
++    try T.expect(Verdict.agree(&.{ on4, on4, on4short, on4 }) == .refuse); // one rank short
++    try T.expect(Verdict.agree(&.{ bad, bad, bad, bad }) == .refuse); // an unreadable cap everywhere
++    try T.expect(Verdict.agree(&.{}) == .refuse);
++    // the floor travels in the word: ranks that read different floors refuse, an unreadable floor refuses everywhere
++    const f3072 = Verdict.encode(.{ .on = true, .cap = 4, .fits = true, .floor_mib = 3072 });
++    const f2560 = Verdict.encode(.{ .on = true, .cap = 4, .fits = true, .floor_mib = 2560 });
++    const f0 = Verdict.encode(.{ .on = true, .cap = 4, .fits = true, .floor_mib = 0 });
++    try T.expectEqual(@as(usize, 4), Verdict.agree(&.{ f2560, f2560, f2560, f2560 }).on);
++    try T.expect(Verdict.agree(&.{ f2560, f3072, f3072, f3072 }) == .refuse); // one rank lowered its floor
++    try T.expect(Verdict.agree(&.{ f0, f0, f0, f0 }) == .refuse); // a bad value on every rank
++}
++
++test "GLM seq grow: admission counts every slot's hold and lets a lone stream reuse its idle slot's rows" {
++    // alone on slot 0, whose idle rows fill the pool: it fits (its pass trims them)
++    try T.expect(admits(100, &.{.{ .mapped = 100 }}, 0, 100));
++    // a live stream on slot 1 granted 60 (mapping 10 so far) and idle slot 0 mapping 30: a new stream on slot 0
++    try T.expect(admits(100, &.{ .{ .mapped = 30 }, .{ .mapped = 10, .granted = 60 } }, 0, 40));
++    try T.expect(!admits(100, &.{ .{ .mapped = 30 }, .{ .mapped = 10, .granted = 60 } }, 0, 41)); // the grant counts, not the 10 mapped
++    try T.expect(!admits(100, &.{ .{ .mapped = 50 }, .{ .mapped = 10, .granted = 60 } }, 0, 10)); // the idle rows count until trimmed
++    // a new slot (no sequence yet) beside two live ones
++    try T.expect(admits(100, &.{ .{ .mapped = 20, .granted = 30 }, .{ .mapped = 40, .granted = 40 }, null }, 2, 30));
++    try T.expect(!admits(100, &.{ .{ .mapped = 20, .granted = 30 }, .{ .mapped = 40, .granted = 40 }, null }, 2, 31));
++    try T.expect(!admits(100, &.{ .{ .mapped = 20, .granted = 30 }, .{ .mapped = 40, .granted = 40 } }, 5, 31)); // f past the list
++}
++
++test "GLM seq grow: the switch reads 1 and 0 and refuses anything else" {
++    try T.expect(!try parse(null));
++    try T.expect(!try parse("0"));
++    try T.expect(try parse("1"));
++    try T.expectError(error.BadSeqGrow, parse("on"));
++    try T.expectError(error.BadSeqGrow, parse(""));
++}
+diff --git a/zig/src/families/glm/cuda_seq_grow_gpu_test.zig b/zig/src/families/glm/cuda_seq_grow_gpu_test.zig
+new file mode 100644
+index 000000000..47d30e460
+--- /dev/null
++++ b/zig/src/families/glm/cuda_seq_grow_gpu_test.zig
+@@ -0,0 +1,91 @@
++//! TF_GLM_SEQ_GROW on a device (TF_SEQ_GROW_GPU=1; skipped without): the real pool's granules mapped, zeroed, kept
++//! across trims, refused when spent, given back. Rows are written and read back through the driver.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const grow = @import("cuda_seq_grow.zig");
++
++const T = std.testing;
++
++fn put(d: *const cuda.Driver, va: u64, bytes: []const u8) !void {
++    try d.check(d.api.cuMemcpyHtoD_v2(va, bytes.ptr, bytes.len), "cuMemcpyHtoD");
++}
++
++fn get(d: *const cuda.Driver, va: u64, out: []u8) !void {
++    try d.check(d.api.cuMemcpyDtoH_v2(out.ptr, va, out.len), "cuMemcpyDtoH");
++}
++
++/// A kv8 latent field (576-byte codes then 8-byte scales) and an index-key field (256 B) of `cap` rows, as cuda_state.
++fn region(gpa: std.mem.Allocator, m: grow.Mapper, cap: usize, out: *[2]u64) !grow.Region {
++    const sizes = [_]usize{ cap * (576 + 8), cap * 256 };
++    const planes = [_]?[2]grow.Plane{ .{ .{ .off = 0, .row = 576 }, .{ .off = cap * 576, .row = 8 } }, .{ .{ .off = 0, .row = 256 }, .{ .off = 0, .row = 0 } } };
++    const np = [_]u8{ 2, 1 };
++    return grow.Region.init(gpa, m, &sizes, &planes, &np, out);
++}
++
++test "GLM seq grow GPU: granules map zeroed, keep their rows across a trim, run out, and come back" {
++    if (std.c.getenv("TF_SEQ_GROW_GPU") == null) return error.SkipZigTest;
++    const gpa = T.allocator;
++    var drv = try cuda.Driver.open();
++    var ctx = try cuda.Context.init(&drv, 0);
++    defer ctx.deinit();
++    const pool = try grow.Pool.open(gpa, &drv);
++    defer pool.close();
++    const cap: usize = 20000;
++    var a_at: [2]u64 = undefined;
++    var a = try region(gpa, pool.mapper(), cap, &a_at);
++    const whole = a.need(cap);
++    try pool.grow(whole); // the pool of one whole region, as the engine makes it
++    try T.expectEqual(whole, pool.available());
++
++    // rows 0..1000 of codes, scales and keys written, read back; the rest of their granules reads zero
++    try a.ensure(1000);
++    const codes = try gpa.alloc(u8, 1000 * 576);
++    defer gpa.free(codes);
++    for (codes, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
++    try put(&drv, a_at[0], codes);
++    try put(&drv, a_at[0] + cap * 576, codes[0 .. 1000 * 8]);
++    try put(&drv, a_at[1], codes[0 .. 1000 * 256]);
++    const back = try gpa.alloc(u8, 1000 * 576);
++    defer gpa.free(back);
++    try get(&drv, a_at[0], back);
++    try T.expectEqualSlices(u8, codes, back);
++    const tail = try gpa.alloc(u8, pool.granularity);
++    defer gpa.free(tail);
++    const g = pool.granularity;
++    const past = std.mem.alignForward(usize, 1000 * 576, g) - 1000 * 576; // the codes granule's rest past row 1000
++    try get(&drv, a_at[0] + 1000 * 576, tail[0..past]);
++    for (tail[0..past]) |b| try T.expectEqual(@as(u8, 0), b);
++
++    // a second region on the same pool: A takes the whole window, B has none; A trimmed back to 1000 rows keeps them
++    var b_at: [2]u64 = undefined;
++    var b = try region(gpa, pool.mapper(), cap, &b_at);
++    try a.ensure(cap);
++    try T.expectEqual(@as(usize, 0), pool.available());
++    try T.expectError(error.LaneMemory, b.ensure(10));
++    a.trim(1000);
++    try get(&drv, a_at[0], back);
++    try T.expectEqualSlices(u8, codes, back);
++    const keys = try gpa.alloc(u8, 1000 * 256);
++    defer gpa.free(keys);
++    try get(&drv, a_at[1], keys);
++    try T.expectEqualSlices(u8, codes[0 .. 1000 * 256], keys);
++    var rows_b: usize = 0; // the most rows (in steps of 1000) whose granules A gave back
++    while (rows_b + 1000 <= cap and b.need(rows_b + 1000) <= pool.available()) rows_b += 1000;
++    try T.expect(rows_b >= 1000);
++    try b.ensure(rows_b); // the granules A gave back serve B
++    try T.expectError(error.LaneMemory, b.ensure(cap)); // and no more than those
++    try put(&drv, b_at[0], codes);
++
++    // B's granules given back and mapped again by A: the rows past A's kept ones read zero, not B's bytes
++    b.deinit();
++    try a.ensure(cap);
++    try get(&drv, a_at[0] + 1000 * 576, tail[0..past]);
++    for (tail[0..past]) |x| try T.expectEqual(@as(u8, 0), x);
++    const far = std.mem.alignForward(usize, 1000 * 576, g); // a granule A had given back and mapped again
++    try get(&drv, a_at[0] + far, tail);
++    for (tail) |x| try T.expectEqual(@as(u8, 0), x);
++    a.deinit();
++    try T.expectEqual(whole, pool.available());
++    std.debug.print("GLM seq grow GPU: granule {d} MiB, {d} granules a {d}-row region, refused when spent, rows kept across a trim, remapped granules zeroed\n", .{ g >> 20, whole, cap });
++}
+diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
+index 6a71d3c47..2db4245b6 100644
+--- a/zig/src/families/glm/cuda_snapshots.zig
++++ b/zig/src/families/glm/cuda_snapshots.zig
+@@ -25,6 +25,8 @@ pub fn prepare(e: anytype, budget: u64) !void {
+ /// `budget` bytes of device pages and `host` bytes of pinned host pages, made once.
+ pub fn prepareTiers(e: anytype, budget: u64, host: u64) !void {
+     if (e.snap_pages != null or e.snaps.count() != 0) return error.SnapshotCacheMade;
++    // TF_GLM_SEQ_GROW: a kept state's restore writes rows no pass mapped; the two do not combine (PROMPT_CACHE_GIB=0)
++    if (@import("cuda_seq_grow.zig").pool != null and budget + host > 0) return error.SeqGrowPromptCache;
+     const count = std.math.cast(u32, budget / pages.page + host / pages.page) orelse return error.SnapshotBudget;
+     try e.snaps.ensureTotalCapacity(e.gpa, count);
+     try e.dropped.ensureTotalCapacity(e.gpa, @as(usize, count) + 1);
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index fdcc5ff62..323c6f118 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -14,6 +14,7 @@ const moe = @import("cuda_moe.zig");
+ const glue = @import("cuda_glue.zig");
+ const mlp = @import("cuda_mlp.zig");
+ const kda_block = @import("cuda_kda_block.zig");
++const seq_grow = @import("cuda_seq_grow.zig");
+ 
+ /// A prompt chunk's rows (decode.PREFILL_ROWS).
+ pub const prefill_rows = 4096;
+@@ -447,6 +448,50 @@ pub const Buffers = struct {
+     }
+ };
+ 
++
++/// TF_GLM_SEQ_GROW: a Region for `sizes`' row fields (each cache's latent rows, codes then scales, and its index keys).
++/// Their entries in `sizes` become 0, so the arena makes only the fixed fields, and `p` gets their region addresses.
++fn growRegion(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, kv8: bool, sizes: []usize, p: []u64) !*seq_grow.Region {
++    const c = &w.config;
++    const nd = mlaLayers(w);
++    const lw = c.kv_lora + c.rope;
++    const rows = latRows(capacity);
++    const gs = try gpa.alloc(usize, sizes.len);
++    defer gpa.free(gs);
++    const planes = try gpa.alloc(?[2]seq_grow.Plane, sizes.len);
++    defer gpa.free(planes);
++    const np = try gpa.alloc(u8, sizes.len);
++    defer gpa.free(np);
++    const out = try gpa.alloc(u64, sizes.len);
++    defer gpa.free(out);
++    @memset(gs, 0);
++    @memset(planes, null);
++    @memset(np, 0);
++    for (0..nd + 1) |j| {
++        const lc = 8 + 4 * j;
++        const ik = 9 + 4 * j;
++        if (sizes[lc] > 0) {
++            gs[lc] = sizes[lc];
++            planes[lc] = if (kv8) .{ .{ .off = 0, .row = lw }, .{ .off = rows * lw, .row = latent.scaleBytes(lw) } } else .{ .{ .off = 0, .row = lw * 2 }, .{ .off = 0, .row = 0 } };
++            np[lc] = if (kv8) 2 else 1;
++            std.debug.assert(sizes[lc] == try latent.cacheBytes(rows, lw, kv8));
++        }
++        if (sizes[ik] > 0) {
++            gs[ik] = sizes[ik];
++            planes[ik] = .{ .{ .off = 0, .row = c.i_dim * 2 }, .{ .off = 0, .row = 0 } };
++            np[ik] = 1;
++        }
++    }
++    const r = try gpa.create(seq_grow.Region);
++    errdefer gpa.destroy(r);
++    r.* = try seq_grow.Region.init(gpa, seq_grow.pool.?.mapper(), gs, planes, np, out);
++    for (gs, 0..) |n, i| if (n > 0) {
++        sizes[i] = 0;
++        p[i] = out[i];
++    };
++    return r;
++}
++
+ /// A sequence's committed caches on a rank (the Python family's State): KDA conv and states, saved rows, DSA caches.
+ pub const State = struct {
+     arena: Arena,
+@@ -487,6 +532,8 @@ pub const State = struct {
+     ltable: u64 = 0, // sharded (TF_GLM_KV_SHARD): its latent table (i32 this rank's latent pages, `pages` entries)
+     lpages: []const u32 = &.{}, // sharded: the latent pages that table holds (cuda_kv_shard.latentIds)
+     hold: ?@import("cuda_kv_shard.zig").Hold = null, // sharded: which ranks hold its latent rows (null: unsharded)
++    grow: ?*seq_grow.Region = null, // TF_GLM_SEQ_GROW: its row fields' granules (null: the arena holds them whole)
++    grow_trim: bool = false, // a begin since the last pass: the next pass gives back the rows it does not keep
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize) !State {
+         return initFormat(gpa, d, w, capacity, false);
+@@ -543,8 +590,22 @@ pub const State = struct {
+         defer gpa.free(sizes);
+         const p = try gpa.alloc(u64, sizes.len);
+         defer gpa.free(p);
++        @memset(p, 0);
++        // TF_GLM_SEQ_GROW: the row fields (each cache's latent rows and index keys) on granules of the shared pool,
++        // the rest in the arena as before; the same addresses inside each field, so the kernels see the same layout
++        const grows = seq_grow.pool != null and paged == null and lat_split <= 1;
++        const region: ?*seq_grow.Region = if (grows) try growRegion(gpa, w, capacity, kv8, sizes, p) else null;
++        errdefer if (region) |r| {
++            r.deinit();
++            gpa.destroy(r);
++        };
++        const kept = try gpa.dupe(u64, p); // the region's field addresses: the arena hands out every entry again
++        defer gpa.free(kept);
+         var a = try arena(d, sizes, p);
+         errdefer a.buf.free();
++        if (region != null) for (0..nd + 1) |j| for ([2]usize{ 8 + 4 * j, 9 + 4 * j }) |i| {
++            if (kept[i] != 0) p[i] = kept[i];
++        };
+         const cur = try gpa.alloc(u1, nk);
+         errdefer gpa.free(cur);
+         @memset(cur, 0);
+@@ -554,7 +615,7 @@ pub const State = struct {
+         const rings = try gpa.alloc(u64, 2 * (nd + 1));
+         for (0..nd + 1) |j| rings[2 * j ..][0..2].* = .{ p[9 + 4 * j], p[10 + 4 * j] };
+         const ring_rows = if (c.dsa) capacity else @min(capacity, index_ring); // glm_moe_dsa's ik rings span the context; rebases never fire
+-        var st: State = .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + @intFromBool(head) * latRows(capacity) * (c.kv_lora + c.rope) else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = if (c.dsa) 0 else pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw, .kv8 = kv8, .head = head };
++        var st: State = .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + @intFromBool(head) * latRows(capacity) * (c.kv_lora + c.rope) else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = if (c.dsa) 0 else pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw, .kv8 = kv8, .head = head, .grow = region };
+         if (paged) |q| {
+             st.table = p[14 + 4 * nd];
+             if (q.shard) st.ltable = p[15 + 4 * nd];
+@@ -571,6 +632,10 @@ pub const State = struct {
+     }
+ 
+     pub fn deinit(st: *State) void {
++        if (st.grow) |r| {
++            r.deinit();
++            st.gpa.destroy(r);
++        }
+         st.arena.buf.free();
+         st.gpa.free(st.cur);
+         st.gpa.free(st.caches);
+@@ -585,6 +650,7 @@ pub const State = struct {
+         try d.check(d.api.cuMemsetD8Async(st.rec, 0, 2 * st.kda_layers * st.rec_layer, stream.handle), "cuMemsetD8Async");
+         @memset(st.cur, 0);
+         st.pending = 0;
++        st.grow_trim = true; // the first pass after this begin keeps only the rows it stands on (TF_GLM_SEQ_GROW)
+         st.setBases(0, 0);
+         try st.setPos(stream, 0);
+         try st.setMtpLen(stream, 0);
+@@ -616,6 +682,15 @@ pub const State = struct {
+     /// Before a pass of `rows` rows at pos: within capacity, and the index rings holding them (rebased if not).
+     pub fn ready(st: *State, stream: cuda.Stream, rows: usize) !void {
+         if (st.pos + rows > st.capacity) return error.PastCapacity;
++        if (st.grow) |r| { // TF_GLM_SEQ_GROW: the rows this pass reaches (and the margin) mapped before it runs
++            const want = @min(st.capacity, st.pos + rows + seq_grow.margin_rows);
++            if (st.grow_trim) { // the rows past where this sequence stands are the last request's: give them back
++                try stream.synchronize(); // nothing queued may still read a granule that goes
++                r.trim(want);
++                st.grow_trim = false;
++            }
++            try r.ensure(want);
++        }
+         if (st.pos + rows > st.base + st.ring_rows) try st.rebase(stream, false);
+     }
+ 
+-- 
+2.43.0
+

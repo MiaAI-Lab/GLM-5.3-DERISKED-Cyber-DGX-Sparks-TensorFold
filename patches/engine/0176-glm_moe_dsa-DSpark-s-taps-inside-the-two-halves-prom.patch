@@ -1,0 +1,66 @@
+From 5e668b0a24619674e60058026d5cf3b015408b08 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 10:35:05 +0200
+Subject: [PATCH 176/178] glm_moe_dsa: DSpark's taps inside the two-halves
+ prompt path (each half's rows after its ffn exchange, on the side stream)
+
+Tapped prompt chunks ran whole (no exchange under compute): -8% prefill at 9K, -3% at 37K with DSpark on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda_forward.zig | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 4d15abb..7746d2f 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -673,7 +673,7 @@ pub const Forward = struct {
+                 const nch = @min(latent.chunksFor(st.pos + lo[h] + rows[h]), b.nch);
+                 try dsa_block.body(k, f.stream, a, st.caches[di], dsa[h], normed[h], D, rows[h], pos_dev[h], st.pos + lo[h], nch, b.part_rows, null);
+                 try dsa_block.fill(f.set(), f.stream, a, dsa[h], 0, rows[h], part[h]);
+-                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h]);
++                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h], null);
+             }
+             prof_mod.context(f.prof, j, null, .ffn);
+             for (0..2) |h| {
+@@ -689,7 +689,7 @@ pub const Forward = struct {
+                         try moe.fill(f.moeKernels(), f.stream, m, b.moe, normed[h], D, 0, rows[h], true, part[h]);
+                     },
+                 }
+-                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h]);
++                try f.sideExchange(p, h, side_comm, part[h], part[h] + span_bytes, hidden[h], rows[h], if (f.taps) |t| .{ .t = t, .j = j, .x = b.hidden, .lo = lo[h] } else null);
+             }
+             di += 1;
+         }
+@@ -697,10 +697,16 @@ pub const Forward = struct {
+     }
+ 
+     /// Half h's exchange on the side stream after the main stream's work so far; p.gathered[h] marks it done.
+-    fn sideExchange(f: *const Forward, p: *const Pieces, h: usize, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, rows: usize) !void {
++    /// A layer's ffn exchange taps its half's finished residual rows on the side stream before `gathered` (DSpark).
++    const HalfTap = struct { t: taps_mod.Taps, j: usize, x: u64, lo: usize };
++
++    fn sideExchange(f: *const Forward, p: *const Pieces, h: usize, comm: cuda.nccl.Comm, part: u64, end: u64, hidden: u64, rows: usize, tap: ?HalfTap) !void {
+         try p.filled[h].record(f.stream);
+         try p.side.wait(p.filled[h]);
+         try f.scatterRows(p.side, comm, part, end, hidden, rows);
++        // the half's rows of the layer, gathered whole in hidden on this stream: the next layer's exchange of this half
++        // (the only writer of these rows) follows on the same stream, and the chunk's end waits for `gathered`
++        if (tap) |q| try q.t.at(p.side, q.j, q.x, q.lo, rows);
+         try p.gathered[h].record(p.side);
+     }
+ 
+@@ -711,7 +717,7 @@ pub const Forward = struct {
+         const D = c.hidden;
+         const pf = f.prefetch();
+         if (f.taps != null and f.taps.?.dsa == 0) return error.DsaTaps; // DFlash2's 4-stream taps: not this stream
+-        if (f.taps == null and f.dsaHalves(R)) return f.wholeDsaHalves(R); // tapped chunks run whole (taps after each layer)
++        if (f.dsaHalves(R)) return f.wholeDsaHalves(R); // DSpark's taps: each half's rows after its ffn exchange
+         var di: usize = 0;
+         for (f.ranks[0].w.layers, 0..) |_, j| {
+             prof_mod.context(f.prof, j, null, .mixer);
+-- 
+2.43.0
+

@@ -1,0 +1,148 @@
+From 4f12f4f938f24bc0a6ab838faabe0874c2a1835b Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <noreply@localhost>
+Date: Mon, 23 Nov 2026 02:20:23 +0200
+Subject: [PATCH 220/222] glm: unified prefill candidates: bit 22 in-place
+ prompt reduce-scatter (U7a), bit 23 one-launch absorb_q (U8b)
+
+---
+ zig/kernels/cuda/glm_glue_num.cuh     | 17 +++++++++++++----
+ zig/src/families/glm/cuda_forward.zig |  7 +++++++
+ zig/src/families/glm/cuda_glue.zig    |  2 ++
+ zig/src/families/glm/cuda_latent.zig  |  6 ++++++
+ zig/src/families/glm/cuda_native.zig  |  2 ++
+ zig/src/families/glm/policy.zig       |  2 ++
+ 6 files changed, 32 insertions(+), 4 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_num.cuh b/zig/kernels/cuda/glm_glue_num.cuh
+index 557fb16d4..ed2dd7581 100644
+--- a/zig/kernels/cuda/glm_glue_num.cuh
++++ b/zig/kernels/cuda/glm_glue_num.cuh
+@@ -43,16 +43,18 @@ struct LatTile {
+   static constexpr int A = LBM * LAP, B = B_KN ? LBK * LBP : LBN * LAP, STAGE = (A + B) * 2;
+ };
+ 
+-template <bool B_KN, int STAGES>
++// HS (U8b, GLM policy bit 23): head h's x and out at h x_hs and h o_hs (glm_moe_dsa's 256-wide q heads and 576-wide out
++// heads) instead of h K and h N; every block's loads and MMAs are those of the one-head launch at those bases.
++template <bool B_KN, int STAGES, bool HS = false>
+ __device__ __forceinline__ void latent_mma(const __nv_bfloat16* __restrict__ x, int64_t xr,
+                                            const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out,
+-                                           int64_t orow, int64_t rows, int N, int K) {
++                                           int64_t orow, int64_t rows, int N, int K, int64_t x_hs = 0, int64_t o_hs = 0) {
+   using T = LatTile<B_KN>;
+   constexpr int MT = 4, NT = 4;
+   extern __shared__ __align__(16) unsigned char lat_smem[];
+   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp >> 2, wn = warp & 3;
+   const int64_t n0 = (int64_t)blockIdx.x * LBN, m0 = (int64_t)blockIdx.y * LBM, h = blockIdx.z;
+-  const __nv_bfloat16* xa = x + h * K;
++  const __nv_bfloat16* xa = x + h * (HS ? x_hs : (int64_t)K);
+   const __nv_bfloat16* wb = w + h * (int64_t)K * N;
+   auto sa = [&](int st) { return reinterpret_cast<__nv_bfloat16*>(lat_smem + st * T::STAGE); };
+   auto sb = [&](int st) { return reinterpret_cast<__nv_bfloat16*>(lat_smem + st * T::STAGE) + T::A; };
+@@ -122,7 +124,7 @@ __device__ __forceinline__ void latent_mma(const __nv_bfloat16* __restrict__ x,
+   }
+   wait<0>();
+   const int g = lane >> 2, t = lane & 3;
+-  __nv_bfloat16* o = out + h * N;
++  __nv_bfloat16* o = out + h * (HS ? o_hs : (int64_t)N);
+ #pragma unroll
+   for (int i = 0; i < MT; ++i)
+ #pragma unroll
+@@ -147,6 +149,13 @@ extern "C" __global__ void __launch_bounds__(256)
+   glm_num::latent_mma<true, 3>(x, xr, w, out, orow, rows, n, k);
+ }
+ 
++// absorb_q for glm_moe_dsa prompt rows in one launch (U8b): heads at q + h x_hs, out + h o_hs.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_latent_mma_kn_hs(const __nv_bfloat16* x, int64_t xr, const __nv_bfloat16* w, __nv_bfloat16* out, int64_t orow,
++                            int64_t rows, int n, int k, int64_t x_hs, int64_t o_hs) {
++  glm_num::latent_mma<true, 3, true>(x, xr, w, out, orow, rows, n, k, x_hs, o_hs);
++}
++
+ // expand_v for prompt rows: out [rows][heads][256] = o_lat [rows][heads][512] . wv [heads][256][512] (B as [N][K]).
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_latent_mma_nk(const __nv_bfloat16* x, int64_t xr, const __nv_bfloat16* w, __nv_bfloat16* out, int64_t orow,
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 02ba9e839..6b4e9344c 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -741,6 +741,13 @@ pub const Forward = struct {
+         try n.lib.check(n.lib.api.ncclReduceScatter(part, recv, per * D, .f32, .sum, comm, stream.handle), "ncclReduceScatter");
+         const lo = @min(R, rank * per);
+         const mine = @min(R, lo + per) - lo;
++        // policy bit 22 (U7a): with R a multiple of the ranks every rank's rows are its own `per`: the sums added in
++        // place into the residual rows and gathered into them (NCCL's in-place all-gather), no copy back
++        if (own == null and padded == R and policy_mod.on(f.policy, .scatter_inplace)) {
++            try glue.residualAdd(f.set(), stream, hidden + lo * D * 2, hidden + lo * D * 2, recv, mine, D, 1);
++            try n.lib.check(n.lib.api.ncclAllGather(hidden + rank * per * D * 2, hidden, per * D, .bf16, comm, stream.handle), "ncclAllGather");
++            return;
++        }
+         if (mine > 0) try glue.residualAdd(f.set(), stream, hidden + lo * D * 2, rows_b16 + rank * per * D * 2, recv, mine, D, 1);
+         if (own) |o| {
+             const w = o.l.q_lora + o.l.rowW();
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 1548459a2..3dfee3a6b 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -97,6 +97,7 @@ pub const Kernels = struct {
+     copy_segs: cuda.Function, // several 16-byte-aligned copies a launch (a shared window's KDA projection rows)
+     scores: cuda.Function,
+     latent_mma_kn: cuda.Function, // TF_GLM_ABSORB_MMA (glm_glue_num.cuh): absorb_q's head-batched GEMM, B as [K][N]
++    latent_mma_kn_hs: cuda.Function, // policy bit 23 (U8b): glm_moe_dsa's absorb_q heads in one launch, real head strides
+     latent_mma_nk: cuda.Function, // and expand_v's, B as [N][K]
+     absorb_q_dsa: cuda.Function, // glm_moe_dsa's absorb: q_nope 192 of the head's 256 dims, out rows 576 wide
+     qa_rope: cuda.Function, // its roped query tails into the absorbed rows' top (glm_glue_latent.cuh)
+@@ -157,6 +158,7 @@ pub const Kernels = struct {
+         try k.chunks_16_w576_s4_i8.allowDynamicShared(chunksSmemW(16, dsa_row));
+         try k.chunks_16_fused_w576_i8.allowDynamicShared(chunksSmemW(16, dsa_row));
+         try k.latent_mma_kn.allowDynamicShared(latent_mma_smem[0]);
++        try k.latent_mma_kn_hs.allowDynamicShared(latent_mma_smem[0]);
+         try k.latent_mma_nk.allowDynamicShared(latent_mma_smem[1]);
+         return k;
+     }
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index 190cf48a8..474bbd925 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -43,6 +43,12 @@ pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, ro
+         // places head h at x + h K and out + h N (192 and 512), which read the previous head's rope dims and wrote
+         // over the next head's row: every prompt of 64 rows or more attended with scrambled queries. One launch a
+         // head, its bases moved by the real strides (16-byte aligned: 512 and 1,152 bytes a head).
++        if (@import("policy.zig").on(set.policy, .absorb_one)) { // policy bit 23 (U8b): every head in one launch
++            if (lw % 128 != 0 or d % 32 != 0) return error.LatentShape;
++            var a: cuda.Args = .{};
++            inline for (.{ q, @as(i64, @intCast(heads * qs)), wk, out, @as(i64, @intCast(heads * os)), @as(i64, @intCast(rows)), @as(c_int, @intCast(lw)), @as(c_int, @intCast(d)), @as(i64, @intCast(qs)), @as(i64, @intCast(os)) }) |v| a.add(v);
++            return cuda.launch.launch(set.glue.latent_mma_kn_hs, .{ .grid = .{ .x = @intCast(lw / 128), .y = cdiv(rows, 128), .z = @intCast(heads) }, .block = .{ .x = 256 }, .shared = glue.latent_mma_smem[0] }, stream, &a);
++        }
+         for (0..heads) |h| try headsMma(set.glue.latent_mma_kn, glue.latent_mma_smem[0], stream, q + h * qs * 2, heads * qs, wk + h * d * lw * 2, out + h * os * 2, heads * os, rows, 1, lw, d);
+         return;
+     }
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index f101d9dc4..d4f473bd4 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -536,6 +536,8 @@ fn policyBoot(e: *const engine.Engine) policy.Boot {
+     if (e.mesh != null) b.offered |= policy.bit(.dflash_mesh); // 17: the mesh is up on every rank or none
+     if (e.m.mm.decode_p2 != null) b.offered |= policy.bit(.mm8_p2); // 18: the P2 decode forms loaded
+     b.offered |= policy.bit(.down_nodead); // 19: tf_exl3_down_combine_nd (falls back to the storing kernel if absent)
++    b.offered |= policy.bit(.scatter_inplace); // 22: the prompt exchange's in-place sums and gather (exact)
++    b.offered |= policy.bit(.absorb_one); // 23: tf_glm_latent_mma_kn_hs, every rank loads glm_glue
+     std.log.info("request policies on (TF_GLM_POLICY_REQUESTS=1): default 0x{x}, offered 0x{x}", .{ b.default & b.offered, b.offered });
+     return b;
+ }
+diff --git a/zig/src/families/glm/policy.zig b/zig/src/families/glm/policy.zig
+index dd48a9f04..80ed00ea4 100644
+--- a/zig/src/families/glm/policy.zig
++++ b/zig/src/families/glm/policy.zig
+@@ -23,6 +23,8 @@ pub const Bit = enum(u5) {
+     down_nodead = 19, // U3b: tf_exl3_down_combine skips the fp32 slot rows nobody reads
+     lane8_mul1 = 20, // U3c: lane_states8 on the mul1 codebook
+     kw_overlap = 21, // U3d: the indexer key write on the side stream behind the [q_a | kv_a] gather
++    scatter_inplace = 22, // U7a: a prompt exchange's reduce-scatter sums added in place into the residual rows and gathered there (R % world == 0)
++    absorb_one = 23, // U8b: glm_moe_dsa's prompt absorb_q in one head-batched launch (tf_glm_latent_mma_kn_hs)
+ };
+ 
+ pub const reserved: Mask = 0x3f;
+-- 
+2.43.0
+

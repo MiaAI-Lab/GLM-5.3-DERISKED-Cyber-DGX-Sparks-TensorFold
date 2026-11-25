@@ -1,0 +1,238 @@
+From 17ddd604abc250370e9e4d40472c796eee118cba Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:17:52 +0200
+Subject: [PATCH] glm_moe_dsa: a decode window's [q_a | kv_a] split across the
+ ranks
+
+Every rank read the whole replicated [q_a | kv_a] projection (16 MB a
+layer at 8 bits) in every decode step. With the mesh up and three ranks
+or more, each rank now also loads its 64-row units of the output rows
+(448 at TP6, 384 the last rank's), computes only those in a decode
+window, the mesh gathers the slots and tf_glm_unblock lays them back into
+rows; the indexer's kw stays replicated. Prompt chunks and the MTP head
+keep the replicated projection. The idea of splitting the replicated
+GEMVs across six Sparks is knapcio's gr8 PR #84.
+TF_GLM_DSA_SPLIT_QKVA=0 keeps the replicated projection.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/kernels/cuda/glm_glue_msa.cuh           | 14 ++++++++++
+ zig/src/families/glm/cuda_dsa_block.zig     | 21 ++++++++++----
+ zig/src/families/glm/cuda_forward.zig       | 29 ++++++++++++++++++-
+ zig/src/families/glm/cuda_glue.zig          |  1 +
+ zig/src/families/glm/cuda_kv_shard_attn.zig |  2 +-
+ zig/src/families/glm/cuda_tile.zig          |  1 +
+ zig/src/families/glm/cuda_weights.zig       | 31 +++++++++++++++++++++
+ 7 files changed, 92 insertions(+), 7 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_msa.cuh b/zig/kernels/cuda/glm_glue_msa.cuh
+index 108ce89..909a369 100644
+--- a/zig/kernels/cuda/glm_glue_msa.cuh
++++ b/zig/kernels/cuda/glm_glue_msa.cuh
+@@ -270,3 +270,17 @@ extern "C" __global__ void __launch_bounds__(glm_msa::NT, 2)
+                           const int* __restrict__ pos, __nv_bfloat16* __restrict__ out, int H, float scale) {
+     glm_msa::run<true>(qa, cache, nullptr, pos, out, H, 0, scale);
+ }
++
++// glm_moe_dsa's split [q_a | kv_a] in a decode window: every rank's columns gathered as [world][rows][cw] slots, rank
++// q's slot holding [rows][n_q] (n_q = min(cw, total - q cw): its columns q cw ..), back into dst [rows][total] (rows
++// dst_stride apart). Block a row, 256 threads, 16-byte pieces where they fall (column runs of 8).
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_unblock(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ dst, int rows, int cw, int total,
++                   long long dst_stride) {
++  const int r = blockIdx.x;
++  for (int c = threadIdx.x; c < total; c += blockDim.x) {
++    const int q = c / cw, cc = c - q * cw;
++    const int nq = min(cw, total - q * cw);
++    dst[(long long)r * dst_stride + c] = src[((long long)q * rows) * cw + (long long)r * nq + cc];
++  }
++}
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index cbb9068..dbec2e8 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -38,6 +38,11 @@ pub const Layer = struct {
+     rope: usize = 0, // the rotary dims: 64 on glm_moe_dsa (its rows lw + rope wide), 0 on Flash
+     inv: u64 = 0, // the rope frequencies on the device (glm_moe_dsa); 0 without a rope plane
+     ifull: bool = true, // glm_moe_dsa's indexer_types; Flash's every layer is full
++    // TF_GLM_DSA_SPLIT_QKVA (three ranks or more, a decode window): this rank's output columns of [q_a | kv_a] (dec_n of
++    // them from rank x dec_cw), the rest gathered from the other ranks; dec_n 0: the replicated proj alone
++    proj_dec: projection.Proj = .{ .bf16 = 0 },
++    dec_n: usize = 0,
++    dec_cw: usize = 0,
+ 
+     /// The cache and query rows' width: the latent plus the rope plane.
+     pub fn rowW(l: Layer) usize {
+@@ -111,7 +116,12 @@ pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize,
+ /// The block up to its out_proj (s.vn holds the expanded rows).
+ /// `o_site` (TF_GLM_L2PF, a decode window): the out-projection read into L2 from the projections' end, under the attention.
+ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize, o_site: ?@import("cuda_l2pf.zig").At) !void {
+-    try prepareProfile(k.set, stream, l, s, x, x_stride, rows, sparseRows(l, host_pos, rows), k.prof);
++    return bodyPre(k, stream, l, c, s, x, x_stride, rows, pos, host_pos, nch, part_rows, o_site, false);
++}
++
++/// `body` with s.dp's [q_a | kv_a] already in place when `proj_done` (fw.Forward.splitProj).
++pub fn bodyPre(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize, o_site: ?@import("cuda_l2pf.zig").At, proj_done: bool) !void {
++    try prepareProfile(k.set, stream, l, s, x, x_stride, rows, sparseRows(l, host_pos, rows), k.prof, proj_done);
+     if (o_site) |at| try at.fork(stream);
+     try attend(k, stream, l, c, s, 0, rows, pos, host_pos, nch, part_rows);
+     const stamp = prof.span(k.prof, stream, .projections);
+@@ -126,18 +136,19 @@ pub fn sparseRows(l: Layer, host_pos: usize, rows: usize) bool {
+ 
+ /// The block's row-by-row part for a shared window: projections, norms, q_b, indexer, absorbed query, `qi`'s query.
+ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool) !void {
+-    return prepareProfile(set, stream, l, s, x, x_stride, rows, qi, null);
++    return prepareProfile(set, stream, l, s, x, x_stride, rows, qi, null, false);
+ }
+ 
+-pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool, profile: ?*prof.Prof) !void {
++/// `proj_done`: s.dp already holds the rows' [q_a | kv_a] (a decode window's split projection, gathered).
++pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool, profile: ?*prof.Prof, proj_done: bool) !void {
+     var stamp = prof.span(profile, stream, .replicated_qakva);
+     const width = l.q_lora + l.rowW();
+     const ix = l.index;
+     const kw_n = ix.d + ix.heads;
+     const has_ix = l.ifull; // a shared layer carries no indexer tensors at all: its kw/qb/gate reads would fault
+     // a decode window's [q_a | kv_a] and the indexer's kw read the same rows: one launch, each its own K slices
+-    const two_kw = if (has_ix) try projection.matmulTwo(set, stream, .{ l.proj, ix.kw }, .{ x, x }, .{ x_stride, x_stride }, .{ s.dp, s.ikr }, .{ width, kw_n }, .{ l.dims, l.dims }, s.mm_part, s.mm_part_bytes, rows) else false;
+-    if (!two_kw) try projection.matmul(set, stream, l.proj, x, x_stride, s.dp, s.mm_part, rows, width, l.dims, false);
++    const two_kw = if (has_ix and !proj_done) try projection.matmulTwo(set, stream, .{ l.proj, ix.kw }, .{ x, x }, .{ x_stride, x_stride }, .{ s.dp, s.ikr }, .{ width, kw_n }, .{ l.dims, l.dims }, s.mm_part, s.mm_part_bytes, rows) else false;
++    if (!two_kw and !proj_done) try projection.matmul(set, stream, l.proj, x, x_stride, s.dp, s.mm_part, rows, width, l.dims, false);
+     try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
+     // the latent rows are rowW apart (the roped tail lands at 512): their norm result strides as the buffer, not lw
+     try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.rowW(), s.xs_lat, l.eps, rows, l.lw);
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index a6df89e..9f774be 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -318,12 +318,39 @@ pub const Forward = struct {
+             .mla => |a| {
+                 const k: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof, .split = f.indexSplit(r) };
+                 // TF_GLM_KV_SHARD: one rank holds this sequence's latent rows, so it attends for both ranks' heads
+-                if (kv_attn.wanted(f, r)) try kv_attn.single(f, r, a, di, rows, nch, k) else try dsa_block.body(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, if (f.prefetch()) |pf| .{ .l2 = pf, .layer = l.index } else null);
++                if (kv_attn.wanted(f, r)) try kv_attn.single(f, r, a, di, rows, nch, k) else {
++                    const done = try f.splitProj(r, a, rows);
++                    try dsa_block.bodyPre(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows, if (f.prefetch()) |pf| .{ .l2 = pf, .layer = l.index } else null, done);
++                }
+                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
+             },
+         }
+     }
+ 
++    /// A decode window's [q_a | kv_a] split across the ranks (TF_GLM_DSA_SPLIT_QKVA, default on with the mesh): this
++    /// rank's columns into its slot of the gathered room, every rank's slots gathered by the mesh, then back into the
++    /// rows of s.dp; false (nothing run) where the replicated projection stays (a prompt chunk, no slice, no mesh).
++    fn splitProj(f: *const Forward, r: Rank, a: dsa_block.Layer, rows: usize) !bool {
++        if (r.b.prefill or a.dec_n == 0 or f.ranks.len != 1) return false;
++        const n = switch (f.exchange) {
++            .local => return false,
++            .nccl => |x| x,
++        };
++        const m = n.mesh orelse return false;
++        const world = r.w.share.world;
++        const sbytes = rows * a.dec_cw * 2;
++        if (!m.fits(sbytes) or world * sbytes > world * r.b.rows * r.w.config.hidden * 4) return false;
++        const base = r.b.gathered;
++        const mine = base + r.w.share.rank * sbytes;
++        try projection.matmul(f.set(), f.stream, a.proj_dec, r.b.normed, r.w.config.hidden, mine, r.b.dsa.mm_part, rows, a.dec_n, a.dims, false);
++        try m.allGatherBytes(mine, base, sbytes, f.stream.handle);
++        const total = a.q_lora + a.rowW();
++        var u: cuda.Args = .{};
++        inline for (.{ base, r.b.dsa.dp, @as(c_int, @intCast(rows)), @as(c_int, @intCast(a.dec_cw)), @as(c_int, @intCast(total)), @as(i64, @intCast(total)) }) |v| u.add(v);
++        try cuda.launch.launch(f.m.glue.unblock, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, f.stream, &u);
++        return true;
++    }
++
+     /// A prompt chunk's indexer rows split across the ranks (index_split) over NCCL; in-process ranks pick every row.
+     fn indexSplit(f: *const Forward, r: Rank) ?sparse.Split {
+         if (!f.index_split or !r.b.prefill) return null;
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 2b739e0..44078d0 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -107,6 +107,7 @@ pub const Kernels = struct {
+     chunks_16_w576: cuda.Function, // the chunk kernels over the dsa's 576-wide rows (512 latent + the 64 rope);
+     chunks_16_fused_w576: cuda.Function, // 16-head blocks only: the 32-head block's 113 KB passes no GB10
+     chunks_16_w576_s4: cuda.Function, // a decode window's dsa rows in chunks of 128 keys (16 a row: four times the blocks)
++    unblock: cuda.Function, // a split [q_a | kv_a]'s gathered column slots back into rows (glm_glue_msa.cuh)
+     msa_w576: cuda.Function, // glm_glue_msa.cuh: a prompt row a block over its token list, the rank's heads one m16 tile
+     msa_w576_dense: cuda.Function, // and a dense prompt row over keys 0 .. its position (the implicit list)
+ 
+diff --git a/zig/src/families/glm/cuda_kv_shard_attn.zig b/zig/src/families/glm/cuda_kv_shard_attn.zig
+index 3d7a080..c9e566f 100644
+--- a/zig/src/families/glm/cuda_kv_shard_attn.zig
++++ b/zig/src/families/glm/cuda_kv_shard_attn.zig
+@@ -184,7 +184,7 @@ pub fn single(f: *const fw.Forward, r: fw.Rank, a: dsa_block.Layer, di: usize, r
+     if (a.rope != 0) return error.DsaShardUnsupported; // glm_moe_dsa serves unsharded until its graph lands (patch 0303)
+     const kv = f.kv.?;
+     const st = r.st;
+-    try dsa_block.prepareProfile(k.set, f.stream, a, r.b.dsa, r.b.normed, r.w.config.hidden, rows, dsa_block.sparseRows(a, st.pos, rows), k.prof);
++    try dsa_block.prepareProfile(k.set, f.stream, a, r.b.dsa, r.b.normed, r.w.config.hidden, rows, dsa_block.sparseRows(a, st.pos, rows), k.prof, false);
+     const caches = [_]dsa_block.Caches{st.caches[di]};
+     const states = [_]*fw.State{st};
+     const d: Gpu = .{ .f = f, .kv = kv, .k = k, .a = a, .b = r.b, .caches = &caches, .states = &states, .nch = nch, .single = true };
+diff --git a/zig/src/families/glm/cuda_tile.zig b/zig/src/families/glm/cuda_tile.zig
+index a97bf32..260034a 100644
+--- a/zig/src/families/glm/cuda_tile.zig
++++ b/zig/src/families/glm/cuda_tile.zig
+@@ -40,6 +40,7 @@ fn layerLinears(gpa: std.mem.Allocator, l: *Layer, list: *std.ArrayList(Lin)) !v
+         },
+         .mla => |*x| {
+             try addProj(list, gpa, &x.proj, x.q_lora + x.lw + x.rope, x.dims);
++            if (x.dec_n > 0) try addProj(list, gpa, &x.proj_dec, x.dec_n, x.dims);
+             try addProj(list, gpa, &x.q_b, x.heads * x.qk, x.q_lora);
+             try addProj(list, gpa, &x.index.kw, x.index.d + x.index.heads, x.dims);
+             try addProj(list, gpa, &x.index.qb, x.index.heads * x.index.d, x.q_lora);
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index ee48803..048bfa4 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -255,6 +255,34 @@ const Loader = struct {
+         try L.format("layers.{d}.self_attn.kv_b_proj", .{i}, if (kv_mx) .mxfp8 else .bf16);
+         const kv_wide: ?formats.mxfp8.Mxfp8 = if (kv_mx) try formats.mxfp8.Mxfp8.read(L.ck, kv_name) else null;
+         const proj = try formats.cutProj(L, L.pfx, i, &.{ .{ .rel = "self_attn.q_a_proj" }, .{ .rel = "self_attn.kv_a_proj_with_mqa" } }, wants, "layers.{d}.dsa.proj");
++        // TF_GLM_DSA_SPLIT_QKVA (default on, three ranks or more, not the MTP head): this rank's 64-row units of
++        // [q_a | kv_a]'s output rows as well, for decode windows; every rank must get some (the same rule on each)
++        var proj_dec: projection.Proj = .{ .bf16 = 0 };
++        var dec_n: usize = 0;
++        var dec_cw: usize = 0;
++        const qkva: usize = c.q_lora + c.kv_lora + c.rope;
++        const world = L.w.share.world;
++        const split_on = if (std.c.getenv("TF_GLM_DSA_SPLIT_QKVA")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
++        if (c.dsa and !mtp and split_on and world >= 3 and qkva % 64 == 0) {
++            const cw = (qkva / 64 + world - 1) / world * 64;
++            if ((world - 1) * cw < qkva) {
++                const lo = L.w.share.rank * cw;
++                const hi = @min(qkva, lo + cw);
++                var parts: [2]formats.Part = undefined;
++                var np: usize = 0;
++                if (lo < c.q_lora) {
++                    parts[np] = .{ .rel = "self_attn.q_a_proj", .rows = .{ lo, @min(hi, c.q_lora) } };
++                    np += 1;
++                }
++                if (hi > c.q_lora) {
++                    parts[np] = .{ .rel = "self_attn.kv_a_proj_with_mqa", .rows = .{ @max(lo, c.q_lora) - c.q_lora, hi - c.q_lora } };
++                    np += 1;
++                }
++                proj_dec = try formats.cutProj(L, L.pfx, i, parts[0..np], wants, "layers.{d}.dsa.proj_dec");
++                dec_n = hi - lo;
++                dec_cw = cw;
++            }
++        }
+         try L.whole(try L.get("layers.{d}.self_attn.q_a_layernorm.weight", .{i}), .bf16);
+         const q_norm = try L.put("layers.{d}.dsa.q_norm", .{i});
+         try L.whole(try L.get("layers.{d}.self_attn.kv_a_layernorm.weight", .{i}), .bf16);
+@@ -315,6 +343,9 @@ const Loader = struct {
+             .rope = c.rope,
+             .inv = L.inv, // weights.load's rope frequency table (theta^-2i/rope): one upload, every layer's
+             .ifull = full, // the loader's: the MTP layer and glm_moe_dsa's indexer_types' "full" layers
++            .proj_dec = proj_dec,
++            .dec_n = dec_n,
++            .dec_cw = dec_cw,
+         };
+     }
+ 
+-- 
+2.43.0
+

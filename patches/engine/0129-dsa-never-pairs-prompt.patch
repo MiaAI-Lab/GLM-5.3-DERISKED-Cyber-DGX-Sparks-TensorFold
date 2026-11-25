@@ -1,0 +1,47 @@
+From ab25faffd2b9e6ecf5ab9d0e068c7032066d806f Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:12:39 +0200
+Subject: [PATCH] 0308: glm_moe_dsa never takes paired prompt steps
+
+pairBody runs the mHC glue: f.pre -> hcPre wants 4096-wide streams of 4,
+which glm_moe_dsa's single 6144-wide residual stream can't shape, so a
+follower's paired prompt step (two chunks under each other's exchanges,
+chosen at prompts over 8K ids) died with HcShape. pairedAt now declines
+DSA like want_pieces declines piecing, and pairBody refuses it outright
+in case a route is missed.
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+---
+ zig/src/families/glm/cuda_forward_pair.zig | 1 +
+ zig/src/families/glm/cuda_prompt_pair.zig  | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/zig/src/families/glm/cuda_forward_pair.zig b/zig/src/families/glm/cuda_forward_pair.zig
+index 2cf9f3a..c660ad3 100644
+--- a/zig/src/families/glm/cuda_forward_pair.zig
++++ b/zig/src/families/glm/cuda_forward_pair.zig
+@@ -14,6 +14,7 @@ const share = fw.Forward.share;
+ /// A chunk with DFlash2 taps is tapped on the side stream as each ffn piece's glue posts its rows,
+ /// and its taps are shared (#1623's shareTaps) once both chunks' last sites are in: the rows `pieced` would tap.
+ pub fn pairBody(a: *const Forward, b: *const Forward, ra: usize, rb: usize) !void {
++    if (a.ranks[0].w.config.dsa) return error.DsaPair; // glm_moe_dsa: pairedAt never routes it here
+     const two = [_]*const Forward{ a, b };
+     const rows = [_]usize{ ra, rb };
+     var cuts: [2][fw.max_pieces][2]usize = undefined;
+diff --git a/zig/src/families/glm/cuda_prompt_pair.zig b/zig/src/families/glm/cuda_prompt_pair.zig
+index c7d46f5..ef03509 100644
+--- a/zig/src/families/glm/cuda_prompt_pair.zig
++++ b/zig/src/families/glm/cuda_prompt_pair.zig
+@@ -80,6 +80,7 @@ pub fn ringsAgree(base: usize, ring: usize, start: usize, rb: usize) bool {
+ 
+ /// Rank 0's choice for the step at `start` (the others take the ids it sends); not with prompt rows or prof.
+ pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
++    if (e.c.dsa) return false; // glm_moe_dsa: one residual stream, no mHC — pairBody's hc glue can't shape it
+     if (e.pair == null or !e.settings.pair or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
+     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
+     if (len < minLen()) return false; // too short to gain from a pair
+-- 
+2.43.0
+

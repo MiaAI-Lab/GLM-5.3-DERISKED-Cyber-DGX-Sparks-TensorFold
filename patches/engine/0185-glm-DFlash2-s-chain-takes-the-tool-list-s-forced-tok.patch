@@ -1,0 +1,111 @@
+From 2c4de59a6cafd89577871f5a00a54a9f7b75ec78 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 00:34:00 +0200
+Subject: [PATCH 185/185] glm: DFlash2's chain takes the tool list's forced
+ tokens (0181's cursor, as DSpark's chain does)
+
+The request's tool-call cursor (tool_draft.zig, carried in dflash.Req.tools since 0181) was read by DSpark's select only.
+DFlash2's select now takes a forced token (a listed name's or key's rest, the tags between) in place of its pick, with
+chance max(its own, the rule's), steps the cursor with every draft, and reads the next slot's codebook row from the
+forced token. TF_GLM_TOOL_DRAFTS=0 turns the cursor off for both. Drafts only propose: replies stay exact.
+test-glm-tools-host: "DFlash2's chain takes the tool list's forced tokens" (dflash_select.zig now in the test list).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/cuda.zig          |  1 +
+ zig/src/families/glm/dflash_select.zig | 60 ++++++++++++++++++++++++--
+ 2 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index 83ed4280f..a77ad37cb 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -103,6 +103,7 @@ test {
+     _ = @import("heat"); // upstream's heat bands, run where the GLM ranks use them
+     _ = @import("tool_draft.zig");
+     _ = @import("dspark.zig");
++    _ = @import("dflash_select.zig");
+ }
+ 
+ pub const dflash = @import("dflash.zig");
+diff --git a/zig/src/families/glm/dflash_select.zig b/zig/src/families/glm/dflash_select.zig
+index 867fbc62c..dec3cd3f8 100644
+--- a/zig/src/families/glm/dflash_select.zig
++++ b/zig/src/families/glm/dflash_select.zig
+@@ -91,6 +91,7 @@ fn edgeWeight() f32 {
+ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
+     const out = q.out.?;
+     var prev: usize = q.anchor;
++    var tools = q.tools; // the stream's place in a tool call after its anchor (0181's cursor), stepped with the chain
+     for (1..df.BLOCK) |t| {
+         const r = i * df.BLOCK + t;
+         var c: [TOPK]Cand = undefined;
+@@ -137,8 +138,61 @@ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
+         var z: f64 = 0;
+         for (sc[0..n]) |x| z += @exp(@as(f64, x - sc[best]) / dr.temp / tc);
+         const pick = if (q.keyed) |k| race(sc[0..n], c[0..n], k, @intCast(q.pos + @as(i64, @intCast(t)))) else best;
+-        out[t - 1] = c[pick].id;
+-        if (q.probs) |p| p[t - 1] = @exp(@as(f64, sc[pick] - sc[best]) / dr.temp / tc) / z;
+-        prev = c[pick].id;
++        var id: u32 = c[pick].id;
++        var chance: f64 = @exp(@as(f64, sc[pick] - sc[best]) / dr.temp / tc) / z;
++        // the request's tool list forces this token (a name's or key's rest, the tags between), as in DSpark's chain;
++        // the next slot's codebook row is then the forced token's. Drafts only propose: replies stay exact.
++        if (tools) |*cur| {
++            if (cur.forced()) |f| {
++                id = f.id;
++                chance = @max(chance, f.conf);
++            }
++            cur.advance(id);
++        }
++        out[t - 1] = id;
++        if (q.probs) |p| p[t - 1] = chance;
++        prev = id;
++    }
++}
++
++test "GLM tool drafts: DFlash2's chain takes the tool list's forced tokens and carries on from them" {
++    const t = std.testing;
++    const gpa = t.allocator;
++    const td = @import("tool_draft.zig");
++    const world: usize = 1;
++    const M: usize = df.BLOCK;
++    var dr: df.Drafter = .{ .gpa = gpa, .d = undefined, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = df.FF, .rank = 0, .world = world };
++    dr.pred = try gpa.alloc(u16, df.VOCAB * RANK);
++    defer gpa.free(dr.pred);
++    dr.succ = try gpa.alloc(u16, df.VOCAB * RANK);
++    defer gpa.free(dr.succ);
++    @memset(dr.pred, 0);
++    @memset(dr.succ, 0);
++    dr.gh = try gpa.alloc(f32, M * RANK);
++    defer gpa.free(dr.gh);
++    @memset(dr.gh, 0);
++    dr.cand = try gpa.alloc(i32, world * M * CW);
++    defer gpa.free(dr.cand);
++    @memset(dr.cand, -1);
++    for (0..M) |r| { // every slot's only candidate is token 1
++        dr.cand[r * CW] = 1;
++        dr.cand[r * CW + TOPK] = @bitCast(@as(f32, 2.0));
+     }
++    const read = [_]u32{ 878, 2458 };
++    const run = [_]u32{ 6108, 48634 };
++    const path = [_]u32{2343};
++    const command = [_]u32{5631};
++    const schema: td.Schema = .{ .tools = &.{
++        .{ .name = &read, .params = &.{.{ .key = &path, .required = true }} },
++        .{ .name = &run, .params = &.{.{ .key = &command, .required = true }} },
++    } };
++    var out: [df.BLOCK - 1]u32 = undefined;
++    var probs: [df.BLOCK - 1]f64 = undefined;
++    select(&dr, 0, M, .{ .slot = 0, .pos = 100, .n = 0, .anchor = 878, .out = &out, .probs = &probs, .tools = schema.cursor(&.{ 5, td.tool_call, 878 }) });
++    // _file, <arg_key>, path, </arg_key>, <arg_value> forced; the value's tokens are the drafter's own (token 1, chance 1)
++    try t.expectEqualSlices(u32, &.{ 2458, td.arg_key, 2343, td.arg_key_end, td.arg_value, 1, 1 }, &out);
++    for (probs) |p| try t.expectApproxEqAbs(@as(f64, 1.0), p, 1e-12); // one candidate: chance 1, never under a forced one's
++    // without the list the chain is the drafter's alone
++    select(&dr, 0, M, .{ .slot = 0, .pos = 100, .n = 0, .anchor = 878, .out = &out, .probs = &probs });
++    try t.expectEqualSlices(u32, &.{ 1, 1, 1, 1, 1, 1, 1 }, &out);
+ }
+-- 
+2.43.0
+

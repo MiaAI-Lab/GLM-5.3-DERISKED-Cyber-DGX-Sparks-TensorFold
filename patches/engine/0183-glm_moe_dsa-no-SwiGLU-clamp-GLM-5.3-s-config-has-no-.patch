@@ -1,0 +1,52 @@
+From a88eb62e038ed02a24a9f7ff10ae43642f398b05 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:58:45 +0200
+Subject: [PATCH] glm_moe_dsa: no SwiGLU clamp (GLM-5.3's config has no
+ swiglu_limit)
+
+The glm_moe_dsa port read swiglu_limit only when config.json has it and
+otherwise kept Config's default, GLM-5.3-Flash's 10. Every dense, shared
+and routed expert of full GLM-5.3 then clamped gate <= 10 and up to
+[-10, 10], which HF's GlmMoeDsaMLP never does. The sink rows' massive
+activations (layer 9's shared expert: gate 19, up 17 on [gMASK]<sop>)
+were cut in half and every later token read the damaged sinks: flatter
+distributions everywhere, row 1 broken. glm_moe_dsa without the field now
+gets no clamp; GLM-5.3-Flash still requires it. TF_GLM_SWIGLU_LIMIT=<x>
+sets a clamp for an A/B (0 or inf: none).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNktFCvQrvpNUbqtqBX
+---
+ zig/src/families/glm/config.zig | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/config.zig b/zig/src/families/glm/config.zig
+index 9beeb283a..3133a45cc 100644
+--- a/zig/src/families/glm/config.zig
++++ b/zig/src/families/glm/config.zig
+@@ -227,7 +227,13 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
+         .float => |f| c.swiglu_limit = @floatCast(f),
+         .integer => |i| c.swiglu_limit = @floatFromInt(i),
+         else => return error.BadConfig,
+-    } else if (!dsa) return error.BadConfig;
++    } else if (!dsa) return error.BadConfig else c.swiglu_limit = std.math.inf(f32); // glm_moe_dsa: no clamp, as HF's GlmMoeDsaMLP
++    // TF_GLM_SWIGLU_LIMIT=<x>: the clamp for an A/B (0 or inf: none); unset keeps the config's (none on glm_moe_dsa)
++    if (std.c.getenv("TF_GLM_SWIGLU_LIMIT")) |e| {
++        const v = std.mem.span(e);
++        const x: f32 = if (std.mem.eql(u8, v, "inf")) std.math.inf(f32) else std.fmt.parseFloat(f32, v) catch return error.BadConfig;
++        c.swiglu_limit = if (x <= 0) std.math.inf(f32) else x;
++    }
+     c.mla_heads = @intCast(try int(t, "num_attention_heads"));
+     c.nope = @intCast(try int(t, "qk_nope_head_dim"));
+     c.v_dim = @intCast(try int(t, "v_head_dim"));
+@@ -445,6 +451,7 @@ test "glm_moe_dsa's shape parses to the dsa template; other widths do not" {
+     try std.testing.expectEqual(@as(u32, 16), c.attnBlocks()); // 2048 keys in blocks of attn_span
+     try std.testing.expect(c.ifull.isSet(0) and c.ifull.isSet(4) and !c.ifull.isSet(1));
+     try std.testing.expectEqual(Kind.mla, c.kind(78)); // the MTP layer
++    if (std.c.getenv("TF_GLM_SWIGLU_LIMIT") == null) try std.testing.expect(std.math.isInf(c.swiglu_limit)); // no swiglu_limit: no clamp
+     const small = try dsaText(gpa, 4, &.{0});
+     defer gpa.free(small);
+     const s = try parse(gpa, small);
+-- 
+2.43.0
+
