@@ -1,5 +1,14 @@
 # Changelog
 
+- **2026-11-26 (branch switchless-ring)** -- `./start-switchless.sh`: four Sparks cabled as a ring without a switch.
+  `FABRIC_EXPECT=ring` brings the 1104 recipe's ring detection, per-rank NCCL graph files and ring NCCL settings into
+  `scripts/tp6.sh`; `ROCE_MESH` is refused on a ring. `validate_config` checks `WORKER`..`WORKER3` at TP=4 and asks for
+  `WORKER4`/`WORKER5` only at TP=6 (a four-Spark `./start.sh` stopped on "WORKER4 is empty").
+  Served and measured the same day on four GB10s on a ring (K4, one stream): `ROCE_RING=on` (default on the ring)
+  turns on patch 0108's RoCE ring all-gather per rank from the ring found, prose 27.8 -> 29.9 and code 42.6 -> 46.3
+  tok/s against NCCL alone, prefill 1,302 -> 1,328 tok/s at 18K (README "Four Sparks without a switch"). NCCL_PROTO=LL,
+  1 or 2 channels and SPLIT_QKVA=0 measured within a few percent or worse. `./stop-tp6.sh` no longer demands WORKER4/5
+  after a four-Spark start; step labels follow TP.
 - **2026-11-25** — **K4 with the unified and neon stacks; gr8 quants supported, not bundled; 3 GiB reserve.**
   - **K4 is now `wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC` @ `e28931c9`** (K4-v1 was removed from Hugging Face), served as
     `GLM-5.3-EXL3-K4`: its `original` view (EXL3 MCG K4 experts, byte-identical in size to K4-v1's, BF16 core packed to

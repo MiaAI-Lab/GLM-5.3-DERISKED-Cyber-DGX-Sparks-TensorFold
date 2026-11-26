@@ -140,6 +140,11 @@ NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-}"     # this Spark's link netdev (aut
 TF_ROCE_HCA="${TF_ROCE_HCA:-}"                   # RDMA devices for the link, comma separated, at most two (auto)
 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-}"       # the RoCE v2 IPv4 GID index (auto; it differs between hosts' tables)
 NCCL_CHANNELS="${NCCL_CHANNELS:-4}"              # NCCL_MIN_NCHANNELS and NCCL_MAX_NCHANNELS
+# FABRIC_EXPECT: mesh (./start.sh, ./start-tp6.sh: a switch, every Spark on one RoCE subnet) or ring (./start-switchless.sh:
+# four Sparks cabled to each other without a switch, one subnet per cable, WORKER..WORKER3 in the ring's order).
+# RING_NCCL_ALGO: NCCL_ALGO on the ring (Ring: NCCL's tree would join the two Sparks across the ring, which no cable reaches).
+FABRIC_EXPECT="${FABRIC_EXPECT:-mesh}"
+RING_NCCL_ALGO="${RING_NCCL_ALGO:-Ring}"
 PORT="${PORT:-8020}"
 HOST="${HOST:-0.0.0.0}"
 NCCL_PORT="${NCCL_PORT:-29583}"                  # NCCL_COMM_ID=FABRIC_SELF:NCCL_PORT; the ranks' watch line uses NCCL_PORT+1
@@ -156,6 +161,12 @@ ROCE_MAX_KB="${ROCE_MAX_KB:-4096}"               # TF_ROCE_MAX_KB, the largest s
 # 36 us against NCCL's 52 / 80 / 86; decode prose 25.9 -> 28.1, code 36.3 -> 39.5 tok/s (2026-11-13). Every rank
 # brings it up and passes a probe gather or all stay on NCCL. MESH_MAX_KB: the largest shard (TF_TP_MAILBOX_MAX_KB).
 ROCE_MESH="${ROCE_MESH:-1}"
+# ROCE_RING (ring only, ./start-switchless.sh): the decode and verify all-gathers up to ROCE_MAX_KB a rank as one-shot
+# RDMA writes to both neighbours, each relaying half of a shard to the rank across (engine patch 0108, from the 2x-pair
+# recipe's four-Spark ring: TF_ROCE_RING=1, TF_ROCE_HCA naming the device toward the previous rank then the one toward
+# the next). Every rank must bring it up or all four fall back to NCCL together. K4 at TP4 on a ring (2026-11-26):
+# prose 27.8 -> 29.9, code 42.6 -> 46.3 tok/s, prompts unchanged. off: NCCL carries every exchange. A switch ignores it.
+ROCE_RING="${ROCE_RING:-on}"
 NSYS_DIR="${NSYS_DIR:-/opt/nvidia/nsight-systems/2025.3.2}" # RANK0_NSYS=1 mounts it into rank 0 (diagnosis only)
 MESH_MAX_KB="${MESH_MAX_KB:-512}"
 # MESH_FAST: the mesh kernel's fast path (TF_TP_ROCE_FAST: its own pollers, staggered posts). Bit-exact; decode

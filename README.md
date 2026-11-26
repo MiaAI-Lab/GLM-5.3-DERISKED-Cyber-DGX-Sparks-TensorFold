@@ -139,6 +139,50 @@ other three, Docker with the NVIDIA runtime on all four, and an NFS server on sp
 The first start builds the image on spark1 and copies it to the workers, then every rank hashes the checkpoint once.
 Later starts take a few minutes. `./start.sh restart` replaces a running server.
 
+## Four Sparks without a switch (ring)
+
+`./start-switchless.sh` serves the same checkpoints and defaults as `./start.sh` on four Sparks cabled as a ring: each
+Spark's two QSFP ports to its two neighbours, one subnet per cable (both PCIe halves of a port addressed, each half on
+its own subnet or told apart by prefix). List the workers in the ring's order from this Spark in `scripts/local.sh`:
+`WORKER` and `WORKER3` are its neighbours, `WORKER2` is across the ring. `DRY_RUN=1 ./start-switchless.sh` prints the
+ring it finds and stops on a wrong order or a switch.
+
+How it differs from `./start.sh` (ported from the four-Spark ring launcher of
+[GLM-5.3-Flash-DGX-Sparks-1104](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104), `scripts/tp4.sh`):
+
+- NCCL runs `NCCL_ALGO=Ring` with a graph file per rank whose channels sit on the cable toward the previous rank,
+  crossnic, subnet-aware routing and no NIC merging. NCCL's tree would pair the two Sparks across the ring, which no
+  cable joins; `NCCL_RUNTIME_CONNECT=1` (already set) keeps it from ever connecting.
+- `ROCE_MESH` is off and refused: its one-shot writes go to every peer directly. In its place `ROCE_RING=on` (the
+  default here) turns on engine patch 0108, already in this recipe's patch set: the four-rank RoCE ring all-gather of
+  the 1104 recipe. Each rank writes its decode and verify shards (up to `ROCE_MAX_KB`) to both neighbours by RDMA, and
+  each neighbour relays half to the rank across. Every rank logs `RoCE ring all-gather: rank r writes to ranks ... relays
+  to rank ...`; `ROCE_RING=off` leaves every exchange to NCCL's ring. DFlash2's mesh gather (policy bit 17) stays on NCCL.
+- `SPLIT_QKVA` (one more gather a layer, which the mesh carried) measured the same on and off on the ring (within 1-3%).
+- Weights: the Spark across the ring reaches this one only over the LAN or a neighbour, so its NFS mount runs at the
+  LAN's speed. Faster: copy the checkpoint (and the drafter) to every worker over the QSFP links and serve with
+  `WORKER_WEIGHTS=check` (`WORKER_MODEL_DIR`, `WORKER_DFLASH2_DIR`; a K4 copy needs `.revision` holding the pinned
+  revision in its snapshot directory). Copy real files, not the HF cache's symlinks. On this Spark, a snapshot whose
+  blobs are themselves links into the hub-wide `blobs/` store (the hf CLI's Xet downloads do this) breaks inside the
+  container, which mounts only the model's own cache directory: rank 0 stops with `cannot estimate checkpoint weight
+  files (FileNotFound)`. Replacing each snapshot link with a hard link to its blob fixes it at no extra space.
+- `./stop-tp6.sh` keeps the start's TP (four ranks here; unset, it reads TP from rank 0's container label).
+
+**Measured** (2026-11-26): K4 (`e28931c9`) with DFlash2 on four GB10s (~2,190 MHz) cabled as a ring, 262,144-token
+window, one stream, the recipe's defaults otherwise; streamed through the API from rank 0 (not sparkDash), prose and
+code at temperature 0 with thinking off, prose the mean of three prompts. Loaded in 172-279 s from local copies.
+
+| | NCCL only | `NCCL_PROTO=LL` | `NCCL_CHANNELS=2` | `NCCL_CHANNELS=1` | **`ROCE_RING=on`** | `ROCE_RING=on`, 2 channels |
+| --- | --- | --- | --- | --- | --- | --- |
+| prose, tok/s | 27.8 | 28.4 | 28.8 | 28.2 | **29.9** | 29.5 |
+| code, tok/s | 42.6 | 42.9 | 44.2 | 43.7 | **46.3** | 45.8 |
+| prefill 18K, tok/s | 1,302 | 824 | 1,331 | 1,110 | **1,328** | 1,333 |
+
+Prose with the switch table's sampling (temperature 0.7, top_k 20, thinking on), NCCL only: 29.0 tok/s, against 38.8
+on the switch. Prefill is within ~5% of the switch; decode stays behind it, because each decode step's small gathers
+cross two links to reach the Spark opposite instead of one hop. The links themselves were checked: all four cables
+negotiate 200 Gb/s on both PCIe halves with no uncorrected errors.
+
 ## Other checkpoints
 
 `MODEL_FORMAT` picks the checkpoint. An exported variable always wins over a format's defaults, and naming a checkpoint

@@ -8,7 +8,8 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 # Six Sparks on a switch: every pair's ConnectX-7 ports share a RoCE subnet, NCCL reaches every rank directly.
-TP6_START=${TP6_START:-./start-tp6.sh}; FABRIC_DESC='a switch'  # ./start.sh (four Sparks) names itself here
+TP6_START=${TP6_START:-./start-tp6.sh}; FABRIC_DESC='a switch'
+[[ "${FABRIC_EXPECT:-mesh}" != ring ]] || FABRIC_DESC='a ring'  # ./start-switchless.sh  # ./start.sh (four Sparks) names itself here
 # MODEL_FORMAT k4 (the default), derisked and exlr8 are four-rank checkpoints: TP6_RANKS=4 is implied unless it is set (a start that
 # names its checkpoint through HF_CACHE_DIR or MODEL_DIR has no format and keeps TP6_RANKS as it gives it)
 if [[ -z "${TP6_RANKS:-}" ]]; then
@@ -73,7 +74,7 @@ request_desc() {
   local k word extra='' out=''
   for k in IMAGE PATCHES_HASH MODEL_DIR WORKER_MODEL_DIR EXLR8_RELEASE EXLR8_DENSE EXLR8_SET_ID SERVED_NAME TP PARALLEL CONTEXT CONTEXT_MAX KV KV8_CODES KV_PAGES DENSE HEAD \
            DRAFTER DRAFTER_MODEL DFLASH2_DIR DRAFTER_BITS DSPARK_CONFIDENCE MTP_DRAFTS MTP_CONFIDENCE MTP_CAP \
-           MEMORY_RESERVE_GIB PROMPT_CACHE_GIB CACHE_FIRST HOST_CACHE_GIB PREFILL_REDUCE MESH_FAST VISION \
+           MEMORY_RESERVE_GIB PROMPT_CACHE_GIB CACHE_FIRST HOST_CACHE_GIB PREFILL_REDUCE MESH_FAST ROCE_RING VISION \
            VISION_MAX_IMAGES SERVE_EXTRA_ARGS SPLIT_QKVA DSA_INDEX_FAST KV_SPLIT SLOT_RESUME PF_EXPERTS_ONCE PF_QMMF2 PF_DOWN_FUSE; do
     out+="$k=${!k-};"
   done
@@ -236,9 +237,9 @@ MANAGED_ENV=' HOME HF_HUB_OFFLINE CUDA_DEVICE_ORDER CUDA_VISIBLE_DEVICES TENSORF
  TENSORFOLD_MEMORY_RESERVE_GIB TF_GLM_DENSE_BITS TF_GLM_HEAD_BITS TF_GLM_CLEAR_THINKING TF_GLM_RANK TF_GLM_WORLD TF_CUDA_DEVICE
  TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TF_GLM_HOST_CACHE_GIB TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET TF_PROMPT_CACHE_FIRST
  TF_GLM_KV_SHARD TF_GLM_L2PF TF_EXTRA_EOS TF_THINK_OFF_SPLIT TF_ROCE TF_ROCE_MAX_KB TF_ROCE_HCA TF_BIN TF_REPO TF_REF TF_GLM_PREFILL_REDUCE
- NCCL_COMM_ID NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS
+ NCCL_ALGO NCCL_GRAPH_FILE NCCL_COMM_ID NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS
  NCCL_CROSS_NIC NCCL_IB_SUBNET_AWARE_ROUTING NCCL_P2P_DISABLE NCCL_SHM_DISABLE NCCL_IB_MERGE_NICS NCCL_IB_SUBNET_PREFIX_LEN
- NCCL_RUNTIME_CONNECT NCCL_CUMEM_ENABLE NCCL_CUMEM_HOST_ENABLE TF_GLM_ROCE_MESH TF_TP_KERNEL_IMAGE TF_TP_MASTER TF_TP_PORT
+ NCCL_RUNTIME_CONNECT NCCL_CUMEM_ENABLE NCCL_CUMEM_HOST_ENABLE TF_GLM_ROCE_MESH TF_ROCE_RING TF_TP_KERNEL_IMAGE TF_TP_MASTER TF_TP_PORT
  TF_TP_ROCE_HCA TF_TP_MAILBOX_MAX_KB TF_TP_ROCE_FAST TF_GLM_DSA_SPLIT_QKVA TF_GLM_MTP_CAP TF_GLM_DSA_ROPE_HOIST TF_GLM_DSA_TOPK_MULTI
  TF_GLM_KV_SPLIT TF_GLM_KV_SPLIT_PREFETCH TF_GLM_SLOT_RESUME TF_GLM_PF_EXPERTS_ONCE TF_GLM_PF_QMMF2 TF_GLM_PF_DOWN_FUSE '
 build_env_args() {
@@ -445,7 +446,7 @@ startup_report() {
 
 finish_start() {
   if [[ "$DRY_RUN" == 1 ]]; then
-    log "Poll every 5 s for up to $WAIT_TIMEOUT s (rank 0 listens once all six ranks have loaded and agreed):"
+    log "Poll every 5 s for up to $WAIT_TIMEOUT s (rank 0 listens once all $TP ranks have loaded and agreed):"
     plan curl --fail --silent --max-time 5 "$URL/health"
     [[ -z "${TENSORFOLD_API_KEY:-}" ]] || log '  (requests below carry Authorization: Bearer from TENSORFOLD_API_KEY; not shown)'
     plan curl --fail --silent --max-time 10 "$URL/v1/models"
@@ -491,7 +492,7 @@ REQUEST=$(request_desc)   # the settings as asked; a running server is reused on
 step 1 'Check all six Sparks: Linux aarch64, Docker, the NVIDIA runtime, memory, disk and ports'
 if [[ "$DRY_RUN" == 1 ]]; then
   log '[I_DRY_RUN] Plan only: nothing is built, started, downloaded, sent or changed. The links below are probed read-only.'
-  log "Check Linux aarch64, docker group access and the NVIDIA runtime here and on the five workers over ssh; a GB10 on each;"
+  log "Check Linux aarch64, docker group access and the NVIDIA runtime here and on the $((TP - 1)) workers over ssh; a GB10 on each;"
   log "$MIN_AVAIL_GIB GiB available on each; disk for what is missing; port $PORT on $HOST and $NCCL_PORT-$((NCCL_PORT + 1)) here."
   if [[ "$MODE" == restart ]]; then DRY_RUN=1 "$REPO_ROOT/stop-tp6.sh"; fi
   tp6_probe_workers
@@ -578,7 +579,7 @@ fi
 
 check_weights_access
 
-step 2 "Build the TensorFold native image with $PATCH_COUNT engine patches for sm_$SM, and send it to the five workers"
+step 2 "Build the TensorFold native image with $PATCH_COUNT engine patches for sm_$SM, and send it to the $((TP - 1)) workers"
 prepare_image
 tp6_ship_image
 
@@ -587,8 +588,9 @@ prepare_weights
 model_overlay
 [[ "$EFFORT_AFTER_DOWNLOAD" == 0 ]] || effort_template
 
-step 4 'Find the links on the switch, and mount the weights on the workers'
+step 4 "Find the links on $FABRIC_DESC, and mount the weights on the workers"
 detect_links
+[[ "${FABRIC_EXPECT:-mesh}" != ring ]] || ring_graphs  # ./start-switchless.sh: NCCL graph files for the ring's channels
 if [[ "$DRY_RUN" != 1 ]]; then
   fabric_status
   for i in $(worker_ids); do
@@ -599,7 +601,7 @@ if [[ "$DRY_RUN" != 1 ]]; then
 fi
 tp6_prepare_worker_weights
 
-step 5 "Start ranks 5, 4, 3, 2 and 1 on $(whost 5), $(whost 4), $(whost 3), $(whost 2) and $(whost 1), then rank 0 here"
+step 5 "Start ranks $(for ((r = TP - 1; r >= 1; r--)); do printf '%s (%s)%s' "$r" "$(whost "$r")" "$( ((r > 1)) && echo ', ')"; done), then rank 0 here"
 ATTEMPT=1
 launch "$CTX"
 

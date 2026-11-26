@@ -7,7 +7,13 @@
 # Only this recipe's containers (label tf.recipe=glm53-nvfp4) are stopped; any other container is left alone.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
-export TP=6 GLM_TP6=1
+# TP: the start's own (./start.sh and ./start-switchless.sh run four ranks, ./start-tp6.sh six). Unset, it is read
+# from rank 0's container label (tf.request carries TP=), and is 6 when there is no container to read.
+if [[ -z "${TP:-}" ]]; then
+  TP=$(docker inspect -f '{{index .Config.Labels "tf.request"}}' "${CONTAINER_NAME:-glm53-spark}" 2>/dev/null \
+    | tr ';' '\n' | sed -n 's/^TP=\([0-9][0-9]*\)$/\1/p' | head -1) || true
+fi
+export TP="${TP:-6}" GLM_TP6=1
 # shellcheck source=scripts/prepare.sh
 source ./scripts/prepare.sh
 # shellcheck source=scripts/tp6.sh
@@ -15,7 +21,8 @@ source ./scripts/tp6.sh
 [[ "$STOP_TIMEOUT" =~ ^[1-9][0-9]*$ && "$LOG_KEEP" =~ ^[1-9][0-9]*$ ]] || fail E_CONFIG 'STOP_TIMEOUT and LOG_KEEP must be positive integers.'
 [[ "$CONTAINER_NAME" != tensorfold-zig-r0 && "$CONTAINER_NAME" != tensorfold-zig-r1 && "$CONTAINER_NAME" != dsv41-1017-exl3-tf ]] \
   || fail E_CONFIG "$CONTAINER_NAME is a DeepSeek recipe's container on these Sparks; this script never stops it."
-for key in WORKER WORKER2 WORKER3 WORKER4 WORKER5; do
+_keys=(WORKER WORKER2 WORKER3 WORKER4 WORKER5)
+for key in "${_keys[@]:0:TP-1}"; do
   [[ -n "${!key}" && "${!key}" =~ ^[A-Za-z0-9_.@:-]+$ ]] || fail E_CONFIG "$key must be an ssh target such as user@host (scripts/local.sh)."
 done
 warn_open_requests() {
