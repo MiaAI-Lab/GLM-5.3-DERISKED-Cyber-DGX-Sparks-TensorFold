@@ -161,6 +161,12 @@ ROCE_MAX_KB="${ROCE_MAX_KB:-4096}"               # TF_ROCE_MAX_KB, the largest s
 # 36 us against NCCL's 52 / 80 / 86; decode prose 25.9 -> 28.1, code 36.3 -> 39.5 tok/s (2026-11-13). Every rank
 # brings it up and passes a probe gather or all stay on NCCL. MESH_MAX_KB: the largest shard (TF_TP_MAILBOX_MAX_KB).
 ROCE_MESH="${ROCE_MESH:-1}"
+# ROCE_RING (ring only, ./start-switchless.sh): the decode and verify all-gathers up to ROCE_MAX_KB a rank as one-shot
+# RDMA writes to both neighbours, each relaying half of a shard to the rank across (engine patch 0108, from the 2x-pair
+# recipe's four-Spark ring: TF_ROCE_RING=1, TF_ROCE_HCA naming the device toward the previous rank then the one toward
+# the next). Every rank must bring it up or all four fall back to NCCL together. K4 at TP4 on a ring (2026-11-26):
+# prose 27.8 -> 29.9, code 42.6 -> 46.3 tok/s, prompts unchanged. off: NCCL carries every exchange. A switch ignores it.
+ROCE_RING="${ROCE_RING:-on}"
 NSYS_DIR="${NSYS_DIR:-/opt/nvidia/nsight-systems/2025.3.2}" # RANK0_NSYS=1 mounts it into rank 0 (diagnosis only)
 MESH_MAX_KB="${MESH_MAX_KB:-512}"
 # MESH_FAST: the mesh kernel's fast path (TF_TP_ROCE_FAST: its own pollers, staggered posts). Bit-exact; decode

@@ -7,8 +7,9 @@
 # (MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104, scripts/tp4.sh: NCCL_ALGO=Ring, per-rank graph files, subnet-aware routing).
 #
 # What differs from the switch: ROCE_MESH (one-shot RoCE writes to every peer, patch 0140) needs every Spark to reach
-# every other directly, so it is off here and the decode gathers go through NCCL's ring; expect a few percent less
-# decode than the README's switch figures (about 8% at six Sparks on the switch, not measured at four on a ring).
+# every other directly, so it is off here. ROCE_RING=on (the default; patch 0108, the 1104 recipe's ring all-gather)
+# writes the decode gathers to both neighbours and relays half to the Spark across; ROCE_RING=off leaves them to NCCL.
+# Measured on a ring (K4, one stream): prose 29.9, code 46.3 tok/s (NCCL alone 27.8 / 42.6), prefill ~1,330 tok/s at 18K.
 # Prompt chunks already use all-gathers (PREFILL_REDUCE=gather), which a ring carries.
 #
 # Weights: the Spark across the ring has no cable to this one, so NFS to it goes over the LAN (1 Gbit) or a route

@@ -435,6 +435,17 @@ tp6_rank_env() {
     [[ -z "$RING_PREFIX" ]] || RANK_ENV+=(-e "NCCL_IB_SUBNET_PREFIX_LEN=$RING_PREFIX")
     [[ -n "${NODE_GRAPH[r]:-}" ]] || fail E_FABRIC "rank $r has no NCCL ring graph (ring_graphs did not run)."
     RANK_MOUNTS=(-v "${NODE_GRAPH[r]}:/nccl-graph.xml:ro")
+    # ROCE_RING=on (patch 0108): RDMA writes to both neighbours over the devices that face them, half relayed across.
+    case "${ROCE_RING:-on}" in
+      on)
+        local -a tprev tnext
+        IFS=, read -r -a tprev <<<"${TOWARD[$r $(( (r + TP - 1) % TP ))]:-}"
+        IFS=, read -r -a tnext <<<"${TOWARD[$r $(( (r + 1) % TP ))]:-}"
+        (( ${#tprev[@]} && ${#tnext[@]} )) || fail E_FABRIC "rank $r has no RoCE device toward both neighbours; set ROCE_RING=off."
+        RANK_ENV+=(-e TF_ROCE=1 -e TF_ROCE_RING=1 -e "TF_ROCE_HCA=${tprev[0]},${tnext[0]}") ;;
+      off) ;;
+      *) fail E_CONFIG "ROCE_RING must be on or off (got '$ROCE_RING')." ;;
+    esac
   fi
 }
 
