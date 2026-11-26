@@ -9,6 +9,9 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 # Six Sparks on a switch: every pair's ConnectX-7 ports share a RoCE subnet, NCCL reaches every rank directly.
 TP6_START=${TP6_START:-./start-tp6.sh}; FABRIC_DESC='a switch'  # ./start.sh (four Sparks) names itself here
+# FABRIC_TOPOLOGY=ring: four Sparks each cabled to the next (a closed ring, no switch). config.sh's setting;
+# detect_links verifies the cabling matches it before any rank starts.
+[[ "${FABRIC_TOPOLOGY:-auto}" != ring ]] || FABRIC_DESC='a ring of four (no switch)'
 # MODEL_FORMAT k4 (the default), derisked and exlr8 are four-rank checkpoints: TP6_RANKS=4 is implied unless it is set (a start that
 # names its checkpoint through HF_CACHE_DIR or MODEL_DIR has no format and keeps TP6_RANKS as it gives it)
 if [[ -z "${TP6_RANKS:-}" ]]; then
@@ -62,8 +65,7 @@ FIT_FILE="$STATE_DIR/context-fit-tp6.tsv"
 fit_key() {
   local k
   printf '%s|' "$PATCHES_HASH" "$MODEL_DIR" "$WORKER" "$WORKER2" "$WORKER3" "$WORKER4" "$WORKER5" "$TP" "$PARALLEL" "$KV" "$KV_PAGES" "$DENSE" "$HEAD" "$VISION" "$VISION_MAX_IMAGES" \
-    "$DRAFTER" "$DRAFTER_BITS" "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$CACHE_FIRST" "$HOST_CACHE_GIB" "$PREFILL_REDUCE" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" \
-    "${RANK_SWITCHES[TF_GLM_SEQ_GROW]}" "${RANK_SWITCHES[TF_GLM_SEQ_GROW_STREAMS]}" "${RANK_SWITCHES[TF_GLM_SEQ_GROW_FLOOR_MIB]}" \
+    "$DRAFTER" "$DRAFTER_BITS" "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$CACHE_FIRST" "$HOST_CACHE_GIB" "$PREFILL_REDUCE" "$FABRIC_TOPOLOGY" "$ROCE_MESH" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" \
     | sha256sum | cut -c1-16
 }
 # The request a running server must match to be reused (2026-11-16: a boot asking for DFlash2 was answered by a
@@ -73,7 +75,7 @@ request_desc() {
   local k word extra='' out=''
   for k in IMAGE PATCHES_HASH MODEL_DIR WORKER_MODEL_DIR EXLR8_RELEASE EXLR8_DENSE EXLR8_SET_ID SERVED_NAME TP PARALLEL CONTEXT CONTEXT_MAX KV KV8_CODES KV_PAGES DENSE HEAD \
            DRAFTER DRAFTER_MODEL DFLASH2_DIR DRAFTER_BITS DSPARK_CONFIDENCE MTP_DRAFTS MTP_CONFIDENCE MTP_CAP \
-           MEMORY_RESERVE_GIB PROMPT_CACHE_GIB CACHE_FIRST HOST_CACHE_GIB PREFILL_REDUCE MESH_FAST VISION \
+           MEMORY_RESERVE_GIB PROMPT_CACHE_GIB CACHE_FIRST HOST_CACHE_GIB PREFILL_REDUCE MESH_FAST ROCE_MESH FABRIC_TOPOLOGY VISION \
            VISION_MAX_IMAGES SERVE_EXTRA_ARGS SPLIT_QKVA DSA_INDEX_FAST KV_SPLIT SLOT_RESUME PF_EXPERTS_ONCE PF_QMMF2 PF_DOWN_FUSE; do
     out+="$k=${!k-};"
   done
@@ -250,6 +252,9 @@ build_env_args() {
     -e "TF_CUDA_DEVICE=0" -e "TF_GLM_WORLD=$TP" -e "NCCL_COMM_ID=$MASTER_ADDR:$NCCL_PORT"
     -e "TF_GLM_PREFILL_REDUCE=$PREFILL_REDUCE" -e "TF_ROCE=0" -e "TF_ROCE_MAX_KB=$ROCE_MAX_KB"
     -e "TF_BIN=$TF_BIN" -e "TENSORFOLD_PREFILL_SHARE=$PREFILL_SHARE")
+  # A ring: the prompt exchanges relay rank to rank (patches 0050, 0106). detect_links still verifies the cables
+  # form the ring; a gather start stays the switch's mode and never sets this.
+  [[ "${FABRIC_TOPOLOGY:-auto}" != ring ]] || ENV_ARGS+=(-e TF_GLM_PREFILL_REDUCE=ring)
   [[ -z "$HOST_CACHE_GIB" ]] || ENV_ARGS+=(-e "TF_GLM_HOST_CACHE_GIB=$HOST_CACHE_GIB")
   [[ -z "$PREFILL_BUDGET" ]] || ENV_ARGS+=(-e "TENSORFOLD_PREFILL_BUDGET=$PREFILL_BUDGET")
   # CACHE_FIRST=1: engine patch 0112 sets PROMPT_CACHE_GIB aside before the streams' windows (every rank alike)
@@ -587,7 +592,7 @@ prepare_weights
 model_overlay
 [[ "$EFFORT_AFTER_DOWNLOAD" == 0 ]] || effort_template
 
-step 4 'Find the links on the switch, and mount the weights on the workers'
+step 4 "Find the links on $FABRIC_DESC, and mount the weights on the workers"
 detect_links
 if [[ "$DRY_RUN" != 1 ]]; then
   fabric_status

@@ -2,6 +2,20 @@
 
 - **2026-11-26** — **`./stop.sh` replaces `./stop-tp6.sh`** and stops either layout: `./start.sh` (TP4) or
   `./start-tp6.sh` (TP6). It already checked all six Sparks; only the name and its messages change.
+- **2026-11-25** — **Four Sparks without a switch: the cabled ring (`FABRIC_TOPOLOGY=ring`).**
+  - Four Sparks cabled in a closed ring (each Spark's port 0 to the next Spark's port 1, the last back to the
+    first; two subnets a cable, one per PCIe rail). `FABRIC_TOPOLOGY=ring` is the only required ring setting: the
+    ring also defaults `WORKER_WEIGHTS=check` (local copies, no NFS; the exlr8 lane's mode) and `ROCE_MESH=0`.
+    `detect_links` classifies the cabling and refuses any shape that is neither a switch (every pair on a shared
+    RoCE subnet) nor a closed ring over the four ranks in WORKER order — including a ring under `auto`, which is
+    refused rather than half-configured, and a rank whose two cabled ports carry different RoCE v2 GID indices
+    (one `NCCL_IB_GID_INDEX` is pinned a rank). Ring ranks get `NCCL_ALGO=Ring`, `NCCL_IB_MERGE_NICS=0`,
+    `NCCL_IB_SUBNET_AWARE_ROUTING=1` (stock NCCL algorithm selection opens channels between ranks no cable
+    reaches) and `PREFILL_REDUCE=ring` (the exchanges pass rank to rank, engine patch 0106). `auto` keeps the
+    switch path unchanged. Decode on the ring is unmeasured end to end on this engine; published four-node
+    ring-vs-switch comparisons span about 1-10% slower decode.
+  - Tests: `scripts/tests/fabric-topology.sh` (edge extraction, classification with its refusals, ring-order
+    check, no synthetic Sparks needed).
 - **2026-11-25** — **K4 with the unified and neon stacks; gr8 quants supported, not bundled; 3 GiB reserve.**
   - **K4 is now `wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC` @ `e28931c9`** (K4-v1 was removed from Hugging Face), served as
     `GLM-5.3-EXL3-K4`: its `original` view (EXL3 MCG K4 experts, byte-identical in size to K4-v1's, BF16 core packed to

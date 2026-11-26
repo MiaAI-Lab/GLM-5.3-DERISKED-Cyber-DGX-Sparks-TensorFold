@@ -139,6 +139,26 @@ other three, Docker with the NVIDIA runtime on all four, and an NFS server on sp
 The first start builds the image on spark1 and copies it to the workers, then every rank hashes the checkpoint once.
 Later starts take a few minutes. `./start.sh restart` replaces a running server.
 
+## Four Sparks without a switch (a ring)
+
+Four Sparks also run cabled as a closed ring: one cable from each Spark's port 0 (the cage nearest the RJ-45) to the
+next Spark's port 1, and the last back to the first Spark's port 1. Each cable carries its own two subnets, one per
+PCIe rail (`/etc/netplan`: two /24 addresses per cabled port, like the two-Spark setup, with every cable on its own
+pair; NVIDIA's [ring example](https://build.nvidia.com/playbooks/connect-multiple-sparks) and
+[spark-vllm-docker's NETWORKING.md](https://github.com/eugr/spark-vllm-docker/blob/main/docs/NETWORKING.md) both carry
+full netplan listings). MTU 9000 on the ring links. All four Sparks stay on the management LAN: ssh and NCCL's
+bootstrap ride it.
+
+Set `FABRIC_TOPOLOGY=ring` in `scripts/local.sh` (or the environment) and list `WORKER`, `WORKER2`, `WORKER3` in the
+cables' order (rank 1 is the Spark cabled to this Spark's port 0). That is the only required setting: the ring also
+defaults `WORKER_WEIGHTS=check` and `ROCE_MESH=0`. Give every Spark a local copy of the checkpoint and the drafter
+at `WORKER_MODEL_DIR` / `WORKER_DFLASH2_DIR` (copy over the cables or the management LAN once). The start verifies
+every rank's copy, that the cables form one closed ring over the four ranks in WORKER order, and that each rank's
+two cabled ports agree on their RoCE v2 GID index; a ring under `FABRIC_TOPOLOGY=auto` is refused, not guessed.
+
+Decode on the ring is unmeasured end to end on this engine; four-node ring-vs-switch comparisons published for
+other serving stacks span about 1-10% slower decode.
+
 ## Other checkpoints
 
 `MODEL_FORMAT` picks the checkpoint. An exported variable always wins over a format's defaults, and naming a checkpoint
@@ -282,7 +302,8 @@ stream.
 ## Known limits
 
 - **One stream by default on four Sparks.** Memory on spark1 is the limit (see "Memory"); six Sparks serve four.
-- **Switch only.** All Sparks must share one RoCE subnet.
+- **Switch, or four Sparks in a cabled ring.** On a switch all Sparks share one RoCE subnet; a four-Spark ring is
+  cabled without one (above).
 - **`KV_SHARD=1` is TP2-only** in this engine; leave it unset.
 - **Six Sparks are not an upstream-supported width.** They work here (`./start-tp6.sh`), mainly for `nvfp4`.
 

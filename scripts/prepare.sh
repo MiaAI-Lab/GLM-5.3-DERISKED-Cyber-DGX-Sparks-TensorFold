@@ -186,7 +186,13 @@ validate_config() {
       [[ "${!key}" =~ ^[A-Za-z0-9_.@:-]+$ ]] || fail E_CONFIG "$key must be an ssh target such as user@host, with no spaces."
     done
     [[ "$WORKER" != "$WORKER2" && "$WORKER" != "$WORKER3" && "$WORKER" != "$WORKER4" && "$WORKER" != "$WORKER5" && "$WORKER2" != "$WORKER3" && "$WORKER2" != "$WORKER4" && "$WORKER2" != "$WORKER5" && "$WORKER3" != "$WORKER4" && "$WORKER3" != "$WORKER5" && "$WORKER4" != "$WORKER5" ]] || fail E_CONFIG 'WORKER, WORKER2, WORKER3, WORKER4 and WORKER5 must name five different Sparks.'
-    [[ "$PREFILL_REDUCE" == gather ]] || fail E_CONFIG 'PREFILL_REDUCE must be gather (TF_GLM_PREFILL_REDUCE: all-gathers between the ranks on the switch).'
+    [[ "$PREFILL_REDUCE" == gather || "$PREFILL_REDUCE" == ring ]] || fail E_CONFIG 'PREFILL_REDUCE must be gather (all-gathers between the ranks on the switch) or ring (the exchanges passed rank to rank; FABRIC_TOPOLOGY=ring).'
+    [[ "$FABRIC_TOPOLOGY" =~ ^(auto|switch|ring)$ ]] || fail E_CONFIG 'FABRIC_TOPOLOGY must be auto, switch or ring.'
+    if [[ "$FABRIC_TOPOLOGY" == ring ]]; then
+      [[ "$TP" == 4 ]] || fail E_CONFIG 'FABRIC_TOPOLOGY=ring runs four Sparks (TP6_RANKS=4 ./start.sh); six need a switch.'
+      [[ "$WORKER_WEIGHTS" != nfs ]] || fail E_CONFIG 'FABRIC_TOPOLOGY=ring refuses WORKER_WEIGHTS=nfs: the ranks across the ring reach this Spark only through a neighbour, and no mount can ride the cables. WORKER_WEIGHTS=check (the ring default) serves from local copies; put the checkpoint and drafter on every Spark (WORKER_MODEL_DIR / WORKER_DFLASH2_DIR).'
+      [[ "$ROCE_MESH" != 1 ]] || fail E_CONFIG 'FABRIC_TOPOLOGY=ring refuses ROCE_MESH=1: the mesh writes one-shot RDMA to every peer, and no cable reaches across the ring. The ring defaults it to 0; unset ROCE_MESH.'
+    fi
     for key in MASTER_ADDR SOCKET_IFNAME NFS_SERVER1 NFS_SERVER2 NFS_SERVER3; do
       [[ -z "${!key}" || "${!key}" =~ ^[A-Za-z0-9.:_-]+$ ]] || fail E_CONFIG "$key must be an address, host name or netdev."
     done
