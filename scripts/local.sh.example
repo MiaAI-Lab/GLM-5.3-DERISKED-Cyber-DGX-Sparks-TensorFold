@@ -10,6 +10,10 @@ WORKER2=mia@spark3             # rank 2
 WORKER3=mia@spark4             # rank 3
 WORKER4=mia@spark5             # rank 4
 WORKER5=mia@spark6             # rank 5
+# FABRIC_TOPOLOGY=ring: four Sparks cabled in a ring, no switch. WORKER..WORKER3 follow the cables (rank 1 is the
+# Spark on this Spark's port 0); WORKER_WEIGHTS=check and ROCE_MESH=0 are the ring defaults. README the ring section.
+# FABRIC_TOPOLOGY=ring
+# WORKER_WEIGHTS=check   # the ring default: every Spark holds its own checkpoint copy (copied over the CX7 cables)
 # MASTER_ADDR=                # this Spark's CX-7 address every worker reaches (found from the route to WORKER when empty)
 # NCCL_SOCKET_IFNAME=         # this Spark's CX-7 netdev (found when empty)
 # TF_ROCE_HCA=                # RDMA devices for the link (found when empty; a Spark's QSFP port gives two)

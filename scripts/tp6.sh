@@ -202,12 +202,58 @@ for r in ranks:
         if id(e) in used and e[1] not in hcas:
             hcas.append(e[1]); gids.add(e[3])
     print("rank", r, default.get(r) or "-", ",".join(hcas) or "-", gids.pop() if len(gids) == 1 else "-")
+for r in ranks:
+    for s in sorted(links[r]):
+        if r < s:
+            print("edge", r, s)
 ' "$@"
 }
 
 # Filled by detect_links: each rank's bootstrap netdev, RoCE devices and GID index; the head's address toward each
 # worker (this Spark's address on its route there) and the worker's own address on the shared subnet.
 declare -a NODE_DEV=() NODE_HCAS=() NODE_GID=() LINK_HEAD_ADDR=() LINK_WORKER_ADDR=()
+# fabric_classify <missing pairs>: switch when every pair of ranks shares a subnet, ring when each rank has exactly
+# two neighbours and FABRIC_TOPOLOGY=ring asked for it (auto refuses a ring it was not told about: half its settings
+# key on the variable, half on the classified kind, and a silent half-ring serves no one), else empty (the caller
+# fails with both layouts named).
+fabric_classify() {
+  local missing=$1
+  if [[ -z "$missing" ]]; then
+    [[ "${FABRIC_TOPOLOGY:-auto}" != ring ]] || fail E_FABRIC 'FABRIC_TOPOLOGY=ring but every pair of ranks shares a RoCE subnet: that is a switch. Set FABRIC_TOPOLOGY=auto (or switch), or recable as a ring (each Spark to the next, the last back to the first).'
+    echo switch; return 0
+  fi
+  # a ring only when asked: a degree-2 fabric under auto or switch is a refused shape, never a silent half-ring
+  local -a deg=(); local r n d
+  for r in $(seq 0 $(( TP - 1 ))); do
+    n=0
+    for d in $missing; do [[ "$d" == "$r-"* || "$d" == *"-$r" ]] && n=$(( n + 1 )); done
+    deg[r]=$(( TP - 1 - n ))
+  done
+  for r in $(seq 0 $(( TP - 1 ))); do
+    (( deg[r] == 2 )) || { echo ''; return 0; }
+  done
+  [[ "${FABRIC_TOPOLOGY:-auto}" == ring ]] || fail E_FABRIC "The cabling is a closed ring, not a switch: every rank has exactly two cabled neighbours ($missing are uncabled). Set FABRIC_TOPOLOGY=ring to run it (four Sparks, WORKER_WEIGHTS=check, WORKER..WORKER3 in the cables' order), or recable as a switch (every pair on one RoCE subnet)."
+  echo ring
+}
+
+# fabric_cycle <edges...>: the linked pairs form one closed ring in WORKER order, 0-1-2-3-0. detect_links passes
+# the `edge a b` pairs pair_links emits; the ring is right only when the edge set equals those four pairs, which is
+# what the engine's rank-to-rank relay and NCCL's Ring algorithm walk. A different cycle (0-1-3-2-0) is a cabling
+# order mismatch: the fix is to list WORKER, WORKER2, WORKER3 in the cables' order, not to change code. pair_links
+# sees subnets, not port polarity, so the two cable directions around the ring are indistinguishable here: the relay
+# walks either.
+fabric_cycle() {
+  local pair target found
+  (( $# == 4 )) || return 1
+  for target in "0 1" "1 2" "2 3" "0 3"; do
+    found=0
+    for pair in "$@"; do
+      [[ "$pair" == "$target" ]] && { found=1; break; }
+    done
+    (( found == 1 )) || return 1
+  done
+  return 0
+}
 detect_links() {
   local i r k kind a b c d pairs missing='' peer
   local -a inv=()
@@ -220,15 +266,28 @@ detect_links() {
   done
   pairs=$(for r in $(seq 0 $(( TP - 1 ))); do sed "s/^/$r /" <<<"${inv[r]}"; done | pair_links $(seq 0 $(( TP - 1 )))) \
     || fail E_FABRIC 'Could not pair the Sparks'"'"' links (python3 and ip are needed on every Spark).'
+  local -a edges=()
   while read -r kind a b c d; do
     case "$kind" in
       rank) NODE_DEV[a]=${SOCKET_IFNAME:-$b}; NODE_HCAS[a]=$c; NODE_GID[a]=$d; [[ "$d" != - ]] || NODE_GID[a]='' ;;
       peer) LINK_WORKER_ADDR[a]=$b ;;
+      edge) edges+=("$a $b") ;;
       missing) missing+=" $a-$b" ;;
     esac
   done <<<"$pairs"
-  # a switch: every pair of Sparks on one RoCE subnet, so NCCL reaches every rank directly, in any order
-  [[ -z "$missing" ]] || fail E_FABRIC "Some of these six Sparks share no RoCE subnet (ranks$missing): on a switch every Spark's ConnectX-7 ports need an address on the switch's subnet (ip -4 addr)."
+  FABRIC_KIND=$(fabric_classify "$missing")
+  case "$FABRIC_KIND" in
+    switch) ;;   # fabric_classify returns switch only when every pair shares a subnet: nothing left to check
+    ring)
+      # a ring: each Spark cabled to two neighbours (one subnet pair a cable); the workers must be listed in the
+      # cables' order (WORKER = rank 1 = this Spark's port-0 neighbour, ...), verified by fabric_cycle below.
+      log "[I_FABRIC] A ring: every Spark shares a RoCE subnet with its two neighbours only (ranks$missing are not directly cabled, as a ring expects)." ;;
+    *)
+      # neither a complete graph nor a closed cycle: an open chain or a split fabric. Fail here rather than
+      # misconfigure NCCL: no start shape matches this cabling.
+      fail E_FABRIC "The cabling is neither a switch (every pair sharing one RoCE subnet) nor a closed ring (ranks$missing are uncabled and no rank has exactly two neighbours). Check the cables and each Spark's addresses (ip -4 addr), or set FABRIC_TOPOLOGY to name the layout you meant." ;;
+  esac
+
   for i in $(worker_ids); do
     peer=${LINK_WORKER_ADDR[i]:-}
     if [[ -z "$peer" ]]; then
@@ -245,11 +304,28 @@ detect_links() {
   done
   for r in $(seq 0 $(( TP - 1 ))); do
     [[ -n "${NODE_DEV[r]:-}" && "${NODE_DEV[r]}" != - ]] \
-      || fail E_FABRIC "rank $r has no default route: set SOCKET_IFNAME to the netdev of the network all six Sparks share (NCCL's bootstrap socket)."
+      || fail E_FABRIC "rank $r has no default route: set SOCKET_IFNAME to the netdev of the network all the Sparks share (NCCL's bootstrap socket)."
     [[ -n "${NODE_HCAS[r]:-}" && "${NODE_HCAS[r]}" != - ]] \
       || fail E_FABRIC "rank $r shares no RoCE subnet with any other rank: check the ConnectX-7 cabling and addresses (ip -4 addr)."
   done
-  log "[I_FABRIC] A switch: every pair of the six Sparks shares a RoCE subnet; RoCE v2 GID index ${NODE_GID[0]:-per device}/${NODE_GID[1]:-per device}/${NODE_GID[2]:-per device}/${NODE_GID[3]:-per device}/${NODE_GID[4]:-per device}/${NODE_GID[5]:-per device}."
+  if [[ "$FABRIC_KIND" == ring ]]; then
+    fabric_cycle "${edges[@]}" || fail E_FABRIC "The cabled links do not form one closed ring over the four ranks in WORKER order (this Spark, $(whost 1), $(whost 2), $(whost 3)): the found edges are ${edges[*]}; the ring walks exactly 0-1, 1-2, 2-3, 0-3. List WORKER, WORKER2, WORKER3 in the cables' order (a wrong order is a refused start, not a recable), or set FABRIC_TOPOLOGY=switch when the four share a switch's subnet."
+    local -a gidpin=()
+    for r in $(seq 0 $(( TP - 1 ))); do
+      # one NCCL_IB_GID_INDEX a rank when its cabled ports agree (the usual table); when they differ the pin is
+      # impossible, so the rank's devices each resolve their own v2 GID (NCCL reads the per-device table; an
+      # all-zero or v1 entry fails a minute in, nodes.sh link_info) and the log names the rank.
+      if [[ -z "${NODE_GID[r]}" ]]; then
+        gidpin[r]='-'
+        log "[W_FABRIC] rank $r's cabled ports carry different RoCE v2 GID indices: NCCL resolves each device's own v2 GID (NCCL_IB_GID_INDEX unset on this rank)."
+      else
+        gidpin[r]=${NODE_GID[r]}
+      fi
+    done
+    log "[I_FABRIC] A closed ring over the four ranks; RoCE v2 GID index ${gidpin[0]}/${gidpin[1]}/${gidpin[2]}/${gidpin[3]}."
+  else
+    log "[I_FABRIC] A switch: every pair of the Sparks shares a RoCE subnet; RoCE v2 GID index ${NODE_GID[0]:-per device}/${NODE_GID[1]:-per device}/${NODE_GID[2]:-per device}/${NODE_GID[3]:-per device}/${NODE_GID[4]:-per device}/${NODE_GID[5]:-per device}."
+  fi
   for r in $(seq 0 $(( TP - 1 ))); do log "[I_FABRIC] rank $r: NCCL on ${NODE_HCAS[r]} (bootstrap ${NODE_DEV[r]})."; done
 }
 
@@ -291,7 +367,8 @@ tp6_rank_env() {
   (( r != 0 )) || RANK_ENV+=(-e "NCCL_SOCKET_IFNAME=${NODE_DEV[r]}")
   [[ -z "${NODE_GID[r]}" ]] || RANK_ENV+=(-e "NCCL_IB_GID_INDEX=${NODE_GID[r]}")
   # ROCE_MESH: fabric/tp's bootstrap on rank 0's address on the switch's subnet, each rank's HCAs with their GID
-  if [[ "${ROCE_MESH:-0}" == 1 ]]; then
+  # (a ring start passes nothing: the mesh's one-shot writes would reach only the two cabled neighbours)
+  if [[ "${ROCE_MESH:-0}" == 1 && "${FABRIC_KIND:-switch}" != ring ]]; then
     local hcas='' h
     for h in ${NODE_HCAS[r]//,/ }; do hcas+="${hcas:+,}$h${NODE_GID[r]:+:${NODE_GID[r]}}"; done
     RANK_ENV+=(-e TF_GLM_ROCE_MESH=1 -e TF_TP_KERNEL_IMAGE=/opt/tensorfold/tp_mailbox.fatbin -e "TF_TP_MASTER=${LINK_HEAD_ADDR[1]}"
@@ -316,6 +393,11 @@ tp6_rank_env() {
   [[ -z "${MTP_CAP:-}" ]] || RANK_ENV+=(-e "TF_GLM_MTP_CAP=$MTP_CAP")
   RANK_ENV+=(-e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e NCCL_RUNTIME_CONNECT=1 -e NCCL_CUMEM_ENABLE=1 -e NCCL_CUMEM_HOST_ENABLE=0
              -e "NCCL_MIN_NCHANNELS=$NCCL_CHANNELS" -e "NCCL_MAX_NCHANNELS=$NCCL_CHANNELS")
+  # A ring: NCCL's Ring algorithm only. Its own selector opens channels between ranks no cable reaches: init
+  # survives but the first real allreduce dies (ncclAllReduce: unhandled system error, measured on this ring;
+  # and QP timeouts at init, as the four-node ring validation found). MERGE_NICS=0 keeps the two rails of a
+  # cable separate, and subnet-aware routing pairs every channel with the subnet its peer shares.
+  [[ "${FABRIC_KIND:-switch}" != ring ]] || RANK_ENV+=(-e NCCL_ALGO=Ring -e NCCL_IB_MERGE_NICS=0 -e NCCL_IB_SUBNET_AWARE_ROUTING=1)
   RANK_MOUNTS=()
 }
 

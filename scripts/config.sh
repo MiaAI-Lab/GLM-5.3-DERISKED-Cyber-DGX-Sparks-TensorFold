@@ -27,6 +27,20 @@ if [[ -f "$REPO_ROOT/.env" ]]; then
 fi
 unset _cfg_key _cfg_line _cfg_value
 
+# --- the fabric: FABRIC_TOPOLOGY --------------------------------------------------------------------------------------
+# auto (the switch layout, where every pair of ranks shares a RoCE subnet and NCCL picks its own algorithms) or
+# ring (four Sparks each cabled to the next, the last back to the first; one subnet pair a cable). ring checks the
+# closed ring's shape and the WORKER order in detect_links, passes the prompt exchanges rank to rank
+# (PREFILL_REDUCE=ring; patches 0050, 0106) and refuses ROCE_MESH (its one-shot writes reach every peer).
+# Above the MODEL_FORMAT lanes, so a ring default outranks a format default (derisked sets WORKER_WEIGHTS=nfs).
+# README "Four Sparks without a switch (a ring)".
+FABRIC_TOPOLOGY="${FABRIC_TOPOLOGY:-auto}"
+# A ring keeps no shared filesystem between the ranks: the only network every rank reaches is its two neighbours,
+# so WORKER_WEIGHTS defaults to the recipe's local mode (each Spark reads its own copy, as the exlr8 lane does).
+[[ "$FABRIC_TOPOLOGY" == ring && -z "${WORKER_WEIGHTS:-}" ]] && WORKER_WEIGHTS=check
+# The mesh's one-shot writes reach every peer; no cable does. The ring needs no setting to start.
+[[ "$FABRIC_TOPOLOGY" == ring && -z "${ROCE_MESH:-}" ]] && ROCE_MESH=0
+
 # --- the checkpoint: MODEL_FORMAT --------------------------------------------------------------------------------
 #   k4     GLM-5.3-EXL3-K4 (the default): wrldsuksgo2mars's K4 quant, wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC at e28931c9,
 #          its `original` view only (EXL3 MCG K4 experts, BF16 dense core packed to 8 bits at load; the k8/k6-compact
