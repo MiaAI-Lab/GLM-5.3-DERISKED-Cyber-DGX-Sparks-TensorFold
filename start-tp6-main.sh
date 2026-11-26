@@ -446,7 +446,7 @@ startup_report() {
 
 finish_start() {
   if [[ "$DRY_RUN" == 1 ]]; then
-    log "Poll every 5 s for up to $WAIT_TIMEOUT s (rank 0 listens once all six ranks have loaded and agreed):"
+    log "Poll every 5 s for up to $WAIT_TIMEOUT s (rank 0 listens once all $TP ranks have loaded and agreed):"
     plan curl --fail --silent --max-time 5 "$URL/health"
     [[ -z "${TENSORFOLD_API_KEY:-}" ]] || log '  (requests below carry Authorization: Bearer from TENSORFOLD_API_KEY; not shown)'
     plan curl --fail --silent --max-time 10 "$URL/v1/models"
@@ -492,7 +492,7 @@ REQUEST=$(request_desc)   # the settings as asked; a running server is reused on
 step 1 'Check all six Sparks: Linux aarch64, Docker, the NVIDIA runtime, memory, disk and ports'
 if [[ "$DRY_RUN" == 1 ]]; then
   log '[I_DRY_RUN] Plan only: nothing is built, started, downloaded, sent or changed. The links below are probed read-only.'
-  log "Check Linux aarch64, docker group access and the NVIDIA runtime here and on the five workers over ssh; a GB10 on each;"
+  log "Check Linux aarch64, docker group access and the NVIDIA runtime here and on the $((TP - 1)) workers over ssh; a GB10 on each;"
   log "$MIN_AVAIL_GIB GiB available on each; disk for what is missing; port $PORT on $HOST and $NCCL_PORT-$((NCCL_PORT + 1)) here."
   if [[ "$MODE" == restart ]]; then DRY_RUN=1 "$REPO_ROOT/stop-tp6.sh"; fi
   tp6_probe_workers
@@ -579,7 +579,7 @@ fi
 
 check_weights_access
 
-step 2 "Build the TensorFold native image with $PATCH_COUNT engine patches for sm_$SM, and send it to the five workers"
+step 2 "Build the TensorFold native image with $PATCH_COUNT engine patches for sm_$SM, and send it to the $((TP - 1)) workers"
 prepare_image
 tp6_ship_image
 
@@ -601,7 +601,7 @@ if [[ "$DRY_RUN" != 1 ]]; then
 fi
 tp6_prepare_worker_weights
 
-step 5 "Start ranks 5, 4, 3, 2 and 1 on $(whost 5), $(whost 4), $(whost 3), $(whost 2) and $(whost 1), then rank 0 here"
+step 5 "Start ranks $(for ((r = TP - 1; r >= 1; r--)); do printf '%s (%s)%s' "$r" "$(whost "$r")" "$( ((r > 1)) && echo ', ')"; done), then rank 0 here"
 ATTEMPT=1
 launch "$CTX"
 
