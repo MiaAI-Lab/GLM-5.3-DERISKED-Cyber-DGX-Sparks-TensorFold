@@ -181,11 +181,14 @@ validate_config() {
     validate_seq_grow
     # TP6_RANKS=4 (start-tp6-main.sh) runs rank 0 and WORKER..WORKER3 only: checkpoints split for four GPUs
     [[ "$TP" == 6 || ( "$TP" == 4 && "${TP6_RANKS:-6}" == 4 ) ]] || fail E_CONFIG "TP=$TP: ./start-tp6.sh runs six Sparks (TP=6) on a switch, or four with TP6_RANKS=4."
-    for key in WORKER WORKER2 WORKER3 WORKER4 WORKER5; do
-      [[ -n "${!key}" ]] || fail E_CONFIG "$key is empty: set WORKER, WORKER2, WORKER3, WORKER4 and WORKER5 to the five workers' ssh targets in scripts/local.sh."
+    # the workers this start uses: WORKER..WORKER3 at TP=4 (TP6_RANKS=4), WORKER..WORKER5 at TP=6
+    local -a wkeys=(WORKER WORKER2 WORKER3); [[ "$TP" != 6 ]] || wkeys+=(WORKER4 WORKER5)
+    for key in "${wkeys[@]}"; do
+      [[ -n "${!key}" ]] || fail E_CONFIG "$key is empty: set ${wkeys[*]} to the workers' ssh targets in scripts/local.sh."
       [[ "${!key}" =~ ^[A-Za-z0-9_.@:-]+$ ]] || fail E_CONFIG "$key must be an ssh target such as user@host, with no spaces."
     done
-    [[ "$WORKER" != "$WORKER2" && "$WORKER" != "$WORKER3" && "$WORKER" != "$WORKER4" && "$WORKER" != "$WORKER5" && "$WORKER2" != "$WORKER3" && "$WORKER2" != "$WORKER4" && "$WORKER2" != "$WORKER5" && "$WORKER3" != "$WORKER4" && "$WORKER3" != "$WORKER5" && "$WORKER4" != "$WORKER5" ]] || fail E_CONFIG 'WORKER, WORKER2, WORKER3, WORKER4 and WORKER5 must name five different Sparks.'
+    local -a wvals=(); for key in "${wkeys[@]}"; do wvals+=("${!key}"); done
+    [[ $(printf '%s\n' "${wvals[@]}" | sort -u | wc -l) == "${#wvals[@]}" ]] || fail E_CONFIG "${wkeys[*]} must name ${#wkeys[@]} different Sparks."
     [[ "$PREFILL_REDUCE" == gather ]] || fail E_CONFIG 'PREFILL_REDUCE must be gather (TF_GLM_PREFILL_REDUCE: all-gathers between the ranks on the switch).'
     for key in MASTER_ADDR SOCKET_IFNAME NFS_SERVER1 NFS_SERVER2 NFS_SERVER3; do
       [[ -z "${!key}" || "${!key}" =~ ^[A-Za-z0-9.:_-]+$ ]] || fail E_CONFIG "$key must be an address, host name or netdev."
