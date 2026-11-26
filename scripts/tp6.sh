@@ -1,4 +1,4 @@
-# Six Sparks at TP=6 on a switch (./start-tp6.sh to start, ./stop-tp6.sh to stop): reaching the five workers,
+# Six Sparks at TP=6 on a switch (./start-tp6.sh to start, ./stop.sh to stop): reaching the five workers,
 # finding the links and the RDMA devices each rank runs on, and the image and the weights on every Spark.
 # Sourced after scripts/prepare.sh (its helpers, config.sh, nodes.sh).
 #
@@ -458,7 +458,7 @@ tp6_start_memguard() {
   [[ "$MEMGUARD" == 1 ]] || return 0
   if [[ "$DRY_RUN" == 1 ]]; then
     log "Memory guard: sample MemAvailable (plus parked pages) on every Spark (this one each ${MEMGUARD_INTERVAL_S} s, a worker"
-    log "in turn) and run ./stop-tp6.sh when one stays under ${MEMGUARD_FLOOR_GIB} GiB for ${MEMGUARD_HOLD_S} s."
+    log "in turn) and run ./stop.sh when one stays under ${MEMGUARD_FLOOR_GIB} GiB for ${MEMGUARD_HOLD_S} s."
     return 0
   fi
   ( exec 8>&-
@@ -483,7 +483,7 @@ tp6_start_memguard() {
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" \
             "$(awk -v b="${sample[r]}" 'BEGIN { printf "%.1f", b / 1073741824 }')" \
             "$MEMGUARD_FLOOR_GIB" "$MEMGUARD_HOLD_S" | tee -a "$RUN_LOG_DIR/memguard.log" >&2
-          MEMGUARD=0 "$REPO_ROOT/stop-tp6.sh" >> "$RUN_LOG_DIR/memguard.log" 2>&1 || true
+          MEMGUARD=0 "$REPO_ROOT/stop.sh" >> "$RUN_LOG_DIR/memguard.log" 2>&1 || true
           exit 0
         fi
       done

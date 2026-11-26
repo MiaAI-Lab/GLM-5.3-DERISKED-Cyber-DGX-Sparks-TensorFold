@@ -5,7 +5,7 @@
 #   --status    report each rank's state
 #   --convert   (default) convert incomplete ranks and re-hash complete ones
 #   DRY_RUN=1   print the plan
-# Stop the server first (./stop-tp6.sh). Each rank needs about 135 GiB free for interim output
+# Stop the server first (./stop.sh). Each rank needs about 135 GiB free for interim output
 # or 116 GiB for native output (22 GiB with hard links), plus about 100 GiB to fetch the rank's data.
 # EXLR8_SRC can specify a complete local release copy. v07 looks for ~/exlr8-v07-src on each Spark.
 # Rank 0 runs here. Ranks 1-3 use WORKER, WORKER2 and WORKER3. Their homes must agree.

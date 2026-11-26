@@ -2,7 +2,7 @@
 # The machinery behind ./start-tp6.sh: check all six Sparks, build the engine image here and send it to the
 # workers, check the weights, start one rank on each Spark (rank 0 here, the API), wait for the API and smoke-test
 # it. The workers' checks, links, image and NFS weights are scripts/tp6.sh. README: "6 Sparks".
-# Usage: ./start-tp6.sh [restart]   (./stop-tp6.sh stops it; DRY_RUN=1 prints the plan, changes nothing)
+# Usage: ./start-tp6.sh [restart]   (./stop.sh stops it; DRY_RUN=1 prints the plan, changes nothing)
 # Configuration: scripts/config.sh defaults < .env < scripts/local.sh < exported environment; on a switch WORKER,
 # WORKER2, WORKER3, WORKER4 and WORKER5 may be in any order.
 set -euo pipefail
@@ -363,7 +363,7 @@ launch() {
 
 # Every container down, rank 0 first so it ends the followers' steps; used between fit attempts and on failure.
 stop_all() {
-  GLM_STOP_LOCK_HELD=1 MEMGUARD=0 "$REPO_ROOT/stop-tp6.sh" >/dev/null 2>&1 \
+  GLM_STOP_LOCK_HELD=1 MEMGUARD=0 "$REPO_ROOT/stop.sh" >/dev/null 2>&1 \
     || fail E_STOP 'The ranks would not stop (stop, then kill, verified absent). Clean up by hand: docker ps on every Spark.'
 }
 
@@ -384,7 +384,7 @@ wait_ready() {
         running=$(wssh_n "$i" docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null) || rc=$?
         if (( rc == 124 || rc == 137 || rc == 255 )); then   # timeout, killed after it, or ssh could not reach the host
           stop_follower
-          GLM_STOP_LOCK_HELD=1 MEMGUARD=0 "$REPO_ROOT/stop-tp6.sh" >/dev/null 2>&1 || true   # skips the dead Spark
+          GLM_STOP_LOCK_HELD=1 MEMGUARD=0 "$REPO_ROOT/stop.sh" >/dev/null 2>&1 || true   # skips the dead Spark
           fail E_WORKER "Rank $i on $(whost "$i") stopped answering (ssh/docker gave no reply within $REMOTE_TIMEOUT s; out of memory?). The start is stopped; check that Spark, then start again."
         fi
         if [[ "$running" != true ]]; then
@@ -493,7 +493,7 @@ if [[ "$DRY_RUN" == 1 ]]; then
   log '[I_DRY_RUN] Plan only: nothing is built, started, downloaded, sent or changed. The links below are probed read-only.'
   log "Check Linux aarch64, docker group access and the NVIDIA runtime here and on the five workers over ssh; a GB10 on each;"
   log "$MIN_AVAIL_GIB GiB available on each; disk for what is missing; port $PORT on $HOST and $NCCL_PORT-$((NCCL_PORT + 1)) here."
-  if [[ "$MODE" == restart ]]; then DRY_RUN=1 "$REPO_ROOT/stop-tp6.sh"; fi
+  if [[ "$MODE" == restart ]]; then DRY_RUN=1 "$REPO_ROOT/stop.sh"; fi
   tp6_probe_workers
 else
   [[ "$(uname -s)" == Linux && "$(uname -m)" == aarch64 ]] || fail E_PLATFORM 'This recipe requires Linux aarch64 (DGX Spark, GB10).'
@@ -527,17 +527,17 @@ else
   fi
   if [[ "$running" == true && "$MODE" == start ]]; then
     log "$CONTAINER_NAME is already running with these settings. Endpoint: $URL/v1"
-    log "Use $TP6_START restart to apply changed settings, or ./stop-tp6.sh to stop it."
+    log "Use $TP6_START restart to apply changed settings, or ./stop.sh to stop it."
     RUN_LOG_DIR=$(readlink -f "$LOG_DIR/current" 2>/dev/null || true)
     [[ -d "$RUN_LOG_DIR" ]] || fail E_LOG 'The running container has no accessible log directory. Inspect its mounts.'
-    wait_ready || { show_failure; fail E_START "A rank exited. Inspect $LOG_DIR/current/rank*.log; ./stop-tp6.sh archives them."; }
+    wait_ready || { show_failure; fail E_START "A rank exited. Inspect $LOG_DIR/current/rank*.log; ./stop.sh archives them."; }
     finish_start
     exit 0
   fi
   any=0
   docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1 && any=1
   for i in $(worker_ids); do wssh_n "$i" docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1 && any=1; done
-  (( any == 0 )) || GLM_STOP_LOCK_HELD=1 "$REPO_ROOT/stop-tp6.sh"
+  (( any == 0 )) || GLM_STOP_LOCK_HELD=1 "$REPO_ROOT/stop.sh"
   names=$(nvidia-smi -L 2>/dev/null) || fail E_GPU 'Cannot list GPUs. Check the driver.'
   grep -q 'GB10' <<< "$names" || warn W_GPU "This Spark's GPU is not a GB10: $(head -1 <<< "$names")."
   log "[I_GPU] rank 0: $(sed -n '1s/ (UUID.*//p' <<< "$names")."
@@ -629,7 +629,7 @@ if [[ "$DRY_RUN" != 1 ]] && ! wait_ready; then
     fi
     if [[ -z "$new" ]] || (( ATTEMPT > ${CONTEXT_RETRIES:-3} )); then
       show_failure
-      (( ATTEMPT == 1 )) && fail E_START "A rank exited during startup. Inspect $LOG_DIR/current/rank*.log; ./stop-tp6.sh archives them."
+      (( ATTEMPT == 1 )) && fail E_START "A rank exited during startup. Inspect $LOG_DIR/current/rank*.log; ./stop.sh archives them."
       fail E_START "Start $ATTEMPT (--context $CTX) failed too. Inspect $LOG_DIR/current/rank*.log; lower CONTEXT or PARALLEL, or raise MEMORY_RESERVE_GIB."
     fi
     warn W_CONTEXT "This start's memory holds less than a $CTX-token window at --parallel $PARALLEL; starting once more with --context $new."

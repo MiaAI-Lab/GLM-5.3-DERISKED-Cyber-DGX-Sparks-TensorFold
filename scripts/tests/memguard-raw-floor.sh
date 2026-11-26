@@ -11,8 +11,8 @@ guard=$(awk '/^tp6_start_memguard\(\) \{/ { on = 1 } on { print } on && /^\}/ { 
 [[ -n "$guard" ]] || { echo 'tp6_start_memguard not found in scripts/tp6.sh' >&2; exit 1; }
 counting=$(awk '/^mem_counting\(\) \{/ { on = 1 } on { print } on && /^\}/ { exit }' scripts/memavail.sh)
 [[ -n "$counting" ]] || { echo 'mem_counting not found in scripts/memavail.sh' >&2; exit 1; }
-printf '#!/usr/bin/env bash\ntouch "$(dirname "$0")/stopped"\n' > "$tmp/stop-tp6.sh"
-chmod +x "$tmp/stop-tp6.sh"
+printf '#!/usr/bin/env bash\ntouch "$(dirname "$0")/stopped"\n' > "$tmp/stop.sh"
+chmod +x "$tmp/stop.sh"
 mkdir -p "$tmp/log"
 { cat <<'SCRIPT'
 set -u

@@ -1,5 +1,7 @@
 # Changelog
 
+- **2026-11-26** — **`./stop.sh` replaces `./stop-tp6.sh`** and stops either layout: `./start.sh` (TP4) or
+  `./start-tp6.sh` (TP6). It already checked all six Sparks; only the name and its messages change.
 - **2026-11-25** — **K4 with the unified and neon stacks; gr8 quants supported, not bundled; 3 GiB reserve.**
   - **K4 is now `wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC` @ `e28931c9`** (K4-v1 was removed from Hugging Face), served as
     `GLM-5.3-EXL3-K4`: its `original` view (EXL3 MCG K4 experts, byte-identical in size to K4-v1's, BF16 core packed to

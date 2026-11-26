@@ -7,7 +7,7 @@
 # GLM-5.3-DERISKED-Cyber-EXL3-4bpw (downloaded when missing) with the same serving defaults; another MODEL_FORMAT (or an
 # exported MODEL_DIR / HF_CACHE_DIR) serves another checkpoint without them.
 #
-# Usage: ./start.sh [restart]   (./stop-tp6.sh stops it; DRY_RUN=1 ./start.sh prints the links it finds and every
+# Usage: ./start.sh [restart]   (./stop.sh stops it; DRY_RUN=1 ./start.sh prints the links it finds and every
 # rank's command, and changes nothing)
 set -euo pipefail
 case "${1:-}" in

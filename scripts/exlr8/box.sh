@@ -143,7 +143,7 @@ fi
 [[ $STATUS == 0 ]] || { say "not complete ($state)"; exit 3; }
 
 # ---- checks, then the work -----------------------------------------------------------------------------------------------------
-a=$(avail_gib); (( a >= MIN_AVAIL )) || fail "MemAvailable ${a} GiB, needs ${MIN_AVAIL}: stop the server first (./stop-tp6.sh); the dense converter holds ~8 GB"
+a=$(avail_gib); (( a >= MIN_AVAIL )) || fail "MemAvailable ${a} GiB, needs ${MIN_AVAIL}: stop the server first (./stop.sh); the dense converter holds ~8 GB"
 # a partial directory is this recipe's own and is converted again, so its space counts as free: empty it first
 if [[ $state == partial && $DENSE != native ]]; then   # native: convert-native.sh empties only a directory it made (.x12-native)
   [[ -f "$OUT/.x8-owned" ]] || fail "$OUT is partial but not owned"

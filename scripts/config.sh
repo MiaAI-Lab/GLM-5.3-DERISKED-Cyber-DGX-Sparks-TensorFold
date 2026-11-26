@@ -203,7 +203,7 @@ PF_QMMF2="${PF_QMMF2:-${TF_GLM_PF_QMMF2:-$_pf}}"
 PF_DOWN_FUSE="${PF_DOWN_FUSE:-${TF_GLM_PF_DOWN_FUSE:-$_pf}}"
 unset _pf
 
-# --- six Sparks (./start-tp6.sh, ./start-tp6-main.sh, ./stop-tp6.sh; README "6 Sparks") ----------------------
+# --- six Sparks (./start-tp6.sh, ./start-tp6-main.sh, ./stop.sh; README "6 Sparks") ----------------------
 # TP=6 over six Sparks: this Spark (rank 0, the API) and WORKER, WORKER2, WORKER3 (ranks 1-5). On a switch
 # (./start-tp6.sh) every Spark's ports share the switch's subnet and the workers may be in any order. Cabled as a ring
 # without a switch (./start-tp6-main.sh) they go in the ring's order, each cabled to the next and the last back to

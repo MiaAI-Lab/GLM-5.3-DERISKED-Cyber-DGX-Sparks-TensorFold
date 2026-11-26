@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Stop the six ranks of ./start-tp6.sh or ./start-tp6-main.sh, save one gzipped archive with their logs and keep the newest LOG_KEEP (10).
-# Rank 0 goes first: it drains its requests and ends the followers' steps; then ranks 1, 2 and 3 on the workers.
+# Stop the ranks of ./start.sh (TP4, four Sparks) or ./start-tp6.sh / ./start-tp6-main.sh (TP6, six Sparks), save one
+# gzipped archive with their logs and keep the newest LOG_KEEP (10). All six Sparks are checked, so one script stops
+# either layout. Rank 0 goes first: it drains its requests and ends the followers' steps; then each worker that has one.
 # A rank that still runs after the STOP_TIMEOUT stop gets docker kill; one still running after the kill fails the
 # stop, so a start aborts for a human instead of layering a second container onto a wedged one.
-# Usage: ./stop-tp6.sh; DRY_RUN=1 ./stop-tp6.sh prints the plan and changes nothing.
+# Usage: ./stop.sh; DRY_RUN=1 ./stop.sh prints the plan and changes nothing.
 # Only this recipe's containers (label tf.recipe=glm53-nvfp4) are stopped; any other container is left alone.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
-export TP=6 GLM_TP6=1
+export TP=6 GLM_TP6=1   # TP=6 makes worker_ids cover all five workers; a TP4 run leaves spark5/6 empty
 # shellcheck source=scripts/prepare.sh
 source ./scripts/prepare.sh
 # shellcheck source=scripts/tp6.sh
@@ -38,7 +39,7 @@ if [[ "$DRY_RUN" == 1 ]]; then
   log "Stop each rank only if its container carries the label tf.recipe=glm53-nvfp4, rank 0 first (up to $STOP_TIMEOUT s each):"
   plan docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME"
   for i in $(worker_ids); do plan ssh "$(wtarget "$i")" docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME"; done
-  log "  Save the six ranks' Docker output as $LOG_DIR/glm53-nvfp4-tp6-<timestamp>.tar.gz; keep the newest $LOG_KEEP archives."
+  log "  Save each stopped rank's Docker output as $LOG_DIR/glm53-nvfp4-tp6-<timestamp>.tar.gz; keep the newest $LOG_KEEP archives."
   plan docker rm "$CONTAINER_NAME"
   for i in $(worker_ids); do plan ssh "$(wtarget "$i")" docker rm "$CONTAINER_NAME"; done
   exit 0

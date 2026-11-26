@@ -133,7 +133,7 @@ other three, Docker with the NVIDIA runtime on all four, and an NFS server on sp
    ```bash
    DRY_RUN=1 ./start.sh   # print the plan and every rank's command; changes nothing
    ./start.sh             # checks, image, weights, four ranks, smoke test (MODEL_FORMAT=derisked ./start.sh for DERISKED)
-   ./stop-tp6.sh          # stop every rank and archive their logs
+   ./stop.sh          # stop every rank and archive their logs
    ```
 
 The first start builds the image on spark1 and copies it to the workers, then every rank hashes the checkpoint once.
@@ -165,7 +165,7 @@ Matt Mastracci (kindlingai) authored the EXLR8 format (exlr8-v2), the MIT-licens
 To run one, stop the server, convert it on the four Sparks (each converts its own rank), then start it:
 
 ```bash
-./stop-tp6.sh
+./stop.sh
 EXLR8_RELEASE=v07 scripts/prepare-exlr8.sh --convert     # or EXLR8_RELEASE=up1
 MODEL_FORMAT=exlr8 EXLR8_RELEASE=v07 ./start-tp6.sh
 ```
