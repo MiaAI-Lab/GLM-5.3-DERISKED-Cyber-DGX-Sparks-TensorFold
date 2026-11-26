@@ -140,6 +140,11 @@ NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-}"     # this Spark's link netdev (aut
 TF_ROCE_HCA="${TF_ROCE_HCA:-}"                   # RDMA devices for the link, comma separated, at most two (auto)
 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-}"       # the RoCE v2 IPv4 GID index (auto; it differs between hosts' tables)
 NCCL_CHANNELS="${NCCL_CHANNELS:-4}"              # NCCL_MIN_NCHANNELS and NCCL_MAX_NCHANNELS
+# FABRIC_EXPECT: mesh (./start.sh, ./start-tp6.sh: a switch, every Spark on one RoCE subnet) or ring (./start-switchless.sh:
+# four Sparks cabled to each other without a switch, one subnet per cable, WORKER..WORKER3 in the ring's order).
+# RING_NCCL_ALGO: NCCL_ALGO on the ring (Ring: NCCL's tree would join the two Sparks across the ring, which no cable reaches).
+FABRIC_EXPECT="${FABRIC_EXPECT:-mesh}"
+RING_NCCL_ALGO="${RING_NCCL_ALGO:-Ring}"
 PORT="${PORT:-8020}"
 HOST="${HOST:-0.0.0.0}"
 NCCL_PORT="${NCCL_PORT:-29583}"                  # NCCL_COMM_ID=FABRIC_SELF:NCCL_PORT; the ranks' watch line uses NCCL_PORT+1

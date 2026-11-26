@@ -8,7 +8,8 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 # Six Sparks on a switch: every pair's ConnectX-7 ports share a RoCE subnet, NCCL reaches every rank directly.
-TP6_START=${TP6_START:-./start-tp6.sh}; FABRIC_DESC='a switch'  # ./start.sh (four Sparks) names itself here
+TP6_START=${TP6_START:-./start-tp6.sh}; FABRIC_DESC='a switch'
+[[ "${FABRIC_EXPECT:-mesh}" != ring ]] || FABRIC_DESC='a ring'  # ./start-switchless.sh  # ./start.sh (four Sparks) names itself here
 # MODEL_FORMAT k4 (the default), derisked and exlr8 are four-rank checkpoints: TP6_RANKS=4 is implied unless it is set (a start that
 # names its checkpoint through HF_CACHE_DIR or MODEL_DIR has no format and keeps TP6_RANKS as it gives it)
 if [[ -z "${TP6_RANKS:-}" ]]; then
@@ -236,7 +237,7 @@ MANAGED_ENV=' HOME HF_HUB_OFFLINE CUDA_DEVICE_ORDER CUDA_VISIBLE_DEVICES TENSORF
  TENSORFOLD_MEMORY_RESERVE_GIB TF_GLM_DENSE_BITS TF_GLM_HEAD_BITS TF_GLM_CLEAR_THINKING TF_GLM_RANK TF_GLM_WORLD TF_CUDA_DEVICE
  TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TF_GLM_HOST_CACHE_GIB TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET TF_PROMPT_CACHE_FIRST
  TF_GLM_KV_SHARD TF_GLM_L2PF TF_EXTRA_EOS TF_THINK_OFF_SPLIT TF_ROCE TF_ROCE_MAX_KB TF_ROCE_HCA TF_BIN TF_REPO TF_REF TF_GLM_PREFILL_REDUCE
- NCCL_COMM_ID NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS
+ NCCL_ALGO NCCL_GRAPH_FILE NCCL_COMM_ID NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS
  NCCL_CROSS_NIC NCCL_IB_SUBNET_AWARE_ROUTING NCCL_P2P_DISABLE NCCL_SHM_DISABLE NCCL_IB_MERGE_NICS NCCL_IB_SUBNET_PREFIX_LEN
  NCCL_RUNTIME_CONNECT NCCL_CUMEM_ENABLE NCCL_CUMEM_HOST_ENABLE TF_GLM_ROCE_MESH TF_TP_KERNEL_IMAGE TF_TP_MASTER TF_TP_PORT
  TF_TP_ROCE_HCA TF_TP_MAILBOX_MAX_KB TF_TP_ROCE_FAST TF_GLM_DSA_SPLIT_QKVA TF_GLM_MTP_CAP TF_GLM_DSA_ROPE_HOIST TF_GLM_DSA_TOPK_MULTI
@@ -587,8 +588,9 @@ prepare_weights
 model_overlay
 [[ "$EFFORT_AFTER_DOWNLOAD" == 0 ]] || effort_template
 
-step 4 'Find the links on the switch, and mount the weights on the workers'
+step 4 "Find the links on $FABRIC_DESC, and mount the weights on the workers"
 detect_links
+[[ "${FABRIC_EXPECT:-mesh}" != ring ]] || ring_graphs  # ./start-switchless.sh: NCCL graph files for the ring's channels
 if [[ "$DRY_RUN" != 1 ]]; then
   fabric_status
   for i in $(worker_ids); do
