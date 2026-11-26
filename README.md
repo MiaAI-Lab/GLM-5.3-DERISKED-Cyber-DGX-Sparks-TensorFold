@@ -139,6 +139,32 @@ other three, Docker with the NVIDIA runtime on all four, and an NFS server on sp
 The first start builds the image on spark1 and copies it to the workers, then every rank hashes the checkpoint once.
 Later starts take a few minutes. `./start.sh restart` replaces a running server.
 
+## Four Sparks without a switch (ring)
+
+`./start-switchless.sh` serves the same checkpoints and defaults as `./start.sh` on four Sparks cabled as a ring: each
+Spark's two QSFP ports to its two neighbours, one subnet per cable (both PCIe halves of a port addressed, each half on
+its own subnet or told apart by prefix). List the workers in the ring's order from this Spark in `scripts/local.sh`:
+`WORKER` and `WORKER3` are its neighbours, `WORKER2` is across the ring. `DRY_RUN=1 ./start-switchless.sh` prints the
+ring it finds and stops on a wrong order or a switch.
+
+How it differs from `./start.sh` (ported from the four-Spark ring launcher of
+[GLM-5.3-Flash-DGX-Sparks-1104](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104), `scripts/tp4.sh`):
+
+- NCCL runs `NCCL_ALGO=Ring` with a graph file per rank whose channels sit on the cable toward the previous rank,
+  crossnic, subnet-aware routing and no NIC merging. NCCL's tree would pair the two Sparks across the ring, which no
+  cable joins; `NCCL_RUNTIME_CONNECT=1` (already set) keeps it from ever connecting.
+- `ROCE_MESH` is off and refused: its one-shot writes go to every peer directly. Decode gathers (and DFlash2's, policy
+  bit 17, which needs the mesh) go through NCCL's ring instead. Expect less decode than the switch figures above; at
+  six Sparks the mesh was worth about 8% (25.9 to 28.1 tok/s prose). Not measured at four on a ring yet.
+- `SPLIT_QKVA=1` adds one more gather a layer, which the mesh carried; measure it on and off on the ring.
+- Weights: the Spark across the ring reaches this one only over the LAN or a neighbour, so its NFS mount runs at the
+  LAN's speed. Faster: copy the checkpoint (and the drafter) to every worker over the QSFP links and serve with
+  `WORKER_WEIGHTS=check` (`WORKER_MODEL_DIR`, `WORKER_DFLASH2_DIR`; a K4 copy needs `.revision` holding the pinned
+  revision in its snapshot directory).
+
+Not yet served. The ring detection, graph files and per-rank NCCL settings were checked against a real four-Spark ring
+(2026-11-26); a full start, decode and prefill numbers are still to come.
+
 ## Other checkpoints
 
 `MODEL_FORMAT` picks the checkpoint. An exported variable always wins over a format's defaults, and naming a checkpoint
