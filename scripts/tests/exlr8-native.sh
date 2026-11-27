@@ -329,7 +329,10 @@ for assignment in TF_GLM_X8_PROMPT_Q8=0 TF_GLM_SEQ_GROW=0 TF_GLM_DSA_SHARED=0 EX
 done
 [[ "$(request TF_GLM_X8_PROMPT_Q8=0)" == "$(request TF_GLM_X8_PROMPT_Q8=1 RANK_EXTRA_ENV=TF_GLM_X8_PROMPT_Q8=0)" ]]
 [[ "$(request TF_GLM_SEQ_GROW=1 KV_SPLIT=1 RANK_EXTRA_ENV=TF_GLM_SEQ_GROW=0)" != "$default" ]]
-for assignment in KV_SPLIT=1 PROMPT_CACHE_GIB=0.25 HOST_CACHE_GIB=auto 'SERVE_EXTRA_ARGS=--prompt-cache-gib 1' 'RANK_EXTRA_ENV=TF_KV_PAGES=on'; do
+for assignment in KV_SPLIT=1 KV_SPLIT=2 PROMPT_CACHE_GIB=0.25 'SERVE_EXTRA_ARGS=--prompt-cache-gib 1'; do
+  request TF_GLM_SEQ_GROW=1 "$assignment" >/dev/null
+done
+for assignment in HOST_CACHE_GIB=auto 'RANK_EXTRA_ENV=TF_KV_PAGES=on'; do
   if request TF_GLM_SEQ_GROW=1 "$assignment" > "$tmp/reject.log" 2>&1; then exit 1; fi
   grep -q 'TF_GLM_SEQ_GROW=1 needs' "$tmp/reject.log"
 done

@@ -1,0 +1,634 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: port <port@local>
+Date: Fri, 27 Nov 2026 16:08:36 -0500
+Subject: [PATCH 0246] glm: allow SEQ_GROW with KV_SPLIT=1/2, decoupled pool_rows,
+ prompt cache, and lockstep idle trim
+
+---
+ zig/src/families/glm/cuda_engine.zig          |  30 +++-
+ zig/src/families/glm/cuda_follow.zig          |  12 +-
+ .../families/glm/cuda_kv8_snapshot_test.zig   | 129 ++++++++++++++++++
+ zig/src/families/glm/cuda_lanes.zig           |  63 ++++++++-
+ zig/src/families/glm/cuda_native.zig          |   2 +
+ zig/src/families/glm/cuda_seq_grow.zig        |  95 ++++++++++++-
+ zig/src/families/glm/cuda_snapshot_layout.zig |  16 ++-
+ zig/src/families/glm/cuda_snapshots.zig       |   4 +-
+ zig/src/families/glm/cuda_state.zig           |   9 +-
+ 9 files changed, 336 insertions(+), 24 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index d79c790..6d5c6c6 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -309,7 +309,7 @@ pub const Engine = struct {
+         // granules one whole-window sequence needs; streams share it, so --parallel adds no window of its own
+         const grows = try seq_grow.asked();
+         if (grows) {
+-            if (e.settings.pages or o.settings.kv_split != 0 or e.settings.kv_shard.on or !c.dsa) return error.SeqGrowRefused;
++            if (e.settings.pages or e.settings.kv_shard.on or !c.dsa) return error.SeqGrowRefused;
+             seq_grow.pool = try seq_grow.Pool.open(gpa, d);
+         }
+         errdefer if (seq_grow.pool) |p| {
+@@ -323,10 +323,19 @@ pub const Engine = struct {
+         }
+         if (seq_grow.pool) |p| {
+             const r = e.seqs.items[0].?.st.grow orelse return error.SeqGrowRefused;
+-            const n = r.need(o.capacity);
++            const pool_rows = try seq_grow.poolRowsAsked(o.capacity);
++            const n = seq_grow.poolGranules(r, o.capacity, pool_rows);
++            if (world > 1) {
++                const words = try a.alloc(u64, world);
++                try ranks.gather(u64, d, lib, comm, stream, rank, @as(u64, n), words);
++                if (!std.mem.allEqual(u64, words, @as(u64, n))) {
++                    std.log.err("seq grow: pool granules differ across ranks ({any}); set TF_GLM_SEQ_GROW_POOL_ROWS alike on every rank", .{words});
++                    return error.SeqGrowMismatch;
++                }
++            }
+             try start_floor.check(@as(u64, n) * p.granularity);
+             try p.grow(n);
+-            if (rank == 0) std.log.info("seq grow: one pool of {d} granules of {d} MiB ({d:.2} GiB), a whole window's rows; every stream's rows map from it as they grow (TF_GLM_SEQ_GROW=1)", .{ n, p.granularity >> 20, @as(f64, @floatFromInt(n * p.granularity)) / (1 << 30) });
++            if (rank == 0) std.log.info("seq grow: one pool of {d} granules of {d} MiB ({d:.2} GiB) for {d} shared rows (per-stream cap {d}; admit_new {d}); every stream's rows map from it as they grow (TF_GLM_SEQ_GROW=1)", .{ n, p.granularity >> 20, @as(f64, @floatFromInt(n * p.granularity)) / (1 << 30), pool_rows, o.capacity, seq_grow.admitNewAsked() });
+         }
+         e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
+         errdefer e.bp.deinit();
+@@ -553,15 +562,26 @@ pub const Engine = struct {
+         if (e.images) |v| try v.activate(slot);
+     }
+ 
+-    /// Frees slot `slot`'s sequence (slot 0 stays, and a paged one gives its pages back) and binds slot 0.
++    /// Frees slot `slot`'s sequence (slot 0 stays, a paged one gives its pages back, and a seq_grow slot stays alive for multi-slot resume until trimmed) and binds slot 0.
+     pub fn release(e: *Engine, slot: u32) void {
+         if (e.images) |v| v.release(slot);
+         const paged = if (e.pages) |p| p.paged(slot) else false;
+-        if (paged) e.pages.?.close(slot) else if (slot != 0) e.free(slot);
++        if (paged) e.pages.?.close(slot) else if (slot != 0 and seq_grow.pool == null) e.free(slot);
+         e.cur = e.seqs.items[0].?;
+         e.slot = 0;
+     }
+ 
++    /// TF_GLM_SEQ_GROW: unmaps an idle slot's VMM granules and clears its begin stamp so no stale standing rows remain.
++    pub fn trimSlot(e: *Engine, slot: u32) !void {
++        if (slot >= e.seqs.items.len) return;
++        const q = e.seqs.items[slot] orelse return;
++        const r = q.st.grow orelse return;
++        if (r.mapped == 0) return;
++        try e.stream.synchronize();
++        r.trim(0);
++        q.begun = 0;
++    }
++
+     fn free(e: *Engine, slot: usize) void {
+         const q = e.seqs.items[slot] orelse return;
+         cuda.completion.drain(e.d, e.stream, "GLM sequence release did not drain");
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index fe0fda8..d6c2800 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -14,7 +14,7 @@ const prompt_solo = @import("cuda_prompt_solo.zig");
+ const policy_mod = @import("policy.zig");
+ const Engine = engine.Engine;
+ 
+-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, layout, rewind };
++pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, layout, rewind, trim };
+ 
+ /// One step as it crosses: 64 bytes, then `n` u32 ids.
+ pub const Header = extern struct {
+@@ -214,6 +214,13 @@ pub const Leader = struct {
+         x.e.release(slot);
+     }
+ 
++    /// TF_GLM_SEQ_GROW: unmaps an idle slot's VMM granules on every rank without changing the bound slot.
++    pub fn trimSlot(x: Leader, slot: u32) !void {
++        try x.flush();
++        try x.send(.{ .kind = @backingInt(Kind.trim), .a = slot }, &.{});
++        try x.e.trimSlot(slot);
++    }
++
+     /// States rank 0 dropped since the last step, so the other ranks free theirs (ids that fit one step at a time).
+     fn flush(x: Leader) !void {
+         const d = &x.e.dropped;
+@@ -465,7 +472,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+         try e.keep((h.flags >> 16) & 0xff);
+         h.flags &= 0xffff;
+     }
+-    if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool and kind != .disk and kind != .layout) try e.bind(h.slot);
++    if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool and kind != .disk and kind != .layout and kind != .trim) try e.bind(h.slot);
+     e.prompt_logprobs = if (promptRows(h)) .{} else null;
+     e.structured = structuredStep(h); // rank 0 alone masks them
+     switch (kind) {
+@@ -555,6 +562,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+         .layout => try checkLayout(e, h.a),
+         .drop => for (ids_in) |id| e.dropState(id),
+         .release => e.release(h.slot),
++        .trim => try e.trimSlot(@intCast(h.a)),
+         .idle => cuda.tp_watch.sleep(e.io),
+         .end => return false, // rank 0 ends on purpose: its line closing from here is expected
+     }
+diff --git a/zig/src/families/glm/cuda_kv8_snapshot_test.zig b/zig/src/families/glm/cuda_kv8_snapshot_test.zig
+index 37e782b..460cb63 100644
+--- a/zig/src/families/glm/cuda_kv8_snapshot_test.zig
++++ b/zig/src/families/glm/cuda_kv8_snapshot_test.zig
+@@ -368,3 +368,132 @@ test "GLM FP8 KV: a split prefix keeps ceil(at / W) rows a cache, about a W-th o
+     try t.expectEqual(@as(usize, 385), state.latHeld(1537));
+     try t.expectEqual(@as(usize, 1537), state.ikHeld(1537)); // index keys stay whole without TF_GLM_KV_SPLIT=2
+ }
++
++test "GLM FP8 KV: seq_grow with KV_SPLIT=2 builds valid snapshot Plan across VMM region and arena" {
++    const seq_grow = @import("cuda_seq_grow.zig");
++    const gpa = t.allocator;
++    _ = setenv("TF_GLM_KV8_INT8", "1", 1);
++    defer _ = unsetenv("TF_GLM_KV8_INT8");
++    state.lat_split = 4;
++    state.ik_split = true;
++    defer {
++        state.lat_split = 1;
++        state.ik_split = false;
++    }
++    var d = Mem.driver();
++    var w: weights.Weights = undefined;
++    w.config = .{};
++    w.config.dsa = true;
++    w.config.rope = 64;
++    var layers: [3]weights.Layer = undefined;
++    for (&layers) |*l| l.mixer = .{ .mla = undefined };
++    w.layers = &layers;
++    w.share = try shard.Share.of(&w.config, 0, 4);
++    const capacity: usize = 4096;
++    const at: usize = 1536;
++
++    // Build a real Region backed by host memory via a mock VMM mapper
++    const HostVmm = struct {
++        gpa: std.mem.Allocator,
++        g: usize = 4096,
++        next_h: u64 = 1,
++        free_h: std.ArrayList(u64) = .empty,
++        backing: std.AutoHashMapUnmanaged(u64, []align(4096) u8) = .empty,
++
++        fn init(al: std.mem.Allocator, count: usize) !@This() {
++            var v: @This() = .{ .gpa = al };
++            try v.free_h.ensureTotalCapacity(al, count);
++            for (0..count) |i| v.free_h.appendAssumeCapacity(i + 1);
++            return v;
++        }
++        fn deinit(v: *@This()) void {
++            var it = v.backing.valueIterator();
++            while (it.next()) |buf| v.gpa.free(buf.*);
++            v.backing.deinit(v.gpa);
++            v.free_h.deinit(v.gpa);
++        }
++        fn of(ctx: *anyopaque) *@This() { return @ptrCast(@alignCast(ctx)); }
++        fn take(ctx: *anyopaque) ?u64 { return of(ctx).free_h.pop(); }
++        fn give(ctx: *anyopaque, h: u64) void { of(ctx).free_h.appendAssumeCapacity(h); }
++        fn map(_: *anyopaque, va: u64, _: u64) seq_grow.Mapped {
++            @memset(@as([*]u8, @ptrFromInt(va))[0..4096], 0);
++            return .ok;
++        }
++        fn unmap(_: *anyopaque, _: u64) bool { return true; }
++        fn reserve(ctx: *anyopaque, len: usize) ?u64 {
++            const v = of(ctx);
++            const buf = v.gpa.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), len) catch return null;
++            const addr: u64 = @intFromPtr(buf.ptr);
++            v.backing.put(v.gpa, addr, buf) catch {
++                v.gpa.free(buf);
++                return null;
++            };
++            return addr;
++        }
++        fn unreserve(ctx: *anyopaque, va: u64, _: usize) void {
++            const v = of(ctx);
++            if (v.backing.fetchRemove(va)) |kv| v.gpa.free(kv.value);
++        }
++        fn mapper(v: *@This()) seq_grow.Mapper {
++            return .{ .ctx = v, .granularity = v.g, .take = take, .give = give, .map = map, .unmap = unmap, .reserve = reserve, .unreserve = unreserve };
++        }
++    };
++
++    // Exercise Plan with a non-grow KV_SPLIT=2 state vs a grow-backed state with identical rows
++    var plain = try state.State.initHead(gpa, &d, &w, capacity, true, false);
++    defer plain.deinit();
++    const plain_plan = try layout.Plan.init(&plain, &w.config, at, null);
++
++    var hv = try HostVmm.init(gpa, 2000);
++    defer hv.deinit();
++    // Build a grow-backed State whose arena only holds the fixed prefix + tail (as growRegion zeroes lc/ik in arena).
++    var st = try state.State.initHead(gpa, &d, &w, capacity, true, false);
++    defer st.deinit();
++    const prefix_len = plain.caches[0].lc - plain.arena.buf.ptr;
++    const tail_len = (plain.arena.buf.ptr + plain.arena.buf.len) - plain.mtp_pos_dev;
++    // Shrink logical arena window to fixed prefix + tail (real State.make allocates only prefix + tail when grow != null).
++    st.mtp_pos_dev = st.arena.buf.ptr + prefix_len;
++    st.arena.buf.len = @intCast(prefix_len + tail_len);
++    const lw: usize = w.config.kv_lora + w.config.rope;
++    const lrows = state.latRows(capacity);
++    var sizes: [6]usize = undefined;
++    var planes: [6]?[2]seq_grow.Plane = undefined;
++    var nps: [6]u8 = undefined;
++    var divs: [6]usize = undefined;
++    var addrs: [6]u64 = undefined;
++    for (0..3) |j| {
++        sizes[2 * j] = try latent.cacheBytes(lrows, lw, true);
++        planes[2 * j] = .{ .{ .off = 0, .row = lw }, .{ .off = lrows * lw, .row = latent.scaleBytes(lw) } };
++        nps[2 * j] = 2;
++        divs[2 * j] = 4;
++        sizes[2 * j + 1] = lrows * w.config.i_dim * 2;
++        planes[2 * j + 1] = .{ .{ .off = 0, .row = w.config.i_dim * 2 }, .{ .off = 0, .row = 0 } };
++        nps[2 * j + 1] = 1;
++        divs[2 * j + 1] = 4;
++    }
++    const r = try gpa.create(seq_grow.Region);
++    r.* = try seq_grow.Region.initDiv(gpa, hv.mapper(), &sizes, &planes, &nps, &divs, &addrs);
++    st.grow = r; // freed by st.deinit()
++    for (st.caches, 0..) |*x, j| {
++        x.lc = addrs[2 * j];
++        x.ls = addrs[2 * j] + lrows * lw;
++        x.ik = addrs[2 * j + 1];
++        st.rings[2 * j] = addrs[2 * j + 1];
++    }
++    try r.ensure(at);
++    const grow_plan = try layout.Plan.init(&st, &w.config, at, null);
++    try t.expectEqual(plain_plan.len, grow_plan.len);
++    // Roundtrip copy through snapshot pool
++    var pool = try pages.Pool.initTiers(gpa, &d, pages.page, 64 * pages.page);
++    defer pool.deinit();
++    var lease = try pool.take(grow_plan.len);
++    defer pool.give(&lease);
++    const stream: cuda.Stream = .{ .d = &d, .handle = null };
++    const lat_held = state.latHeld(at);
++    fillOrPoison(&st, st.caches, lat_held, lw, 8, false);
++    try pool.move(stream, &lease, &grow_plan, true);
++    fillOrPoison(&st, st.caches, lat_held, lw, 8, true);
++    try pool.move(stream, &lease, &grow_plan, false);
++    const res = check(&st, st.caches, lat_held, lw, 8);
++    try t.expectEqual(Result{}, res);
++}
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index adc7ed1..8035077 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -346,6 +346,7 @@ pub const Lanes = struct {
+         defer self.x.e.prompt_logprobs = null;
+         const l0 = self.lanes.getPtr(s).?;
+         const start = if (from) |r| r.at else l0.rewound;
++        try self.ensureGrowSpace(l0.slot, s.prompt().len + seq_grow.margin_rows);
+         const first = try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+         const l = self.lanes.getPtr(s).?;
+         if (self.standingOf(l.slot)) |st| st.ran(fw.prefill_rows, start);
+@@ -401,6 +402,7 @@ pub const Lanes = struct {
+         const cuts = cutsOf(s, l.policy);
+         const cut_at: ?usize = if (cuts) |cs| nextCut(cs, at) else null;
+         const solo = !self.othersDecode(s);
++        try self.ensureGrowSpace(l.slot, @min(s.prompt().len, at + 2 * fw.prefill_rows) + seq_grow.margin_rows);
+         const step = try self.x.chunkTo(s.prompt(), at, solo, from, .{ .ptr = s, .check = cancelled }, marksOf(s), if (cuts != null) (cut_at orelse s.prompt().len) else null);
+         if (self.standingOf(l.slot)) |st| {
+             if (cuts != null) {
+@@ -501,11 +503,14 @@ pub const Lanes = struct {
+ 
+     /// The stream's slot, its pages, then its sequence: a slot past the paged ones waits before binding makes a window.
+     pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize) ![]const u32 {
+-        // Choose slot with prefix affinity, then check shared VMM pool headroom when TF_GLM_SEQ_GROW is active.
++        // TF_GLM_SEQ_GROW: choose slot with prefix affinity, trim LRU idle slots if needed, then admit if live + need fits
+         const existing = self.lanes.getPtr(s);
+         const chosen = if (existing) |el| el.slot else self.chooseSlotFor(s);
+         const grow_need = if (existing == null) self.growNeed(prompt, max_new) else 0;
+-        if (existing == null and !self.growFitsSlot(chosen, grow_need)) return error.LaneMemory;
++        if (existing == null and seq_grow.pool != null) {
++            if (chosen >= seq_grow.max_streams) return error.LaneMemory;
++            if (!try self.prepareGrowSlot(chosen, grow_need, self.standingMatch(chosen, s) > 0)) return error.LaneMemory;
++        }
+         const l = if (existing) |el| el else try self.claimSlot(s, chosen);
+         l.grow_need = grow_need;
+         l.pending_rows = null;
+@@ -573,6 +578,59 @@ pub const Lanes = struct {
+         return seq_grow.admits(pool.total, slots[0..seqs.len], target_slot, need);
+     }
+ 
++    /// Find the least-recently-used idle slot holding mapped VMM granules, excluding `skip_slot`.
++    fn lruIdleMappedSlot(self: *const Lanes, skip_slot: ?u32) ?u32 {
++        var victim: ?u32 = null;
++        var age: u64 = std.math.maxInt(u64);
++        for (self.x.e.seqs.items, 0..) |q, i| {
++            const slot: u32 = @intCast(i);
++            if (skip_slot != null and slot == skip_slot.?) continue;
++            if (self.slotTaken(slot)) continue;
++            const r = (q orelse continue).st.grow orelse continue;
++            if (r.mapped == 0) continue;
++            const u = self.slotUsed(slot);
++            if (victim == null or u < age) {
++                victim = slot;
++                age = u;
++            }
++        }
++        return victim;
++    }
++
++    /// Trim LRU idle slots across all ranks until `target_slot` fits `need` granules (never trimming a matched slot).
++    fn prepareGrowSlot(self: *Lanes, target_slot: u32, need: usize, matched: bool) !bool {
++        if (seq_grow.pool == null) return true;
++        while (!self.growFitsSlot(target_slot, need)) {
++            const victim = self.lruIdleMappedSlot(target_slot) orelse break;
++            if (self.standingOf(victim)) |st| st.clear();
++            try self.x.trimSlot(victim);
++        }
++        if (self.growFitsSlot(target_slot, need)) return true;
++        if (!matched and target_slot < self.x.e.seqs.items.len) {
++            if (self.x.e.seqs.items[target_slot]) |q| if (q.st.grow) |r| if (r.mapped > need) {
++                if (self.standingOf(target_slot)) |st| st.clear();
++                try self.x.trimSlot(target_slot);
++            };
++        }
++        return self.growFitsSlot(target_slot, need);
++    }
++
++    /// Before broadcasting a step that maps up to `target_rows` on `slot`, reclaim LRU idle slots if free granules are short.
++    fn ensureGrowSpace(self: *Lanes, slot: u32, target_rows: usize) !void {
++        const pool = seq_grow.pool orelse return;
++        if (slot >= self.x.e.seqs.items.len) return;
++        const q = self.x.e.seqs.items[slot] orelse return;
++        const r = q.st.grow orelse return;
++        const want = @min(self.x.e.capacity, target_rows);
++        const miss = r.missing(want);
++        if (miss == 0) return;
++        while (pool.available() < miss) {
++            const victim = self.lruIdleMappedSlot(slot) orelse return error.LaneMemory;
++            if (self.standingOf(victim)) |st| st.clear();
++            try self.x.trimSlot(victim);
++        }
++    }
++
+     /// The lane host's admission: with a pool, a paged sequence and the request's pages are free.
+     pub fn fits(self: *const Lanes, prompt: usize, max_tokens: usize) bool {
+         const p = self.x.e.pages orelse return true; // its wait note is rank 0's, on the engine thread
+@@ -698,6 +756,7 @@ pub const Lanes = struct {
+             const bits = try self.putBits(0, rows, w.masks); // before the step goes out: a refusal after it strands the ranks
+             self.x.e.structured = bits != 0;
+             defer self.x.e.structured = false;
++            try self.ensureGrowSpace(l.slot, pos + rows + seq_grow.margin_rows);
+             const t0 = self.now();
+             try self.x.verify(ids[0..rows], sampled[0..rows], bits);
+             self.observe(l, w, ids[1..rows], sampled[0..rows], self.since(t0), true);
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index e4f2f2f..8821115 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -601,6 +601,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4, MIXED_PRECISION and EXL3 mcg checkpoints (the log names what config.json has)",
+         error.X8Mismatch => "the EXLR8 ranks selected different dense weight formats or prompt modes",
+         error.BadStartFloor => "TF_GLM_START_FLOOR_MIB expects a nonnegative number of MiB (0 disables the check)",
++        error.BadSeqGrowPoolRows => "TF_GLM_SEQ_GROW_POOL_ROWS expects 0 (same as capacity) or an integer from capacity up to 4194304",
++        error.SeqGrowMismatch => "TF_GLM_SEQ_GROW_POOL_ROWS differs across ranks: start every rank with the same pool row count",
+         error.MemoryFloor => "the GLM allocation would breach the raw MemAvailable floor (TF_GLM_START_FLOOR_MIB)",
+         error.MemoryFloorUnreadable => "cannot read MemAvailable from /proc/meminfo for the GLM startup floor",
+         error.UnreadableExl3 => "an EXL3 routed expert is not an mcg trellis of 1 to 8 bits with its marker and fp16 scales (the log names the tensor)",
+diff --git a/zig/src/families/glm/cuda_seq_grow.zig b/zig/src/families/glm/cuda_seq_grow.zig
+index 4c051c3..f3ab239 100644
+--- a/zig/src/families/glm/cuda_seq_grow.zig
++++ b/zig/src/families/glm/cuda_seq_grow.zig
+@@ -33,15 +33,24 @@ pub const Field = struct {
+     len: usize,
+     planes: [2]Plane = .{ .{ .off = 0, .row = 0 }, .{ .off = 0, .row = 0 } },
+     np: u8 = 1,
++    div: usize = 1, // TF_GLM_KV_SPLIT: ranks this field splits across (1: unsplit; >1: ceil(rows / div) + 1 local rows)
+ };
+ 
++/// Local rows held by this rank for `rows` global tokens when split across `div` ranks (matches cuda_kv_split.localRows).
++fn localRowsFor(rows: usize, div: usize) usize {
++    if (rows == 0) return 0;
++    if (div <= 1) return rows;
++    return (rows + div - 1) / div + 1;
++}
++
+ /// The granules [lo, hi) of the region that hold field f's first `rows` rows (each plane's prefix, merged).
+ fn spans(f: Field, g: usize, rows: usize, out: *[2][2]usize) usize {
++    const eff = localRowsFor(rows, f.div);
+     var n: usize = 0;
+     for (f.planes[0..f.np]) |p| {
+-        if (rows == 0 or p.row == 0) continue;
++        if (eff == 0 or p.row == 0) continue;
+         const a = f.off + p.off;
+-        const b = @min(f.off + f.len, a + rows * p.row);
++        const b = @min(f.off + f.len, a + eff * p.row);
+         if (b <= a) continue;
+         const lo = a / g;
+         const hi = (b + g - 1) / g;
+@@ -100,6 +109,11 @@ pub const Region = struct {
+     /// Lays `sizes` out granule aligned (zero sizes take no room) and reserves their range; `out[i]` gets field i's
+     /// address. `planes_of(i)` gives field i's planes. Nothing is mapped yet.
+     pub fn init(gpa: std.mem.Allocator, m: Mapper, sizes: []const usize, planes: []const ?[2]Plane, nplanes: []const u8, out: []u64) Error!Region {
++        return initDiv(gpa, m, sizes, planes, nplanes, null, out);
++    }
++
++    /// `init` with per-field split divisors (`divs`, null: all 1) for TF_GLM_KV_SPLIT.
++    pub fn initDiv(gpa: std.mem.Allocator, m: Mapper, sizes: []const usize, planes: []const ?[2]Plane, nplanes: []const u8, divs: ?[]const usize, out: []u64) Error!Region {
+         const g = m.granularity;
+         var fields: std.ArrayList(Field) = .empty;
+         errdefer fields.deinit(gpa);
+@@ -110,7 +124,8 @@ pub const Region = struct {
+             at[i] = off;
+             if (n == 0) continue;
+             const pl: [2]Plane = p orelse .{ Plane{ .off = 0, .row = 0 }, Plane{ .off = 0, .row = 0 } };
+-            try fields.append(gpa, .{ .off = off, .len = n, .planes = pl, .np = np });
++            const dv: usize = if (divs) |d| @max(d[i], 1) else 1;
++            try fields.append(gpa, .{ .off = off, .len = n, .planes = pl, .np = np, .div = dv });
+             off += std.mem.alignForward(usize, n, g);
+         }
+         const len = @max(off, g);
+@@ -196,10 +211,45 @@ pub const Region = struct {
+     pub fn need(r: *const Region, rows: usize) usize {
+         return granulesFor(r.fields, r.m.granularity, rows);
+     }
++
++    /// Unmapped granules required to cover `rows` rows (0 when already covered).
++    pub fn missing(r: *const Region, rows: usize) usize {
++        if (rows <= r.covered) return 0;
++        const g = r.m.granularity;
++        var miss: usize = 0;
++        for (r.fields) |f| {
++            var s: [2][2]usize = undefined;
++            const n = spans(f, g, rows, &s);
++            for (s[0..n]) |x| for (x[0]..x[1]) |k| {
++                if (r.handles[k] == 0) miss += 1;
++            };
++        }
++        return miss;
++    }
+ };
+ 
+-/// TF_GLM_SEQ_GROW_ADMIT_NEW: max output tokens reserved per stream at admission so omitted max_tokens (e.g. 1M)
+-/// does not monopolize the shared VMM pool (0: legacy full max_new; default: 16384).
++/// TF_GLM_SEQ_GROW_POOL_ROWS: shared VMM pool token capacity across all concurrent streams (>= capacity; unset or 0: capacity).
++pub fn poolRowsAsked(capacity: usize) !usize {
++    return parsePoolRows(if (std.c.getenv("TF_GLM_SEQ_GROW_POOL_ROWS")) |v| std.mem.span(v) else null, capacity);
++}
++
++fn parsePoolRows(v: ?[]const u8, capacity: usize) !usize {
++    const s = v orelse return capacity;
++    if (s.len == 0 or std.mem.eql(u8, s, "0")) return capacity;
++    const n = std.fmt.parseInt(usize, s, 10) catch return error.BadSeqGrowPoolRows;
++    if (n < capacity or n > 4 * 1024 * 1024) return error.BadSeqGrowPoolRows;
++    return n;
++}
++
++/// Pool granules for `pool_rows` shared tokens when each stream's region spans `capacity` rows.
++pub fn poolGranules(r: *const Region, capacity: usize, pool_rows: usize) usize {
++    const one = r.need(capacity);
++    if (pool_rows <= capacity or capacity == 0) return one;
++    return std.math.divCeil(usize, one * pool_rows, capacity) catch one;
++}
++
++/// TF_GLM_SEQ_GROW_ADMIT_NEW: output tokens reserved at admission (default 16384; 0: reserve full max_tokens).
++/// Dynamic growth maps additional granules on demand if a stream decodes past its initial reservation.
+ pub fn admitNewAsked() usize {
+     return parseAdmitNew(if (std.c.getenv("TF_GLM_SEQ_GROW_ADMIT_NEW")) |v| std.mem.span(v) else null);
+ }
+@@ -754,7 +804,40 @@ test "GLM seq grow: the switch reads 1 and 0 and refuses anything else" {
+     try T.expectError(error.BadSeqGrow, parse(""));
+ }
+ 
+-test "GLM seq grow: admitNewAsked and admitRows bound omitted max_tokens" {
++test "GLM seq grow: KV_SPLIT div=4 maps ceil(rows/4)+1 local rows and poolGranules scales pool_rows past capacity" {
++    const g: usize = 4096;
++    const cap: usize = 4096;
++    const local_cap: usize = (cap + 3) / 4 + 1; // 1025
++    const sizes = [_]usize{ 0, local_cap * (576 + 8), local_cap * 256 };
++    const planes = [_]?[2]Plane{ null, .{ .{ .off = 0, .row = 576 }, .{ .off = local_cap * 576, .row = 8 } }, .{ .{ .off = 0, .row = 256 }, .{ .off = 0, .row = 0 } } };
++    const np = [_]u8{ 0, 2, 1 };
++    const divs = [_]usize{ 1, 4, 4 };
++    var f = try Fake.init(T.allocator, g, 1000);
++    defer f.deinit();
++    var out: [3]u64 = undefined;
++    var r = try Region.initDiv(T.allocator, f.mapper(), &sizes, &planes, &np, &divs, &out);
++    defer r.deinit();
++    try T.expectEqual(@as(usize, 0), r.need(0));
++    const n400 = r.need(400);
++    const ncap = r.need(cap);
++    try T.expect(n400 > 0 and n400 < ncap);
++    try T.expectEqual(n400, r.missing(400));
++    try r.ensure(400);
++    try T.expectEqual(@as(usize, 0), r.missing(400));
++    try T.expectEqual(ncap - n400, r.missing(cap));
++    // whole capacity matches local_cap bytes rounded up to granules
++    const exp_lat = (local_cap * (576 + 8) + g - 1) / g;
++    const exp_ik = (local_cap * 256 + g - 1) / g;
++    try T.expectEqual(exp_lat + exp_ik, ncap);
++    // pool_rows scaling
++    try T.expectEqual(ncap, poolGranules(&r, cap, cap));
++    try T.expectEqual(std.math.divCeil(usize, ncap * (cap * 3 / 2), cap) catch unreachable, poolGranules(&r, cap, cap * 3 / 2));
++    try T.expectEqual(cap, try parsePoolRows(null, cap));
++    try T.expectEqual(cap, try parsePoolRows("0", cap));
++    try T.expectEqual(cap * 2, try parsePoolRows("8192", cap));
++    try T.expectError(error.BadSeqGrowPoolRows, parsePoolRows("2048", cap));
++    try T.expectError(error.BadSeqGrowPoolRows, parsePoolRows("bad", cap));
++    // admitNew / admitRows
+     try T.expectEqual(@as(usize, 16384), parseAdmitNew(null));
+     try T.expectEqual(@as(usize, 0), parseAdmitNew("0"));
+     try T.expectEqual(@as(usize, 8192), parseAdmitNew("8192"));
+diff --git a/zig/src/families/glm/cuda_snapshot_layout.zig b/zig/src/families/glm/cuda_snapshot_layout.zig
+index 750f133..44872ec 100644
+--- a/zig/src/families/glm/cuda_snapshot_layout.zig
++++ b/zig/src/families/glm/cuda_snapshot_layout.zig
+@@ -46,8 +46,8 @@ pub const Plan = struct {
+         if (at > st.capacity or st.caches.len > @import("config.zig").max_layers) return error.SnapshotShape;
+         if (st.rings.len != 2 * (st.caches.len + 1)) return error.SnapshotShape;
+         var p: Plan = .{ .ids = st.pages, .lids = st.lpages, .sizing = sizing, .latent = latent };
+-        // a paged sequence's caches are its pages: its fields up to them end at its first ring
+-        const first = if (st.table != 0) st.rings[0] else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
++        // a paged sequence's caches are its pages (fields up to them end at rings[0]); a seq_grow sequence's caches live in its VMM region (arena prefix ends at mtp_pos_dev)
++        const first = if (st.table != 0) st.rings[0] else if (st.grow != null) st.mtp_pos_dev else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
+         if (first < st.arena.buf.ptr) return error.SnapshotShape;
+         try p.add(st, st.arena.buf.ptr, @intCast(first - st.arena.buf.ptr));
+         for (st.caches, 0..) |x, j| try p.rows(st, c, x, j, at);
+@@ -126,11 +126,17 @@ pub const Plan = struct {
+         return .{ .live = part.live + @as(u64, ids[done / part.span]) * part.page + off, .len = @min(part.span - off, part.len - done) };
+     }
+ 
++    fn inRange(base: u64, bound: usize, live: u64, len: usize) bool {
++        if (live < base) return false;
++        const off = live - base;
++        return off <= bound and len <= bound - off;
++    }
++
+     fn add(p: *Plan, st: *const State, live: u64, len: usize) !void {
+         if (len == 0) return;
+-        if (live < st.arena.buf.ptr) return error.SnapshotShape;
+-        const off = live - st.arena.buf.ptr;
+-        if (off > st.arena.buf.len or len > st.arena.buf.len - off or p.count == p.parts.len)
++        const in_arena = inRange(st.arena.buf.ptr, st.arena.buf.len, live, len);
++        const in_grow = if (st.grow) |r| inRange(r.va, r.len, live, len) else false;
++        if ((!in_arena and !in_grow) or p.count == p.parts.len)
+             return error.SnapshotShape;
+         p.len = try std.math.add(usize, p.len, len);
+         p.parts[p.count] = .{ .live = live, .len = len };
+diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
+index 2db4245..b23f1da 100644
+--- a/zig/src/families/glm/cuda_snapshots.zig
++++ b/zig/src/families/glm/cuda_snapshots.zig
+@@ -25,8 +25,7 @@ pub fn prepare(e: anytype, budget: u64) !void {
+ /// `budget` bytes of device pages and `host` bytes of pinned host pages, made once.
+ pub fn prepareTiers(e: anytype, budget: u64, host: u64) !void {
+     if (e.snap_pages != null or e.snaps.count() != 0) return error.SnapshotCacheMade;
+-    // TF_GLM_SEQ_GROW: a kept state's restore writes rows no pass mapped; the two do not combine (PROMPT_CACHE_GIB=0)
+-    if (@import("cuda_seq_grow.zig").pool != null and budget + host > 0) return error.SeqGrowPromptCache;
++    // TF_GLM_SEQ_GROW: restore() maps the target rows via State.ready() before copying kept pages into the region.
+     const count = std.math.cast(u32, budget / pages.page + host / pages.page) orelse return error.SnapshotBudget;
+     try e.snaps.ensureTotalCapacity(e.gpa, count);
+     try e.dropped.ensureTotalCapacity(e.gpa, @as(usize, count) + 1);
+@@ -202,6 +201,7 @@ pub fn restore(e: anytype, id: u64) !void {
+     if (s.ring_from != null) try plan.outside(try (e.drafter orelse return error.SnapshotSize).ringPtr(e.slot), (e.drafter orelse return error.SnapshotSize).ringBytes());
+     if (plan.len != s.len) return error.SnapshotSize;
+     errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
++    if (e.cur.st.grow != null) try e.cur.st.ready(e.stream, s.pos);
+     const t0 = now();
+     try pool.moveParts(e.stream, &s.lease, &plan, false, !own or kv_keep.restoresLatent(home, hold, e.share.rank));
+     // TF_GLM_KV_SHARD: the latent rows to the rank that holds the new stream's rows but not the state's copy of them
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index c967133..346de45 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -587,11 +587,14 @@ fn growRegion(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
+     defer gpa.free(planes);
+     const np = try gpa.alloc(u8, sizes.len);
+     defer gpa.free(np);
++    const divs = try gpa.alloc(usize, sizes.len);
++    defer gpa.free(divs);
+     const out = try gpa.alloc(u64, sizes.len);
+     defer gpa.free(out);
+     @memset(gs, 0);
+     @memset(planes, null);
+     @memset(np, 0);
++    @memset(divs, 1);
+     for (0..nd + 1) |j| {
+         const lc = 8 + 4 * j;
+         const ik = 9 + 4 * j;
+@@ -599,17 +602,19 @@ fn growRegion(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
+             gs[lc] = sizes[lc];
+             planes[lc] = if (kv8) .{ .{ .off = 0, .row = lw }, .{ .off = rows * lw, .row = latent.scaleBytes(lw) } } else .{ .{ .off = 0, .row = lw * 2 }, .{ .off = 0, .row = 0 } };
+             np[lc] = if (kv8) 2 else 1;
++            divs[lc] = if (j < nd) lat_split else 1;
+             std.debug.assert(sizes[lc] == try latent.cacheBytes(rows, lw, kv8));
+         }
+         if (sizes[ik] > 0) {
+             gs[ik] = sizes[ik];
+             planes[ik] = .{ .{ .off = 0, .row = c.i_dim * 2 }, .{ .off = 0, .row = 0 } };
+             np[ik] = 1;
++            divs[ik] = if (j < nd and ik_split) lat_split else 1;
+         }
+     }
+     const r = try gpa.create(seq_grow.Region);
+     errdefer gpa.destroy(r);
+-    r.* = try seq_grow.Region.init(gpa, seq_grow.pool.?.mapper(), gs, planes, np, out);
++    r.* = try seq_grow.Region.initDiv(gpa, seq_grow.pool.?.mapper(), gs, planes, np, divs, out);
+     for (gs, 0..) |n, i| if (n > 0) {
+         sizes[i] = 0;
+         p[i] = out[i];
+@@ -718,7 +723,7 @@ pub const State = struct {
+         @memset(p, 0);
+         // TF_GLM_SEQ_GROW: the row fields (each cache's latent rows and index keys) on granules of the shared pool,
+         // the rest in the arena as before; the same addresses inside each field, so the kernels see the same layout
+-        const grows = seq_grow.pool != null and paged == null and lat_split <= 1;
++        const grows = seq_grow.pool != null and paged == null;
+         const region: ?*seq_grow.Region = if (grows) try growRegion(gpa, w, capacity, kv8, sizes, p) else null;
+         errdefer if (region) |r| {
+             r.deinit();
+-- 
+2.43.0
+
