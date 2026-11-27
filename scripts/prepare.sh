@@ -82,8 +82,8 @@ validate_seq_grow() {
   split=$(rank_extra_value TF_GLM_KV_SPLIT 0)
   pages=$(rank_extra_value TF_KV_PAGES "$KV_PAGES")
   shard=$(rank_extra_value TF_GLM_KV_SHARD 0)
-  [[ "$KV_SPLIT" == 0 && "$split" =~ ^(0|)$ && "$pages" == off && "$KV_SHARD" == 0 && "$shard" =~ ^(0|)$ ]] \
-    || fail E_CONFIG 'TF_GLM_SEQ_GROW=1 needs KV_PAGES=off, KV_SPLIT=0 and KV_SHARD=0 on every rank.'
+  [[ "$KV_SPLIT" =~ ^[012]$ && "$split" =~ ^(0|1|2|)$ && "$pages" == off && "$KV_SHARD" == 0 && "$shard" =~ ^(0|)$ ]] \
+    || fail E_CONFIG 'TF_GLM_SEQ_GROW=1 needs KV_PAGES=off, KV_SPLIT=0|1|2 and KV_SHARD=0 on every rank.'
   host_cache=$(rank_extra_value TF_GLM_HOST_CACHE_GIB "$HOST_CACHE_GIB")
   prompt_cache=$PROMPT_CACHE_GIB
   read -r -a extra <<< "$SERVE_EXTRA_ARGS"
@@ -94,8 +94,8 @@ validate_seq_grow() {
       --prompt-cache-gib=*) prompt_cache=${arg#*=} ;;
     esac
   done
-  [[ "$host_cache" =~ ^0+(\.0+)?$ && "$prompt_cache" =~ ^0+(\.0+)?$ ]] \
-    || fail E_CONFIG 'TF_GLM_SEQ_GROW=1 needs PROMPT_CACHE_GIB=0 and HOST_CACHE_GIB=0 on every rank.'
+  [[ "$host_cache" =~ ^0+(\.0+)?$ ]] \
+    || fail E_CONFIG 'TF_GLM_SEQ_GROW=1 needs HOST_CACHE_GIB=0 on every rank.'
 }
 
 validate_config() {
@@ -140,13 +140,13 @@ validate_config() {
   [[ -z "${MTP_CAP:-}" || "$MTP_CAP" =~ ^[1-6]$ ]] || fail E_CONFIG 'MTP_CAP must be empty or 1..6.'
   [[ "${SPLIT_QKVA:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'SPLIT_QKVA must be 0 or 1.'
   [[ "${DSA_INDEX_FAST:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'DSA_INDEX_FAST must be 0 or 1.'
-  [[ "${KV_SPLIT:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'KV_SPLIT must be 0 or 1.'
+  [[ "${KV_SPLIT:-0}" =~ ^[012]$ ]] || fail E_CONFIG 'KV_SPLIT must be 0, 1 or 2.'
   [[ "${SLOT_RESUME:-1}" =~ ^[01]$ ]] || fail E_CONFIG 'SLOT_RESUME must be 0 or 1.'
   [[ "${PF_EXPERTS_ONCE:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'PF_EXPERTS_ONCE must be 0 or 1.'
   [[ "${PF_QMMF2:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'PF_QMMF2 must be 0 or 1.'
   [[ "${PF_DOWN_FUSE:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'PF_DOWN_FUSE must be 0 or 1.'
   validate_rank_env
-  if [[ "${KV_SPLIT:-0}" == 1 ]]; then  # patches 0187-0189: the split latent rows live in each rank's own arena
+  if [[ "${KV_SPLIT:-0}" != 0 ]]; then  # patches 0187-0189: the split latent/ik rows live in each rank's own arena
     [[ "$KV_PAGES" == off ]] || fail E_CONFIG "KV_SPLIT=1 needs KV_PAGES=off (got $KV_PAGES)."
     [[ "$DRAFTER" != mtp ]] || fail E_CONFIG 'KV_SPLIT=1 serves without the MTP drafter: DRAFTER=dflash2, dspark or none.'
     [[ "${LEARN_GIB:-0}" == 0 ]] || fail E_CONFIG "KV_SPLIT=1 needs LEARN_GIB=0 (got $LEARN_GIB)."
@@ -205,7 +205,7 @@ validate_config() {
     [[ "$TP" == 4 && "${TP6_RANKS:-}" == 4 ]] || fail E_CONFIG "MODEL_FORMAT=exlr8 serves four Sparks (TP6_RANKS=4 ./start-tp6.sh; TP=$TP, TP6_RANKS=${TP6_RANKS:-unset})."
     [[ "$WORKER_WEIGHTS" == check ]] || fail E_CONFIG 'MODEL_FORMAT=exlr8: every rank reads its own converted pieces, so WORKER_WEIGHTS must be check (NFS and rsync cannot carry them).'
     [[ "$MODEL_SOURCE" == local ]] || fail E_CONFIG 'MODEL_FORMAT=exlr8 serves the converted directory (scripts/prepare-exlr8.sh): MODEL_SOURCE must be local.'
-    [[ "${KV_SPLIT:-0}" != 1 ]] || warn W_CONFIG 'KV_SPLIT=1 has no EXLR8 measurements and overrides the 196,608-token default.'
+    [[ "${KV_SPLIT:-0}" == 0 ]] || warn W_CONFIG "KV_SPLIT=$KV_SPLIT has no EXLR8 measurements and overrides the 196,608-token default."
   fi
   for key in FABRIC_PEER FABRIC_SELF NFS_SERVER; do
     [[ -z "${!key}" || "${!key}" =~ ^[A-Za-z0-9.:_-]+$ ]] || fail E_CONFIG "$key must be an address or host name."
