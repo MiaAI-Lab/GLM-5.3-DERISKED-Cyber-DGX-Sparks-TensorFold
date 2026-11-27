@@ -302,7 +302,7 @@ tp6_rank_env() {
   # DSA_INDEX_FAST=1 (config.sh): the decode indexer's RoPE hoist and multi-CTA top-2048 (patch 0192), on every rank
   [[ "${DSA_INDEX_FAST:-0}" != 1 ]] || RANK_ENV+=(-e TF_GLM_DSA_ROPE_HOIST=1 -e TF_GLM_DSA_TOPK_MULTI=1)
   # KV_SPLIT=1 (config.sh): each token's latent rows on one rank (patches 0187-0189), the history prefetch off
-  [[ "${KV_SPLIT:-0}" != 1 ]] || RANK_ENV+=(-e TF_GLM_KV_SPLIT=1 -e TF_GLM_KV_SPLIT_PREFETCH=0)
+  [[ "${KV_SPLIT:-0}" == 0 ]] || RANK_ENV+=(-e "TF_GLM_KV_SPLIT=$KV_SPLIT" -e TF_GLM_KV_SPLIT_PREFETCH=0)
   # SLOT_RESUME (config.sh): a later prompt resumes on its slot's own prompt rows (patch 0195); every rank alike
   RANK_ENV+=(-e "TF_GLM_SLOT_RESUME=${SLOT_RESUME:-1}")
   # PF_EXPERTS_ONCE / PF_QMMF2 / PF_DOWN_FUSE (config.sh; patches 0206-0208): a 1 reaches every rank alike, a 0 passes nothing;

@@ -350,4 +350,8 @@ rank_env_test=$(env -i PATH="$PATH" HOME="$HOME" GLM_TP6=1 MODEL_FORMAT=exlr8 ba
 for assignment in TF_GLM_RANK=0 TF_GLM_SEQ_GROW=1 TF_GLM_SEQ_GROW_STREAMS=2 TF_GLM_SEQ_GROW_FLOOR_MIB=2560 TF_GLM_DSA_SHARED=1 TF_GLM_X8_PROMPT_Q8=1; do
   grep -qx "$assignment" <<< "$rank_env_test"
 done
+# Patch 0245: KV_SPLIT=1 and KV_SPLIT=2 allow LEARN_GIB > 0.
+for split in 1 2; do
+  request TF_GLM_SEQ_GROW=0 KV_SPLIT="$split" LEARN_GIB=100 >/dev/null
+done
 echo 'exlr8-native: effective request switches, rank environment and sequence-growth validation: pass'

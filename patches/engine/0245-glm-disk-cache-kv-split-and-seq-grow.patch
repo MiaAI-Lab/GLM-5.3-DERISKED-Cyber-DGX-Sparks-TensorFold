@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: port <port@local>
+Date: Fri, 27 Nov 2026 16:08:36 -0500
+Subject: [PATCH 0245] glm: support KV_SPLIT=1/2 and SEQ_GROW in disk conversation
+ cache (LEARN_GIB)
+
+---
+ zig/build/glm_family_host.zig                 |   1 +
+ zig/src/families/glm/cuda_disk_image.zig      | 104 +++++++++++++++---
+ zig/src/families/glm/cuda_disk_image_test.zig |  84 ++++++++++++++
+ zig/src/native/cuda_glm_disk.zig              |  44 +++++---
+ 4 files changed, 199 insertions(+), 34 deletions(-)
+
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index d0aac90..4cba350 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -29,6 +29,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     b.step("test-glm-swift-krn-gpu", "Policy bits 2 and 3: the decode select through dsaSelect with the bits set and clear, bit for bit (TF_KRN_GPU: the fatbins' directory; skipped without)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM swift KRN GPU:"} })).step);
+     b.step("test-glm-scan-split-gpu", "Policy bit 10: every rank's split index scan on one device, gathered and merged, against the unsplit lists and counts, bit for bit (TF_KRN_GPU: the fatbins' directory; skipped without)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM scan split GPU:"} })).step);
+     b.step("test-glm-kv-split-host", "TF_GLM_KV_SPLIT's ownership, head tables and switch, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"KV split:"} })).step);
++    b.step("test-glm-disk-image-host", "GLM disk image layout, KV_SPLIT multi-rank routing and permit sizing, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "GLM disk image:", "GLM disk permit:" } })).step);
+     b.step("test-glm-slot-resume-host", "TF_GLM_SLOT_RESUME: where a later prompt resumes on its slot's own rows (prefix, grid, stamps, drafter window), without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM slot resume:"} })).step);
+     b.step("test-glm-dsa-shared-host", "glm_moe_dsa's streams one window a round until its shared window is built (TF_GLM_DSA_SHARED), without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM dsa shared:"} })).step);
+     b.step("test-glm-seq-grow-host", "TF_GLM_SEQ_GROW: granules follow the rows, trims, a shared pool and its refusal, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM seq grow:"} })).step);
+diff --git a/zig/src/families/glm/cuda_disk_image.zig b/zig/src/families/glm/cuda_disk_image.zig
+index 71febbf..2cc9efc 100644
+--- a/zig/src/families/glm/cuda_disk_image.zig
++++ b/zig/src/families/glm/cuda_disk_image.zig
+@@ -67,15 +67,16 @@ pub const Shape = struct {
+     head: bool, // the MTP head's caches are kept (drafting)
+     dsa: bool, // glm_moe_dsa: the ig rings are dead (its select reads ik only); the image keeps no ig part
+     unindexed: u128 = 0, // glm_moe_dsa: bit j set where DSA layer j holds no index keys (it reuses a full layer's picks)
++    lat_split: u32 = 1, // TF_GLM_KV_SPLIT: ranks latent rows split over (1: unsplit)
++    ik_split: bool = false, // TF_GLM_KV_SPLIT=2: index keys split as latent rows
+ 
+     pub fn of(st: *const State, c: *const Config, capacity: usize, head: bool) !Shape {
+         if (st.rings.len == 0) return error.SnapshotShape;
+-        if (st_mod.lat_split > 1) return error.KvSplitDisk; // TF_GLM_KV_SPLIT: a rank's own rows only (device and host tiers keep them; disk not yet)
+         const base = st.arena.buf.ptr;
+-        const first = if (st.table != 0) st.rings[0] else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
++        const first = if (st.table != 0) st.rings[0] else if (st.grow != null) st.mtp_pos_dev else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
+         const end = if (st.table != 0) st.table else base + st.arena.buf.len;
+         if (first < base or st.mtp_pos_dev < first or end < st.mtp_pos_dev) return error.SnapshotShape;
+-        const fp8 = st.mtp_caches.ls != 0;
++        const fp8 = if (st.caches.len > 0) st.caches[0].ls != 0 else st.mtp_caches.ls != 0;
+         return .{
+             .prefix = first - base,
+             .tail = end - st.mtp_pos_dev,
+@@ -97,9 +98,19 @@ pub const Shape = struct {
+                 };
+                 break :blk m;
+             },
++            .lat_split = @intCast(st_mod.lat_split),
++            .ik_split = st_mod.ik_split,
+         };
+     }
+ 
++    fn latHeld(sh: Shape, n: u64) u64 {
++        return if (sh.lat_split <= 1) n else (n + sh.lat_split - 1) / sh.lat_split;
++    }
++
++    fn ikHeld(sh: Shape, n: u64) u64 {
++        return if (sh.ik_split) sh.latHeld(n) else n;
++    }
++
+     /// Rows the image keeps of the head's caches at `at`: a verify window past it, as the cache charges a state.
+     pub fn headRows(sh: Shape, at: u32) u32 {
+         return @min(sh.capacity, at + window_rows);
+@@ -121,11 +132,14 @@ pub fn permit(default: u64, bytes: u64, at: u32, budget: u64) u64 {
+ /// Cache `j` (a DSA layer; the head is never unindexed): glm_moe_dsa keeps index keys on its indexer layers only and
+ /// no pooled keys.
+ fn cacheOf(sh: Shape, j: usize, n: u64) [5]u64 {
+-    const indexed = j >= 128 or sh.unindexed & (@as(u128, 1) << @intCast(j)) == 0;
++    const head_cache = j >= 128;
++    const indexed = head_cache or sh.unindexed & (@as(u128, 1) << @intCast(j)) == 0;
++    const lat_n = if (head_cache) n else sh.latHeld(n);
++    const ik_n = if (head_cache) n else sh.ikHeld(n);
+     return .{
+-        n * sh.latent,
+-        if (sh.scales) n * sh.scale_row else 0,
+-        if (indexed) @min(n, sh.ring_rows) * sh.ring_row else 0,
++        lat_n * sh.latent,
++        if (sh.scales) lat_n * sh.scale_row else 0,
++        if (indexed) @min(ik_n, sh.ring_rows) * sh.ring_row else 0,
+         if (sh.dsa) 0 else @min(n, sh.ring_rows) * sh.ring_row,
+         if (sh.dsa) 0 else @min(n / sparse.pool + 2, sh.pk_rows) * sh.pooled_row,
+     };
+@@ -136,16 +150,30 @@ fn cache(sh: Shape, n: u64) [5]u64 {
+     return cacheOf(sh, 128, n);
+ }
+ 
+-/// The image at `at` (a chunk start): the words, the prefix, each DSA layer's rows, the head's caches, the tail.
++/// The image at `at` (a chunk start): the words, then one rank's body (prefix, DSA layers, head, tail).
+ pub fn parts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator) !void {
+     if (at == 0 or at % sparse.pool != 0 or at > sh.capacity) return error.SnapshotShape;
+-    try out.appendSlice(a, &.{ .{ .bytes = Words.bytes }, .{ .bytes = sh.prefix } });
++    try out.append(a, .{ .bytes = Words.bytes });
++    try partsBody(sh, at, out, a);
++}
++
++/// One rank's parts after `Words`: prefix, each DSA layer's rows (block-deduplicated by `per` when it divides 256), head, tail.
++fn partsBody(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator) !void {
++    try out.append(a, .{ .bytes = sh.prefix });
+     const pooled: u64 = if (sh.dsa) 0 else at / sparse.pool;
++    const lat_per: u32 = if (sh.lat_split <= 1) 1 else sh.lat_split;
++    const lat_block = 256 % lat_per == 0;
++    const ik_per: u32 = if (sh.ik_split) lat_per else 1;
++    const ik_block = sh.dsa and sh.ring_rows >= sh.capacity and (256 % ik_per == 0);
+     for (0..sh.layers) |j| {
+         const c = cacheOf(sh, j, at);
+-        try out.append(a, .{ .bytes = c[0], .row = sh.latent });
+-        if (sh.scales) try out.append(a, .{ .bytes = c[1], .row = sh.scale_row });
+-        try out.append(a, .{ .bytes = c[2] });
++        try out.append(a, if (lat_block) .{ .bytes = c[0], .row = sh.latent, .per = lat_per } else .{ .bytes = c[0] });
++        if (sh.scales) try out.append(a, if (lat_block) .{ .bytes = c[1], .row = sh.scale_row, .per = lat_per } else .{ .bytes = c[1] });
++        if (ik_block and c[2] > 0) {
++            try out.append(a, .{ .bytes = c[2], .row = sh.ring_row, .per = ik_per });
++        } else {
++            try out.append(a, .{ .bytes = c[2] });
++        }
+         if (c[3] > 0) try out.append(a, .{ .bytes = c[3] });
+         // whole pools are rows by position; the pool past them and the spare row stay the state's own
+         if (c[4] > 0) try out.appendSlice(a, &.{ .{ .bytes = pooled * sh.pooled_row, .row = sh.pooled_row, .per = sparse.pool }, .{ .bytes = c[4] - pooled * sh.pooled_row } });
+@@ -227,16 +255,60 @@ pub fn imageBytes(sh: Shape, at: u32) u64 {
+ /// `len` bytes at `off` of rank `rank`'s image; `shared`: past rank 0's prefix, the same bytes every rank holds.
+ pub const Piece = struct { rank: u32, off: u64, len: u64, shared: bool };
+ 
+-/// The store's image at `at`: rank 0's, then each other rank's prefix (rank 0's bytes stand for all the rest).
++/// Total store image bytes across all ranks at `at`.
++pub fn storeImageBytes(sh: Shape, prefixes: []const u64, at: u32) u64 {
++    var total = imageBytes(sh, at);
++    if (sh.lat_split > 1) {
++        for (prefixes[1..]) |p| {
++            var rsh = sh;
++            rsh.prefix = p;
++            total += imageBytes(rsh, at) - Words.bytes;
++        }
++    } else {
++        for (prefixes[1..]) |p| total += p;
++    }
++    return total;
++}
++
++/// The store's image at `at`: rank 0's, then each other rank's prefix (unsplit) or full per-rank body (KV_SPLIT).
+ pub fn storeParts(sh: Shape, prefixes: []const u64, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator) !void {
+     try parts(sh, at, out, a);
++    if (sh.lat_split > 1) {
++        for (prefixes[1..]) |p| {
++            var rsh = sh;
++            rsh.prefix = p;
++            try partsBody(rsh, at, out, a);
++        }
++        return;
++    }
+     for (prefixes[1..]) |p| try out.append(a, .{ .bytes = p });
+ }
+ 
+-/// Store image bytes [off, off + len) split by rank: rank 0's image, then rank r's prefix after its words. `home`: a
+-/// KV-sharded state's home part (null: unsharded), whose rank alone holds the latent rows; their bytes are its own
+-/// there (shared false), at the same place past its prefix as in rank 0's image.
++/// Store image bytes [off, off + len) split by rank: rank 0's image, then rank r's prefix (unsplit) or rank r's full
++/// per-rank body (KV_SPLIT, every piece `.shared = false`). `home`: KV-sharded home part (null: unsharded).
+ pub fn route(sh: Shape, prefixes: []const u64, at: u32, off: u64, len: u64, home: ?u8, out: *std.ArrayList(Piece), a: std.mem.Allocator) !void {
++    if (sh.lat_split > 1) {
++        if (home != null) return error.SnapshotShape;
++        var start: u64 = 0;
++        for (prefixes, 0..) |p, r| {
++            var rsh = sh;
++            rsh.prefix = p;
++            const size = if (r == 0) imageBytes(rsh, at) else imageBytes(rsh, at) - Words.bytes;
++            defer start += size;
++            const lo = @max(off, start);
++            const hi = @min(off + len, start + size);
++            if (lo >= hi) continue;
++            if (r == 0 and lo < Words.bytes and hi > Words.bytes) {
++                try out.append(a, .{ .rank = 0, .off = lo, .len = Words.bytes - lo, .shared = false });
++                try out.append(a, .{ .rank = 0, .off = Words.bytes, .len = hi - Words.bytes, .shared = false });
++            } else {
++                const rank_off = if (r == 0) lo else Words.bytes + (lo - start);
++                try out.append(a, .{ .rank = @intCast(r), .off = rank_off, .len = hi - lo, .shared = false });
++            }
++        }
++        if (off + len > start) return error.SnapshotShape;
++        return;
++    }
+     const own = Words.bytes + sh.prefix; // rank 0's bytes no other rank holds
+     if (home) |h| if (h >= prefixes.len) return error.SnapshotShape;
+     var start: u64 = 0; // the section's first store byte
+diff --git a/zig/src/families/glm/cuda_disk_image_test.zig b/zig/src/families/glm/cuda_disk_image_test.zig
+index 8a17007..f72687b 100644
+--- a/zig/src/families/glm/cuda_disk_image_test.zig
++++ b/zig/src/families/glm/cuda_disk_image_test.zig
+@@ -336,3 +336,87 @@ test "GLM disk permit: a 124,928-token state is staged whole within the RAM stor
+     try std.testing.expectEqual(gib, image.permit(gib, state, 124_928, gib / 2)); // a store too small to keep it: the default
+     try std.testing.expectEqual(gib, image.permit(gib, 0, 0, 8 * gib));
+ }
++
++test "GLM disk image: KV_SPLIT=2 matches Plan.len, validates 256-token blocks, and routes all 4 ranks disjointly" {
++    const state_mod = @import("cuda_state.zig");
++    const ranks_mod = @import("cuda_disk_ranks.zig");
++    const a = std.testing.allocator;
++    state_mod.lat_split = 4;
++    state_mod.ik_split = true;
++    defer {
++        state_mod.lat_split = 1;
++        state_mod.ik_split = false;
++    }
++    var layers: [3]weights.Layer = undefined;
++    for (&layers) |*l| l.mixer = .{ .mla = undefined };
++    var w: weights.Weights = undefined;
++    w.config = .{};
++    w.config.dsa = true;
++    w.config.rope = 64;
++    w.share = try shard.Share.of(&w.config, 0, 4);
++    w.layers = &layers;
++
++    var d = H.driver();
++    const cap: usize = 4096;
++    var st = try State.initHead(a, &d, &w, cap, true, false);
++    defer st.deinit();
++    const sh = try image.Shape.of(&st, &w.config, cap, false);
++    try expectEqual(@as(u32, 4), sh.lat_split);
++    try expect(sh.ik_split);
++    const at: u32 = 4096;
++    const plan = try Plan.init(&st, &w.config, at, null);
++    try expectEqual(@as(u64, plan.len), image.leaseBytes(sh, at, 0));
++
++    const prefixes = [_]u64{ sh.prefix, sh.prefix, sh.prefix, sh.prefix };
++    var list: std.ArrayList(image.Part) = .empty;
++    defer list.deinit(a);
++    try image.storeParts(sh, &prefixes, at, &list, a);
++    var total: u64 = 0;
++    var row_parts: usize = 0;
++    for (list.items) |p| {
++        total += p.bytes;
++        if (p.row > 0) {
++            row_parts += 1;
++            try expect(256 % p.per == 0);
++            try expectEqual(@as(u64, at / p.per) * p.row, p.bytes);
++        }
++    }
++    try expectEqual(image.storeImageBytes(sh, &prefixes, at), total);
++    // 4 ranks * 3 layers * (latent + scales + ik) = 36 block-deduplicated row parts!
++    try expectEqual(@as(usize, 4 * 3 * 3), row_parts);
++
++    // Roundtrip gatherWith -> scatterWith over 4 ranks with distinct per-rank bytes
++    const rank_img_len: usize = @intCast(image.imageBytes(sh, at));
++    var src_ranks: [4][]u8 = undefined;
++    var dst_ranks: [4][]u8 = undefined;
++    for (0..4) |r| {
++        src_ranks[r] = try a.alloc(u8, rank_img_len);
++        dst_ranks[r] = try a.alloc(u8, rank_img_len);
++        @memset(dst_ranks[r], 0);
++        for (src_ranks[r], 0..) |*b, idx| b.* = @truncate((r + 1) * 53 +% idx *% 17);
++    }
++    defer for (0..4) |r| {
++        a.free(src_ranks[r]);
++        a.free(dst_ranks[r]);
++    };
++    const MockIo = struct {
++        src: [4][]u8,
++        dst: [4][]u8,
++        pub fn take(io: @This(), rank: u32, off: u64, out: []u8) !void {
++            @memcpy(out, io.src[rank][@intCast(off)..][0..out.len]);
++        }
++        pub fn put(io: @This(), rank: u32, off: u64, bytes: []const u8) !void {
++            @memcpy(io.dst[rank][@intCast(off)..][0..bytes.len], bytes);
++        }
++    };
++    const mock: MockIo = .{ .src = src_ranks, .dst = dst_ranks };
++    const buf = try a.alloc(u8, @intCast(total));
++    defer a.free(buf);
++    const R = struct { off: u64, len: u64 };
++    const ranges = [_]R{ .{ .off = 0, .len = total / 3 }, .{ .off = total / 3, .len = total - total / 3 } };
++    try ranks_mod.gatherWith(mock, sh, &prefixes, at, null, &ranges, buf, a);
++    try ranks_mod.scatterWith(mock, sh, &prefixes, at, null, &ranges, buf, a);
++    for (0..4) |r| {
++        try std.testing.expectEqualSlices(u8, src_ranks[r][image.Words.bytes..], dst_ranks[r][image.Words.bytes..]);
++    }
++}
+diff --git a/zig/src/native/cuda_glm_disk.zig b/zig/src/native/cuda_glm_disk.zig
+index 245a7a3..57a17cc 100644
+--- a/zig/src/native/cuda_glm_disk.zig
++++ b/zig/src/native/cuda_glm_disk.zig
+@@ -137,23 +137,25 @@ fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, e: *Engine) !
+     const k: *Kept = @ptrCast(@alignCast(saved));
+     const sh = try ranks.shape(e);
+     const own = img.imageBytes(sh, mark);
+-    var total = own;
+-    for (prefixes[1..]) |p| total += p;
++    const total = img.storeImageBytes(sh, prefixes, mark);
+     const bytes = try a.alloc(u8, @intCast(total));
+     try gather(e, saved, &.{.{ .off = 0, .len = total }}, bytes);
+-    const shared = bytes[@intCast(img.Words.bytes + sh.prefix)..@intCast(own)];
+-    const theirs = try a.alloc(u8, shared.len);
+-    // each rank's copy of what it holds (under TF_GLM_KV_SHARD the latent rows on the probe's home alone)
+-    const home = try homeOf(e, k.id);
+-    var held: std.ArrayList([2]u64) = .empty;
+-    defer held.deinit(a);
+-    for (prefixes[1..], 1..) |q, r| {
+-        held.clearRetainingCapacity();
+-        try img.heldShared(sh, mark, if (home) |h| h == r else true, &held, a);
+-        for (held.items) |x| {
+-            const part = theirs[@intCast(x[0])..][0..@intCast(x[1])];
+-            try ranks.take(e, @intCast(r), k.id, img.Words.bytes + q + x[0], part);
+-            if (!std.mem.eql(u8, shared[@intCast(x[0])..][0..part.len], part)) return error.RanksDiffer;
++    // Under TF_GLM_KV_SPLIT each rank holds disjoint token shards (all already gathered and hashed in `bytes`).
++    if (sh.lat_split <= 1) {
++        const shared = bytes[@intCast(img.Words.bytes + sh.prefix)..@intCast(own)];
++        const theirs = try a.alloc(u8, shared.len);
++        // each rank's copy of what it holds (under TF_GLM_KV_SHARD the latent rows on the probe's home alone)
++        const home = try homeOf(e, k.id);
++        var held: std.ArrayList([2]u64) = .empty;
++        defer held.deinit(a);
++        for (prefixes[1..], 1..) |q, r| {
++            held.clearRetainingCapacity();
++            try img.heldShared(sh, mark, if (home) |h| h == r else true, &held, a);
++            for (held.items) |x| {
++                const part = theirs[@intCast(x[0])..][0..@intCast(x[1])];
++                try ranks.take(e, @intCast(r), k.id, img.Words.bytes + q + x[0], part);
++                if (!std.mem.eql(u8, shared[@intCast(x[0])..][0..part.len], part)) return error.RanksDiffer;
++            }
+         }
+     }
+     try ranks.rest(e);
+@@ -168,7 +170,7 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
+     prefixes = prefix_buf[0..e.share.world];
+     const sh = try ranks.shape(e);
+     var facts: std.ArrayList(u64) = .empty;
+-    try facts.appendSlice(a, &.{ e.share.world, sh.capacity, sh.ring_rows, sh.tail, @intFromBool(sh.head), @intFromBool(sh.scales), @intFromBool(e.drafter != null) });
++    try facts.appendSlice(a, &.{ e.share.world, sh.capacity, sh.ring_rows, sh.tail, @intFromBool(sh.head), @intFromBool(sh.scales), @intFromBool(e.drafter != null), sh.lat_split, @intFromBool(sh.ik_split) });
+     // an image's head rows run a verify window past its position: states kept at another window width are another store
+     try facts.append(a, glm.forward.window_rows);
+     try facts.appendSlice(a, prefixes);
+@@ -182,10 +184,16 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
+     // spill stays off: an eviction would gather on rank 0 mid-pass while the other ranks wait in the gate's all-reduce
+     const r = try rows.Rows.open(store.gpa, store.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid });
+     r.prefill_rate = p.rate;
+-    // a save is staged whole: the permit takes the longest state the RAM store can keep, not the 1 GiB default
++    // a save is staged whole: the permit takes the longest state the RAM store can keep; under KV_SPLIT cap rank-0 host staging safely
+     if (r.parts(a, img.longest(sh))) |ps| {
+         defer a.free(ps);
+-        r.staging_bytes = img.permit(r.staging_bytes, rows.image.imageBytes(ps), img.longest(sh), store.budget);
++        if (sh.lat_split > 1) {
++            const cap_mib: u64 = if (std.c.getenv("TF_GLM_DISK_STAGE_MIB")) |v| @max(1024, std.fmt.parseInt(u64, std.mem.span(v), 10) catch 3072) else 3072;
++            const raw = img.permit(r.staging_bytes, rows.image.imageBytes(ps), img.longest(sh), store.budget * @as(u64, sh.lat_split));
++            r.staging_bytes = @min(raw, cap_mib << 20);
++        } else {
++            r.staging_bytes = img.permit(r.staging_bytes, rows.image.imageBytes(ps), img.longest(sh), store.budget);
++        }
+     } else |err| std.log.warn("glm: the longest state is not priced ({s}): a save stages up to the default", .{@errorName(err)});
+     store.disk = r;
+     std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts; a save stages up to {d} MiB)", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len, r.staging_bytes >> 20 });
+-- 
+2.43.0
+
