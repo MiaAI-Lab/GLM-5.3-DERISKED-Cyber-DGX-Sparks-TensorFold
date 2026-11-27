@@ -1,0 +1,296 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: port <port@local>
+Date: Fri, 27 Nov 2026 16:08:36 -0500
+Subject: [PATCH 0244] glm: prefix-affinity slot selector and dynamic
+ TF_GLM_SEQ_GROW_ADMIT_NEW
+
+---
+ zig/src/families/glm/cuda_lanes.zig      | 98 ++++++++++++++++++++----
+ zig/src/families/glm/cuda_lanes_test.zig | 61 +++++++++++++++
+ zig/src/families/glm/cuda_seq_grow.zig   | 29 +++++++
+ 3 files changed, 172 insertions(+), 16 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index b6f6527..adc7ed1 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -74,6 +74,8 @@ pub const Lanes = struct {
+     costs: rule.Costs = undefined, // verify ms by rows, fit on lone windows
+     slot_resume: bool = false, // TF_GLM_SLOT_RESUME (cuda_native reads it): a prompt resumes on its slot's own rows
+     standing: std.ArrayList(slot_resume.Standing) = .empty, // by slot: what its last prompt pass left (rank 0)
++    slot_used: std.ArrayList(u64) = .empty, // by slot: recency clock for LRU idle slot eviction / trim
++    slot_clock: u64 = 0,
+     resumes: u64 = 0, // prompt passes that resumed on their slot's rows, and the rows they skipped
+     resumed_rows: u64 = 0,
+ 
+@@ -81,9 +83,27 @@ pub const Lanes = struct {
+         if (self.bits) |*b| b.free();
+         for (self.standing.items) |*st| st.deinit(self.x.e.gpa);
+         self.standing.deinit(self.x.e.gpa);
++        self.slot_used.deinit(self.x.e.gpa);
+         self.lanes.deinit(self.x.e.gpa);
+     }
+ 
++    fn slotUsed(self: *const Lanes, slot: u32) u64 {
++        return if (slot < self.slot_used.items.len) self.slot_used.items[slot] else 0;
++    }
++
++    fn touchSlot(self: *Lanes, slot: u32) void {
++        const gpa = self.x.e.gpa;
++        if (slot >= self.slot_used.items.len) self.slot_used.appendNTimes(gpa, 0, slot + 1 - self.slot_used.items.len) catch return;
++        self.slot_clock += 1;
++        self.slot_used.items[slot] = self.slot_clock;
++    }
++
++    fn slotTaken(self: *const Lanes, slot: u32) bool {
++        var it = self.lanes.valueIterator();
++        while (it.next()) |l| if (l.slot == slot) return true;
++        return false;
++    }
++
+     /// Slot `slot`'s standing record (made on first use; null when it cannot be: nothing resumes there).
+     fn standingOf(self: *Lanes, slot: u32) ?*slot_resume.Standing {
+         const gpa = self.x.e.gpa;
+@@ -235,11 +255,57 @@ pub const Lanes = struct {
+     pub fn claimUsing(self: *Lanes, s: *const lanes.Stream, comptime choose: anytype) !*Lane {
+         if (self.lanes.getPtr(s)) |existing| return existing;
+         const slot = choose(self);
++        return self.claimSlot(s, slot);
++    }
++
++    fn claimSlot(self: *Lanes, s: *const lanes.Stream, slot: u32) !*Lane {
++        if (self.lanes.getPtr(s)) |existing| return existing;
+         const gop = try self.lanes.getOrPut(self.x.e.gpa, s);
+         gop.value_ptr.* = .{ .slot = slot };
++        self.touchSlot(slot);
+         return gop.value_ptr;
+     }
+ 
++    /// Standing prefix-resume match length for `s` on `slot` (0 when ineligible or no standing prefix).
++    pub fn standingMatch(self: *const Lanes, slot: u32, s: *const lanes.Stream) usize {
++        if (!self.slot_resume or s.images.len > 0 or s.prompt_logprobs != null or self.x.e.pages != null or s.reuse.saved != null) return 0;
++        if (slot >= self.standing.items.len or slot >= self.x.e.seqs.items.len) return 0;
++        const q = self.x.e.seqs.items[slot] orelse return 0;
++        const st = &self.standing.items[slot];
++        if (st.whole == 0) return 0;
++        const mask = self.policy.effective(s.policy);
++        const tail = policy_mod.retapRows(mask orelse 0, self.drafterTail());
++        return if (cutsOf(s, mask)) |cs| st.planCut(s.prompt(), q.begun, mask orelse 0, tail, cs, cut_slack) else st.plan(fw.prefill_rows, s.prompt(), q.begun, mask orelse 0, tail);
++    }
++
++    /// Prefix-affinity slot selector: (1) free slot with longest standing match, (2) lowest empty free slot, (3) LRU idle free slot.
++    pub fn chooseSlotFor(self: *const Lanes, s: *const lanes.Stream) u32 {
++        if (self.standing.items.len == 0 and seq_grow.pool == null) return self.freeSlot();
++        const limit: u32 = if (seq_grow.pool != null) @intCast(seq_grow.max_streams) else @intCast(@max(self.standing.items.len, self.x.e.seqs.items.len));
++        var best_match_slot: ?u32 = null;
++        var best_match_len: usize = 0;
++        var empty_slot: ?u32 = null;
++        var lru_slot: ?u32 = null;
++        var lru_age: u64 = std.math.maxInt(u64);
++        var slot: u32 = 0;
++        while (slot < limit) : (slot += 1) {
++            if (self.slotTaken(slot)) continue;
++            const m = self.standingMatch(slot, s);
++            if (m > best_match_len) {
++                best_match_len = m;
++                best_match_slot = slot;
++            }
++            const empty = slot >= self.standing.items.len or self.standing.items[slot].whole == 0;
++            if (empty and empty_slot == null) empty_slot = slot;
++            const age = self.slotUsed(slot);
++            if (lru_slot == null or age < lru_age) {
++                lru_slot = slot;
++                lru_age = age;
++            }
++        }
++        return best_match_slot orelse empty_slot orelse lru_slot orelse self.freeSlot();
++    }
++
+     /// The stream's sequence bound, its last verify committed (`kept` rows, else all of them).
+     fn bind(self: *Lanes, s: *const lanes.Stream, kept: ?usize) !*Lane {
+         const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
+@@ -435,11 +501,12 @@ pub const Lanes = struct {
+ 
+     /// The stream's slot, its pages, then its sequence: a slot past the paged ones waits before binding makes a window.
+     pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize) ![]const u32 {
+-        // TF_GLM_SEQ_GROW: the pool must hold this stream's rows beside the other slots' (LaneMemory: the lane host
+-        // requeues the request until a stream ends; alone, the slot it takes holds at most the pool)
+-        const grow_need = if (self.lanes.getPtr(s) == null) self.growNeed(prompt, max_new) else 0;
+-        if (!self.growFits(grow_need)) return error.LaneMemory;
+-        const l = try self.claim(s);
++        // Choose slot with prefix affinity, then check shared VMM pool headroom when TF_GLM_SEQ_GROW is active.
++        const existing = self.lanes.getPtr(s);
++        const chosen = if (existing) |el| el.slot else self.chooseSlotFor(s);
++        const grow_need = if (existing == null) self.growNeed(prompt, max_new) else 0;
++        if (existing == null and !self.growFitsSlot(chosen, grow_need)) return error.LaneMemory;
++        const l = if (existing) |el| el else try self.claimSlot(s, chosen);
+         l.grow_need = grow_need;
+         l.pending_rows = null;
+         l.held_n = 0;
+@@ -472,23 +539,23 @@ pub const Lanes = struct {
+         return snap.home;
+     }
+ 
+-    /// TF_GLM_SEQ_GROW (rank 0): the pool granules a stream of `prompt` + `max_new` rows needs, with a last window
+-    /// and the margin State.ready maps past a pass (0: off). Every slot's sequence has the same fields as slot 0's.
++    /// TF_GLM_SEQ_GROW (rank 0): the pool granules a stream of `prompt` + `max_new` rows needs at admission,
++    /// using TF_GLM_SEQ_GROW_ADMIT_NEW so omitted max_tokens does not monopolize the whole shared pool.
+     fn growNeed(self: *const Lanes, prompt: usize, max_new: usize) usize {
+         if (seq_grow.pool == null) return 0;
+         const q = self.x.e.seqs.items[0] orelse return 0;
+         const r = q.st.grow orelse return 0;
+-        return r.need(@min(self.x.e.capacity, prompt + max_new + max_rows + seq_grow.margin_rows));
++        const rows = seq_grow.admitRows(self.x.e.capacity, prompt, max_new, max_rows + seq_grow.margin_rows, seq_grow.admitNewAsked());
++        return r.need(rows);
+     }
+ 
+-    /// Whether the pool holds `need` more granules on the slot freeSlot gives, beside every other slot's: a live
+-    /// stream's charge is the most of what it maps and what it was admitted with; an idle slot's, what it maps (slot
+-    /// 0 keeps its last rows for slot resume until its next pass trims them).
+-    fn growFits(self: *const Lanes, need: usize) bool {
++    /// Whether the pool holds `need` granules on `target_slot` beside every other slot's current charge.
++    fn growFitsSlot(self: *const Lanes, target_slot: u32, need: usize) bool {
+         const pool = seq_grow.pool orelse return true;
++        if (target_slot >= seq_grow.max_streams) return false;
+         var slots: [64]?seq_grow.Slot = undefined;
+         const seqs = self.x.e.seqs.items;
+-        if (seqs.len > slots.len) return false; // more slots than the check holds: refuse rather than guess
++        if (seqs.len > slots.len) return false;
+         for (seqs, slots[0..seqs.len], 0..) |q, *x, slot| {
+             const r = (q orelse {
+                 x.* = null;
+@@ -503,9 +570,7 @@ pub const Lanes = struct {
+                 x.*.?.granted = @max(x.*.?.granted, l.grow_need);
+             };
+         }
+-        const f = self.freeSlot();
+-        if (f >= seq_grow.max_streams) return false; // TF_GLM_SEQ_GROW_STREAMS: no slot past the cap (the request waits)
+-        return seq_grow.admits(pool.total, slots[0..seqs.len], f, need);
++        return seq_grow.admits(pool.total, slots[0..seqs.len], target_slot, need);
+     }
+ 
+     /// The lane host's admission: with a pool, a paged sequence and the request's pages are free.
+@@ -973,6 +1038,7 @@ pub const Lanes = struct {
+     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+         const self = of(ptr);
+         const kv = self.lanes.fetchRemove(s) orelse return;
++        self.touchSlot(kv.value.slot);
+         self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
+         if (self.lanes.count() == 0) self.x.idle() catch |err| std.log.err("the other ranks' idle step: {s}", .{@errorName(err)});
+     }
+diff --git a/zig/src/families/glm/cuda_lanes_test.zig b/zig/src/families/glm/cuda_lanes_test.zig
+index d06aa0c..1e7acf5 100644
+--- a/zig/src/families/glm/cuda_lanes_test.zig
++++ b/zig/src/families/glm/cuda_lanes_test.zig
+@@ -139,3 +139,64 @@ test "GLM dsa shared: a segment's scratch from its first row keeps its own token
+     try std.testing.expectEqual(s.tokens, f.tokens);
+     try std.testing.expectEqual(s.counts, f.counts);
+ }
++
++test "GLM slot resume: chooseSlotFor prefers longest standing prefix match, then empty slot, then LRU idle slot" {
++    const gpa = std.testing.allocator;
++    const types = @import("cuda_engine_types.zig");
++    var e: engine.Engine = undefined;
++    e.gpa = gpa;
++    e.pages = null;
++    e.drafter = null;
++    e.seqs = .empty;
++    defer e.seqs.deinit(gpa);
++    var q0: types.Seq = undefined;
++    var q1: types.Seq = undefined;
++    var q2: types.Seq = undefined;
++    q0.begun = 1;
++    q1.begun = 2;
++    q2.begun = 3;
++    try e.seqs.appendSlice(gpa, &.{ &q0, &q1, &q2 });
++
++    var self: Lanes = .{ .x = .{ .e = &e, .link = undefined }, .slot_resume = true };
++    defer self.deinit();
++
++    // Populate standing prefixes on slots 0 and 1, leave slot 2 empty
++    const grid = fw.prefill_rows;
++    const a_toks = try gpa.alloc(u32, grid + 10);
++    defer gpa.free(a_toks);
++    const b_toks = try gpa.alloc(u32, 2 * grid + 10);
++    defer gpa.free(b_toks);
++    const c_toks = try gpa.alloc(u32, grid + 10);
++    defer gpa.free(c_toks);
++    for (a_toks, 0..) |*t, i| t.* = @intCast(100 + i);
++    for (b_toks, 0..) |*t, i| t.* = @intCast(100000 + i);
++    for (c_toks, 0..) |*t, i| t.* = @intCast(200000 + i);
++
++    try self.standing.appendNTimes(gpa, .{}, 3);
++    self.standing.items[0].open(gpa, a_toks, 0, q0.begun, 0, true);
++    self.standing.items[0].ran(grid, 0);
++    self.standing.items[1].open(gpa, b_toks, 0, q1.begun, 0, true);
++    self.standing.items[1].ran(grid, 0);
++    // Recency: slot 1 older (1), slot 0 newer (2)
++    try self.slot_used.appendSlice(gpa, &.{ 2, 1, 0 });
++    self.slot_clock = 2;
++
++    var sb = try lanes.Stream.init(gpa, .{ .id = "b2", .prompt = b_toks, .max_new = 4 });
++    defer sb.deinit(gpa);
++    try std.testing.expectEqual(@as(u32, 1), self.chooseSlotFor(&sb)); // matches slot 1's standing prefix!
++
++    var sc = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = c_toks, .max_new = 4 });
++    defer sc.deinit(gpa);
++    try std.testing.expectEqual(@as(u32, 2), self.chooseSlotFor(&sc)); // prefers empty slot 2 over warm slots 0 and 1!
++
++    // Once slot 2 also has standing rows (most recent), a brand-new prompt evicts LRU slot 1
++    self.standing.items[2].open(gpa, c_toks, 0, q2.begun, 0, true);
++    self.standing.items[2].ran(grid, 0);
++    self.slot_used.items[2] = 3;
++    const d_toks = try gpa.alloc(u32, grid + 10);
++    defer gpa.free(d_toks);
++    for (d_toks, 0..) |*t, i| t.* = @intCast(300000 + i);
++    var sd = try lanes.Stream.init(gpa, .{ .id = "d", .prompt = d_toks, .max_new = 4 });
++    defer sd.deinit(gpa);
++    try std.testing.expectEqual(@as(u32, 1), self.chooseSlotFor(&sd)); // LRU idle slot 1!
++}
+diff --git a/zig/src/families/glm/cuda_seq_grow.zig b/zig/src/families/glm/cuda_seq_grow.zig
+index 8a60338..4c051c3 100644
+--- a/zig/src/families/glm/cuda_seq_grow.zig
++++ b/zig/src/families/glm/cuda_seq_grow.zig
+@@ -198,6 +198,26 @@ pub const Region = struct {
+     }
+ };
+ 
++/// TF_GLM_SEQ_GROW_ADMIT_NEW: max output tokens reserved per stream at admission so omitted max_tokens (e.g. 1M)
++/// does not monopolize the shared VMM pool (0: legacy full max_new; default: 16384).
++pub fn admitNewAsked() usize {
++    return parseAdmitNew(if (std.c.getenv("TF_GLM_SEQ_GROW_ADMIT_NEW")) |v| std.mem.span(v) else null);
++}
++
++fn parseAdmitNew(v: ?[]const u8) usize {
++    const s = v orelse return 16384;
++    if (s.len == 0) return 16384;
++    const n = std.fmt.parseInt(usize, s, 10) catch return 16384;
++    if (n == 0) return 0;
++    return std.math.clamp(n, 256, 1024 * 1024);
++}
++
++/// Rows reserved at admission for `prompt` + `max_new` + `extra` (window + margin), bounded by `capacity`.
++pub fn admitRows(capacity: usize, prompt: usize, max_new: usize, extra: usize, cap_new: usize) usize {
++    const eff_new = if (cap_new == 0) max_new else @min(max_new, cap_new);
++    return @min(capacity, prompt +| eff_new +| extra);
++}
++
+ /// A slot's hold on the pool: the granules it maps now, and a live stream's grant (what it was admitted with; 0 for an
+ /// idle slot, whose rows wait for slot resume until its next pass trims them).
+ pub const Slot = struct { mapped: usize, granted: usize = 0 };
+@@ -733,3 +753,12 @@ test "GLM seq grow: the switch reads 1 and 0 and refuses anything else" {
+     try T.expectError(error.BadSeqGrow, parse("on"));
+     try T.expectError(error.BadSeqGrow, parse(""));
+ }
++
++test "GLM seq grow: admitNewAsked and admitRows bound omitted max_tokens" {
++    try T.expectEqual(@as(usize, 16384), parseAdmitNew(null));
++    try T.expectEqual(@as(usize, 0), parseAdmitNew("0"));
++    try T.expectEqual(@as(usize, 8192), parseAdmitNew("8192"));
++    try T.expectEqual(@as(usize, 16000 + 8192 + 4128), admitRows(524352, 16000, 1_048_576, 4128, 8192));
++    try T.expectEqual(@as(usize, 16000 + 512 + 4128), admitRows(524352, 16000, 512, 4128, 8192));
++    try T.expectEqual(@as(usize, 524352), admitRows(524352, 16000, 1_048_576, 4128, 0));
++}
+-- 
+2.43.0
+

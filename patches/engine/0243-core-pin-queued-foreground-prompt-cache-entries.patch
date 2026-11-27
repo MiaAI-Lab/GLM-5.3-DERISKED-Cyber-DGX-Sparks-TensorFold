@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: port <port@local>
+Date: Fri, 27 Nov 2026 16:08:36 -0500
+Subject: [PATCH 0243] core: pin queued foreground requests' RAM prompt-cache
+ entries
+
+---
+ zig/src/core/lane_host.zig             | 14 +++++
+ zig/src/core/lane_host_admit.zig       | 14 +++++
+ zig/src/core/lane_host_borrow_test.zig | 81 ++++++++++++++++++++++++++
+ zig/src/core/lane_job.zig              |  8 +++
+ zig/src/core/lane_stream.zig           |  1 +
+ zig/src/core/prompt_cache.zig          |  9 +++
+ 6 files changed, 127 insertions(+)
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index fc82074..e5567a0 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -273,6 +273,7 @@ pub const LaneHost = struct {
+         h.memory_lanes = null; // a lane may have freed: the next admission asks the backend for memory again
+         if (h.rounds) |rd| rd.vtable.left(rd.ctx, @intFromPtr(job));
+         job.reported();
++        job.unpin();
+         h.gpa.free(job.marks);
+         h.gpa.free(job.key);
+         const s = &job.stream;
+@@ -489,6 +490,19 @@ pub const LaneHost = struct {
+             return true;
+         }
+         job.fill_on.store(false, .release); // off the lists before the teardown a status reader could have walked into
++        // Re-pin before releasing job.entry so a requeued job has zero unpinned gap in the RAM cache.
++        if (job.pinned == null and !job.request.background and job.request.images.len == 0) {
++            if (job.entry) |e| {
++                if (!e.expired) {
++                    e.borrowers += 1;
++                    job.pinned = e;
++                }
++            } else if (h.cache) |store| {
++                const r = job.request;
++                if (r.embedding == null and r.prompt_logprobs == null and !r.untaught and r.cacheKey().len > 0)
++                    job.pinned = store.pinPrefix(r.cacheKey(), r.chunks, h.spans(r));
++            }
++        }
+         job.reported();
+         if (job.stream.grammar) |g| g.deinit(h.gpa); // the next admission compiles its own
+         job.stream.deinit(h.gpa);
+diff --git a/zig/src/core/lane_host_admit.zig b/zig/src/core/lane_host_admit.zig
+index 67e527c..cdb8341 100644
+--- a/zig/src/core/lane_host_admit.zig
++++ b/zig/src/core/lane_host_admit.zig
+@@ -8,9 +8,23 @@ const fetch = @import("lane_host_fetch.zig");
+ const pressure = @import("lane_host_pressure.zig");
+ 
+ /// The queued job to admit (its index), or null to hold; the caller holds the lock.
++/// Pin the best RAM cache entry for foreground queued requests near the head so active keeps cannot evict them.
++fn pinQueued(h: *LaneHost) void {
++    const store = h.cache orelse return;
++    const cap = @max(h.info_.lanes * 2, 4);
++    const n = @min(h.queued.items.len, cap);
++    for (h.queued.items[0..n]) |job| {
++        if (job.pinned != null) continue;
++        const r = job.request;
++        if (r.background or r.embedding != null or r.prompt_logprobs != null or r.untaught or r.images.len > 0 or r.cacheKey().len == 0) continue;
++        job.pinned = store.pinPrefix(r.cacheKey(), r.chunks, h.spans(r));
++    }
++}
++
+ pub fn pick(h: *LaneHost) ?usize {
+     if (pressure.holds(h)) return null; // under memory pressure nothing starts or is read ahead
+     if (!h.stale) fetch.queue(h); // disk states read ahead for queued requests, a lane free or not
++    if (!h.stale) pinQueued(h); // pin queued foreground requests' RAM prefixes before active keeps can evict them
+     // a stale device takes no reply: `learn.refuse` ends the queued ones instead
+     if (h.stale or h.queued.items.len == 0 or h.admitted.items.len >= @min(h.info_.lanes, h.memory_lanes orelse h.info_.lanes)) return null;
+     prefix.release(h); // requests whose awaited cut is in (or will not come) go on first
+diff --git a/zig/src/core/lane_host_borrow_test.zig b/zig/src/core/lane_host_borrow_test.zig
+index fb6bf46..c92aae9 100644
+--- a/zig/src/core/lane_host_borrow_test.zig
++++ b/zig/src/core/lane_host_borrow_test.zig
+@@ -135,3 +135,84 @@ test "a queued prompt's kept state survives a later request's reservation until
+     defer a.free(want3);
+     try std.testing.expectEqualSlices(u32, want3, r3.ids.items);
+ }
++
++test "a queued request pins its prompt-cache entry so an active stream's keep cannot evict it before admission" {
++    var cfg = try lanes.Config.init(a, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(a);
++    var target: lanes.fake.Fake = .{ .gpa = a, .prefill_chunks = 3 };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(a, &cfg, target.stepped(), clock.clock());
++    defer core.deinit();
++    var snaps: Snaps = .{ .f = &target };
++    const vtable: pc.Snapshots.VTable = .{
++        .bytes = Snaps.bytes,
++        .save = Snaps.save,
++        .restore = Snaps.restore,
++        .drop = Snaps.drop,
++    };
++    // Budget holds exactly 1 entry (100 bytes), lanes = 1.
++    var store = pc.Store.init(a, .{ .ptr = &snaps, .vtable = &vtable }, .{ .min_prompt = 0 }, 100);
++    defer store.deinit();
++    var host = api.LaneHost.init(a, std.testing.io, &core, .{ .lanes = 1 });
++    host.cache = &store;
++    try host.start();
++    defer host.stop();
++
++    const eng = host.engine();
++    const prompt_a1 = [_]u32{ 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
++    const prompt_a2 = [_]u32{ 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 };
++    const prompt_c = [_]u32{ 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82 };
++    const prompt_b = [_]u32{ 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102 };
++
++    // 1. Run A1 to populate the 1-slot RAM cache with A's prefix at history_len=8
++    var r_a1: Reply = .{};
++    defer r_a1.ids.deinit(a);
++    const req_a1: api.Request = .{ .prompt = &prompt_a1, .max_tokens = 2, .history_len = 8 };
++    try eng.submit(10, &req_a1, .{ .ctx = &r_a1, .event = Reply.event });
++    try std.testing.expectEqual(api.Reason.length, try r_a1.wait());
++    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
++    try std.testing.expectEqual(@as(u32, 8), store.entries.items[0].at);
++
++    // 2. Submit C (history_len=0, occupies lane 0); on C's first chunk enqueue BOTH B (history_len=8) and A2!
++    //    While C runs, admit.pick pins A2's RAM entry; then when B takes lane 0 ahead of A2, neither B's
++    //    lookupUser.reserve() nor B's keep() can evict A2's pinned entry.
++    var r_b: Reply = .{};
++    defer r_b.ids.deinit(a);
++    var r_a2: Reply = .{};
++    defer r_a2.ids.deinit(a);
++    const req_b: api.Request = .{ .prompt = &prompt_b, .max_tokens = 2, .history_len = 8 };
++    const req_a2: api.Request = .{ .prompt = &prompt_a2, .max_tokens = 2, .history_len = 10 };
++    const EnqueueBoth = struct {
++        engine: api.Engine,
++        req_b: *const api.Request,
++        rep_b: *Reply,
++        req_a2: *const api.Request,
++        rep_a2: *Reply,
++        len: usize,
++        sent: bool = false,
++        fn call(ctx: *anyopaque, s: *lanes.Stream, _: usize) void {
++            const self: *@This() = @ptrCast(@alignCast(ctx));
++            if (self.sent or s.prompt().len != self.len) return;
++            self.sent = true;
++            self.engine.submit(12, self.req_b, .{ .ctx = self.rep_b, .event = Reply.event }) catch {};
++            self.engine.submit(13, self.req_a2, .{ .ctx = self.rep_a2, .event = Reply.event }) catch {};
++        }
++    };
++    var hook: EnqueueBoth = .{ .engine = eng, .req_b = &req_b, .rep_b = &r_b, .req_a2 = &req_a2, .rep_a2 = &r_a2, .len = prompt_c.len };
++    target.prefill_hook = EnqueueBoth.call;
++    target.prefill_hook_ctx = &hook;
++
++    var r_c: Reply = .{};
++    defer r_c.ids.deinit(a);
++    const req_c: api.Request = .{ .prompt = &prompt_c, .max_tokens = 4, .history_len = 0 };
++    try eng.submit(11, &req_c, .{ .ctx = &r_c, .event = Reply.event });
++
++    try std.testing.expectEqual(api.Reason.length, try r_c.wait());
++    try std.testing.expectEqual(api.Reason.length, try r_b.wait());
++    try std.testing.expectEqual(api.Reason.length, try r_a2.wait());
++    try std.testing.expect(hook.sent);
++    // A2's cached prefix MUST survive B's reserve() and keep() because A2 pinned it while queued!
++    try std.testing.expectEqual(@as(?u32, 8), r_a2.cached);
++    for (store.entries.items) |e| try std.testing.expectEqual(@as(u32, 0), e.borrowers);
++}
+diff --git a/zig/src/core/lane_job.zig b/zig/src/core/lane_job.zig
+index 15a7540..5cc8b41 100644
+--- a/zig/src/core/lane_job.zig
++++ b/zig/src/core/lane_job.zig
+@@ -31,6 +31,7 @@ pub const Job = struct {
+     fill_on: std.atomic.Value(bool) = .init(false),
+     prefilled: ?i96 = null,
+     entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
++    pinned: ?*pc.Entry = null, // RAM entry pinned while queued so concurrent keeps cannot evict it before admission
+     marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+     key: []u32 = &.{}, // the request's cache key with its image frame in the first word (gpa-owned); empty: its own
+     kept0: u64 = 0, // the store's kept count when the job looked it up
+@@ -58,6 +59,13 @@ pub const Job = struct {
+         if (job.host.cache) |store| _ = store.keepBorn(job.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request));
+     }
+ 
++    /// Release any RAM cache entry pinned while this job was queued.
++    pub fn unpin(job: *Job) void {
++        const e = job.pinned orelse return;
++        job.pinned = null;
++        if (job.host.cache) |store| store.release(e);
++    }
++
+     /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+     pub fn reported(job: *Job) void {
+         const e = job.entry orelse return;
+diff --git a/zig/src/core/lane_stream.zig b/zig/src/core/lane_stream.zig
+index 5f4a85d..3fa77c9 100644
+--- a/zig/src/core/lane_stream.zig
++++ b/zig/src/core/lane_stream.zig
+@@ -30,6 +30,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
+         job.marks = l.marks;
+         reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
+     } else |_| {};
++    job.unpin(); // lookupUser already borrowed job.entry (or h.drop -> h.finish unpins if open failed earlier)
+     if (h.proposers) |ps| {
+         job.custom = ps.make(ps.ctx, h.gpa, r.prompt, r.eos) catch return !h.drop(job, "the drafter could not start");
+     } else job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 252b90c..37746c1 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -268,6 +268,15 @@ pub const Store = struct {
+     /// The longest kept token prefix with matching canonical spans through its position, leaving at least one row.
+     pub const find = index.find;
+ 
++    /// Borrow the longest matching RAM entry for a queued request so active streams' keeps cannot evict it while it waits.
++    /// Read-only on cache stats/clock/disk; caller releases via `release(e)`.
++    pub fn pinPrefix(s: *Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span) ?*Entry {
++        s.collectExpired();
++        const e = s.find(prompt, starts, spans) orelse return null;
++        e.borrowers += 1;
++        return e;
++    }
++
+     /// Restore the longest prefix matching tokens and canonical spans, then plan prompt-cache marks.
+     pub fn begin(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, owner: ?*anyopaque, spans: []const modes.Span) !Plan {
+         return s.beginRewind(a, prompt, history_len, 0, shared, starts, owner, spans);
+-- 
+2.43.0
+
