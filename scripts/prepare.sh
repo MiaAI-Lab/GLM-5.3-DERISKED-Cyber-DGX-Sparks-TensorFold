@@ -140,16 +140,16 @@ validate_config() {
   [[ -z "${MTP_CAP:-}" || "$MTP_CAP" =~ ^[1-6]$ ]] || fail E_CONFIG 'MTP_CAP must be empty or 1..6.'
   [[ "${SPLIT_QKVA:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'SPLIT_QKVA must be 0 or 1.'
   [[ "${DSA_INDEX_FAST:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'DSA_INDEX_FAST must be 0 or 1.'
-  [[ "${KV_SPLIT:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'KV_SPLIT must be 0 or 1.'
+  [[ "${KV_SPLIT:-0}" =~ ^[012]$ ]] || fail E_CONFIG 'KV_SPLIT must be 0, 1 or 2.'
   [[ "${SLOT_RESUME:-1}" =~ ^[01]$ ]] || fail E_CONFIG 'SLOT_RESUME must be 0 or 1.'
   [[ "${PF_EXPERTS_ONCE:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'PF_EXPERTS_ONCE must be 0 or 1.'
   [[ "${PF_QMMF2:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'PF_QMMF2 must be 0 or 1.'
   [[ "${PF_DOWN_FUSE:-0}" =~ ^[01]$ ]] || fail E_CONFIG 'PF_DOWN_FUSE must be 0 or 1.'
   validate_rank_env
-  if [[ "${KV_SPLIT:-0}" == 1 ]]; then  # patches 0187-0189: the split latent rows live in each rank's own arena
+  if [[ "${KV_SPLIT:-0}" != 0 ]]; then  # patches 0187-0189: the split latent/ik rows live in each rank's own arena
     [[ "$KV_PAGES" == off ]] || fail E_CONFIG "KV_SPLIT=1 needs KV_PAGES=off (got $KV_PAGES)."
     [[ "$DRAFTER" != mtp ]] || fail E_CONFIG 'KV_SPLIT=1 serves without the MTP drafter: DRAFTER=dflash2, dspark or none.'
-    [[ "${LEARN_GIB:-0}" == 0 ]] || fail E_CONFIG "KV_SPLIT=1 needs LEARN_GIB=0 (got $LEARN_GIB)."
+    : # patch 0245 supports LEARN_GIB with KV_SPLIT=1/2 and SEQ_GROW
   fi
   # GB10 is a unified-memory device, where the engine's own reserve floor is 2 GiB (cuda_memory.zig's floor(unified)).
   is_number "$MEMORY_RESERVE_GIB" && at_least "$MEMORY_RESERVE_GIB" 2 \
@@ -205,7 +205,7 @@ validate_config() {
     [[ "$TP" == 4 && "${TP6_RANKS:-}" == 4 ]] || fail E_CONFIG "MODEL_FORMAT=exlr8 serves four Sparks (TP6_RANKS=4 ./start-tp6.sh; TP=$TP, TP6_RANKS=${TP6_RANKS:-unset})."
     [[ "$WORKER_WEIGHTS" == check ]] || fail E_CONFIG 'MODEL_FORMAT=exlr8: every rank reads its own converted pieces, so WORKER_WEIGHTS must be check (NFS and rsync cannot carry them).'
     [[ "$MODEL_SOURCE" == local ]] || fail E_CONFIG 'MODEL_FORMAT=exlr8 serves the converted directory (scripts/prepare-exlr8.sh): MODEL_SOURCE must be local.'
-    [[ "${KV_SPLIT:-0}" != 1 ]] || warn W_CONFIG 'KV_SPLIT=1 has no EXLR8 measurements and overrides the 196,608-token default.'
+    [[ "${KV_SPLIT:-0}" == 0 ]] || warn W_CONFIG "KV_SPLIT=$KV_SPLIT has no EXLR8 measurements and overrides the 196,608-token default."
   fi
   for key in FABRIC_PEER FABRIC_SELF NFS_SERVER; do
     [[ -z "${!key}" || "${!key}" =~ ^[A-Za-z0-9.:_-]+$ ]] || fail E_CONFIG "$key must be an address or host name."
